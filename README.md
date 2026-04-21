@@ -97,6 +97,8 @@ Prepare a UE Python command without launching UE:
 
 ```bash
 python -m myagent ue run-python scripts\list_assets.py --cwd D:\Path\To\GameProject
+python -m myagent ue list-assets --cwd D:\Path\To\GameProject
+python -m myagent ue validate-assets --cwd D:\Path\To\GameProject
 ```
 
 Useful options:

@@ -85,6 +85,14 @@ def run_chat(options: AgentOptions) -> None:
         if query.lower() in {"", "q", "quit", "exit"}:
             return
 
+        if query.lower() == "/clear":
+            messages = [
+                ChatMessage(role="system", content=SYSTEM_PROMPT),
+                ChatMessage(role="user", content=f"Working directory: {options.cwd}\nShell: {shell_name()}"),
+            ]
+            print("Conversation context cleared.")
+            continue
+
         if handle_slash_command(query, options.cwd):
             continue
 
@@ -113,7 +121,7 @@ def run_turn(
     verbose: bool,
     allow_ue_execute: bool,
 ) -> str | None:
-    tool_used = False
+    work_tool_used = False
     todo_manager = TodoManager(cwd / ".agent")
     tools = build_tool_handlers(
         cwd=cwd,
@@ -151,7 +159,7 @@ def run_turn(
             continue
 
         if isinstance(action, FinalAction):
-            if requires_tool_action(goal) and not tool_used:
+            if requires_tool_action(goal) and not work_tool_used:
                 if verbose:
                     print("\nRefusing premature final answer; task appears to require a tool action.")
                 messages.append(
@@ -185,7 +193,8 @@ def run_turn(
             except Exception as error:
                 output = f"Tool {action.name} failed: {error}"
 
-            tool_used = True
+            if action.name not in {"todo_update", "todo_list"}:
+                work_tool_used = True
             messages.append(
                 ChatMessage(
                     role="user",
@@ -212,10 +221,6 @@ def handle_slash_command(query: str, cwd: Path) -> bool:
     if command == "/ue doctor":
         print(render_doctor(discover_ue(cwd)))
         return True
-    if command == "/clear":
-        print("Conversation context will start fresh on your next prompt.")
-        return True
-
     print(f"Unknown slash command: {query}")
     return True
 

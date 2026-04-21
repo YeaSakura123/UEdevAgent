@@ -59,6 +59,18 @@ def build_parser() -> argparse.ArgumentParser:
     ue_run.add_argument("--execute", action="store_true", help="actually launch UE; omitted means dry-run only")
     ue_run.add_argument("--timeout", type=int, default=300, help="UE process timeout in seconds")
 
+    ue_list = ue_subparsers.add_parser("list-assets", help="prepare or execute a /Game asset listing script")
+    ue_list.add_argument("--cwd", default=str(Path.cwd()), help="UE project or workspace directory")
+    ue_list.add_argument("--mode", choices=["commandlet", "full_editor"], default="commandlet", help="UE Python execution mode")
+    ue_list.add_argument("--execute", action="store_true", help="actually launch UE; omitted means dry-run only")
+    ue_list.add_argument("--timeout", type=int, default=300, help="UE process timeout in seconds")
+
+    ue_validate = ue_subparsers.add_parser("validate-assets", help="prepare or execute UE Data Validation")
+    ue_validate.add_argument("--cwd", default=str(Path.cwd()), help="UE project or workspace directory")
+    ue_validate.add_argument("--mode", choices=["commandlet", "full_editor"], default="commandlet", help="UE Python execution mode")
+    ue_validate.add_argument("--execute", action="store_true", help="actually launch UE; omitted means dry-run only")
+    ue_validate.add_argument("--timeout", type=int, default=300, help="UE process timeout in seconds")
+
     return parser
 
 
@@ -178,6 +190,19 @@ def handle_ue(args: argparse.Namespace) -> None:
             script=script,
             mode=args.mode,
             kind="custom",
+            execute=args.execute,
+            timeout_seconds=args.timeout,
+        )
+        print(render_run_result(result))
+        return
+
+    if args.ue_command in {"list-assets", "validate-assets"}:
+        result = run_ue_python(
+            cwd=cwd,
+            agent_dir=cwd / ".agent",
+            script="",
+            mode=args.mode,
+            kind="list_assets" if args.ue_command == "list-assets" else "validate_assets",
             execute=args.execute,
             timeout_seconds=args.timeout,
         )

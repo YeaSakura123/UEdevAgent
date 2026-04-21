@@ -8,8 +8,10 @@ from pathlib import Path
 from . import __version__
 from .loop import AgentOptions, run_agent, run_chat
 from .shell import shell_name
-from .tasks import TodoManager
+from .tasks import TaskManager, TodoManager
+from .team import MessageBus, TeamManager
 from .ue import discover_ue, render_doctor, render_run_result, run_ue_python
+from .worktrees import WorktreeManager
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     run_parser.add_argument("--verbose", action="store_true", help="show internal iteration and protocol diagnostics")
     run_parser.add_argument("--allow-ue-execute", action="store_true", help="allow the agent to launch Unreal Editor for UE Python tools")
+    run_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
 
     chat_parser = subparsers.add_parser("chat", help="start an interactive agent chat session")
     chat_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=8, help=argparse.SUPPRESS)
@@ -42,9 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     chat_parser.add_argument("--verbose", action="store_true", help="show internal iteration and protocol diagnostics")
     chat_parser.add_argument("--allow-ue-execute", action="store_true", help="allow the agent to launch Unreal Editor for UE Python tools")
+    chat_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
 
     task_parser = subparsers.add_parser("tasks", help="show the persisted agent todo list")
     task_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
+    task_parser.add_argument("--graph", action="store_true", help="show persistent task graph instead of short todos")
+
+    team_parser = subparsers.add_parser("team", help="show persistent teammate roster")
+    team_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .team state")
+
+    worktree_parser = subparsers.add_parser("worktrees", help="show managed task worktrees")
+    worktree_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .worktrees state")
 
     ue_parser = subparsers.add_parser("ue", help="Unreal Engine helper commands")
     ue_subparsers = ue_parser.add_subparsers(dest="ue_command", required=True)
@@ -94,6 +105,7 @@ def main() -> None:
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
                     allow_ue_execute=args.allow_ue_execute,
+                    context_threshold=args.context_threshold,
                 )
             )
         elif args.command == "chat":
@@ -106,10 +118,24 @@ def main() -> None:
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
                     allow_ue_execute=args.allow_ue_execute,
+                    context_threshold=args.context_threshold,
                 )
             )
         elif args.command == "tasks":
-            print(TodoManager(Path(args.cwd).resolve() / ".agent").render_current())
+            cwd = Path(args.cwd).resolve()
+            if args.graph:
+                print(TaskManager(cwd / ".tasks").list_all())
+            else:
+                print(TodoManager(cwd / ".agent").render_current())
+        elif args.command == "team":
+            cwd = Path(args.cwd).resolve()
+            task_manager = TaskManager(cwd / ".tasks")
+            bus = MessageBus(cwd / ".team")
+            print(TeamManager(cwd / ".team", task_manager, bus).list_all())
+        elif args.command == "worktrees":
+            cwd = Path(args.cwd).resolve()
+            task_manager = TaskManager(cwd / ".tasks")
+            print(WorktreeManager(cwd, cwd / ".worktrees", task_manager).list_all())
         elif args.command == "ue":
             handle_ue(args)
     except KeyboardInterrupt:

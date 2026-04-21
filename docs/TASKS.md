@@ -9,13 +9,25 @@
 - [x] 初始化本地 Git 仓库并提交基线
 - [x] 明确本项目优先落地 harness，而不是训练模型本身
 
-## 阶段 2：CLI Agent Harness
+## 阶段 2：CLI Agent Harness（按 s01-s12）
 
 - [x] 保留最小 agent loop：模型输出动作，CLI 执行动作并回填观察结果
 - [x] 将旧 shell/final 协议扩展为可注册工具协议
 - [x] 增加持久化 todo 状态，支持多步任务规划
 - [x] 增加 chat slash commands：`/help`、`/todos`、`/ue doctor`
-- [ ] 后续可扩展：会话 resume、上下文压缩、后台任务、团队 inbox
+- [x] s01 Agent Loop
+- [x] s02 Tool Use
+- [x] s03 TodoWrite
+- [x] s04 Subagent
+- [x] s05 Skill Loading
+- [x] s06 Context Compact
+- [x] s07 Task System
+- [x] s08 Background Tasks
+- [x] s09 Agent Teams
+- [x] s10 Team Protocols
+- [x] s11 Autonomous Task Claiming
+- [x] s12 Worktree Task Isolation
+- [ ] 后续可扩展：真正后台 LLM 队友轮询、会话 resume、MCP transport
 
 ## 阶段 3：UE Python 能力
 

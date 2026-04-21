@@ -16,6 +16,11 @@ Other built-in tools:
 
 ```json
 {"type":"tool","name":"todo_update","input":{"items":[{"id":"1","text":"...","status":"pending"}]}}
+{"type":"tool","name":"subagent","input":{"prompt":"inspect tests and summarize"}}
+{"type":"tool","name":"task_create","input":{"subject":"Validate UE assets","description":"Run dry-run first"}}
+{"type":"tool","name":"background_run","input":{"command":"python -m unittest discover -s test","reason":"run tests"}}
+{"type":"tool","name":"spawn_teammate","input":{"name":"alice","role":"tester","prompt":"claim ready tasks"}}
+{"type":"tool","name":"worktree_create","input":{"name":"asset-validation","task_id":1}}
 {"type":"tool","name":"ue_doctor","input":{}}
 {"type":"tool","name":"ue_run_python","input":{"kind":"list_assets","mode":"commandlet","script":"","execute":false}}
 ```
@@ -85,6 +90,9 @@ Show the persisted agent todo board:
 
 ```bash
 python -m myagent tasks
+python -m myagent tasks --graph
+python -m myagent team
+python -m myagent worktrees
 ```
 
 Inspect UE configuration without launching Unreal Engine:
@@ -119,6 +127,10 @@ even stricter: UE Python tools dry-run unless the command line explicitly passes
 - `run` handles one task and exits.
 - `chat` keeps the same message history across turns.
 - `chat` supports slash commands: `/help`, `/todos`, `/ue doctor`.
+- The harness implements the staged mechanisms from `learn-claude-code-main`:
+  loop, tool dispatch, TodoWrite, subagent, skill loading, context compact,
+  persistent task graph, background tasks, team inbox/protocols, autonomous task
+  claiming, and task-aware git worktrees.
 - Commands run in the selected working directory.
 - Shell commands time out after 120 seconds by default.
 - Internal protocol diagnostics are hidden unless `--verbose` is enabled.
@@ -141,5 +153,6 @@ hoc shell commands:
 See:
 
 - `docs/ARCHITECTURE.md`
+- `docs/STAGED_HARNESS_IMPLEMENTATION.md`
 - `docs/UE_AGENT_DESIGN.md`
 - `docs/TASKS.md`

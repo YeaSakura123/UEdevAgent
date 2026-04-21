@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Literal, Union
+from typing import Any, Literal, Union
 
 
 class ActionParseError(ValueError):
@@ -19,12 +19,19 @@ class ShellAction:
 
 
 @dataclass(frozen=True)
+class ToolAction:
+    type: Literal["tool"]
+    name: str
+    input: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class FinalAction:
     type: Literal["final"]
     answer: str
 
 
-AgentAction = Union[ShellAction, FinalAction]
+AgentAction = Union[ShellAction, ToolAction, FinalAction]
 
 
 def parse_agent_action(raw: str) -> AgentAction:
@@ -38,6 +45,15 @@ def parse_agent_action(raw: str) -> AgentAction:
         raise ActionParseError("Model JSON response must be an object.", raw)
 
     action_type = data.get("type")
+    if action_type == "tool":
+        name = data.get("name")
+        tool_input = data.get("input", {})
+        if not isinstance(name, str) or not name.strip():
+            raise ActionParseError("tool action requires a non-empty name", raw)
+        if not isinstance(tool_input, dict):
+            raise ActionParseError("tool action input must be an object", raw)
+        return ToolAction(type="tool", name=name, input=tool_input)
+
     if action_type == "shell":
         command = data.get("command")
         reason = data.get("reason")

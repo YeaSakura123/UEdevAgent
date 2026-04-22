@@ -16,10 +16,12 @@ class Skill:
 class SkillLoader:
     """按需加载 SKILL.md，避免把全部领域知识塞进 system prompt。"""
 
+    # 内部函数：初始化当前类实例，准备 SKILL.md 扫描、描述展示和按需加载 所需状态。
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
         self.skills = self._scan()
 
+    # 内部函数：处理 _scan 辅助逻辑，支撑 SKILL.md 扫描、描述展示和按需加载。
     def _scan(self) -> dict[str, Skill]:
         skills: dict[str, Skill] = {}
         if not self.skills_dir.exists():
@@ -33,11 +35,13 @@ class SkillLoader:
             skills[name] = Skill(name=name, description=description, body=body, path=path)
         return skills
 
+    # 外部函数：输出可用技能摘要供系统提示使用，负责 SKILL.md 扫描、描述展示和按需加载。
     def descriptions(self) -> str:
         if not self.skills:
             return "(no skills found)"
         return "\n".join(f"- {skill.name}: {skill.description}" for skill in self.skills.values())
 
+    # 外部函数：实现 load_skill 工具能力，按名称返回指定技能正文。
     def load(self, name: str) -> str:
         skill = self.skills.get(name)
         if skill is None:
@@ -45,6 +49,7 @@ class SkillLoader:
             return f"Error: unknown skill '{name}'. Available: {available}"
         return f"<skill name=\"{skill.name}\" path=\"{skill.path}\">\n{skill.body}\n</skill>"
 
+    # 内部函数：处理 _parse_frontmatter 辅助逻辑，支撑 SKILL.md 扫描、描述展示和按需加载。
     def _parse_frontmatter(self, text: str) -> tuple[dict[str, str], str]:
         match = re.match(r"^---\s*\n(.*?)\n---\s*\n(.*)$", text, re.DOTALL)
         if not match:

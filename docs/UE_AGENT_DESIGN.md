@@ -13,7 +13,7 @@
 
 ## 当前已实现能力
 
-### `myagent ue doctor`
+### `uedev ue doctor`
 
 检查：
 
@@ -28,7 +28,7 @@
 - `UE_EDITOR_CMD_PATH`
 - `UE_EDITOR_PATH`
 
-### `myagent ue run-python`
+### `uedev ue run-python`
 
 将普通 Python 脚本包装成 UE 内执行脚本，外层捕获异常并打印 JSON。默认 dry-run，只输出：
 

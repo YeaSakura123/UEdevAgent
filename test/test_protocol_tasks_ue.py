@@ -4,12 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from myagent.protocol import ToolAction, parse_agent_action
-from myagent.tasks import TodoManager
-from myagent.ue import build_python_script, discover_ue, run_ue_python
+from uedev.protocol import FinalAction, ToolAction, parse_agent_action
+from uedev.tasks import TodoManager
+from uedev.ue import build_python_script, discover_ue, run_ue_python
 
 
 class ProtocolTests(unittest.TestCase):
+    # 测试函数：由 unittest 执行，验证 协议、todo 和 UE helper 回归测试 中的 test_parse_tool_action 场景。
     def test_parse_tool_action(self) -> None:
         action = parse_agent_action(
             '{"type":"tool","name":"todo_list","input":{}}'
@@ -18,8 +19,25 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsInstance(action, ToolAction)
         self.assertEqual(action.name, "todo_list")
 
+    # 测试函数：由 unittest 执行，验证缺少 type 的 answer 简写会被兼容为 final action。
+    def test_parse_answer_shorthand_as_final_action(self) -> None:
+        action = parse_agent_action('{"answer":"test"}')
+
+        self.assertIsInstance(action, FinalAction)
+        self.assertEqual(action.answer, "test")
+
+    # 测试函数：由 unittest 执行，验证多个 JSON action 粘连时会解析第一个可执行 action。
+    def test_parse_first_action_from_concatenated_json_objects(self) -> None:
+        action = parse_agent_action(
+            '{"type":"tool","name":"list_files","input":{"path":"test"}}{"type":"final","answer":"done"}'
+        )
+
+        self.assertIsInstance(action, ToolAction)
+        self.assertEqual(action.name, "list_files")
+
 
 class TodoManagerTests(unittest.TestCase):
+    # 测试函数：由 unittest 执行，验证 协议、todo 和 UE helper 回归测试 中的 test_update_rejects_multiple_in_progress_items 场景。
     def test_update_rejects_multiple_in_progress_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             manager = TodoManager(Path(temp) / ".agent")
@@ -32,6 +50,7 @@ class TodoManagerTests(unittest.TestCase):
                     ]
                 )
 
+    # 测试函数：由 unittest 执行，验证 协议、todo 和 UE helper 回归测试 中的 test_update_persists_items 场景。
     def test_update_persists_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             manager = TodoManager(Path(temp) / ".agent")
@@ -41,6 +60,7 @@ class TodoManagerTests(unittest.TestCase):
 
 
 class UeTests(unittest.TestCase):
+    # 测试函数：由 unittest 执行，验证 协议、todo 和 UE helper 回归测试 中的 test_discover_project_from_environment 场景。
     def test_discover_project_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -58,12 +78,14 @@ class UeTests(unittest.TestCase):
                 else:
                     __import__("os").environ["UE_PROJECT_PATH"] = old
 
+    # 测试函数：由 unittest 执行，验证 协议、todo 和 UE helper 回归测试 中的 test_build_script_wraps_json_errors 场景。
     def test_build_script_wraps_json_errors(self) -> None:
         wrapped = build_python_script("custom", "print('ok')")
 
         self.assertIn("traceback.format_exc", wrapped)
         self.assertIn("print('ok')", wrapped)
 
+    # 测试函数：由 unittest 执行，验证 协议、todo 和 UE helper 回归测试 中的 test_run_python_dry_run_requires_editor_path 场景。
     def test_run_python_dry_run_requires_editor_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -14,12 +14,13 @@ from .ue import discover_ue, render_doctor, render_run_result, run_ue_python
 from .worktrees import WorktreeManager
 
 
+# 外部函数：构建 CLI 参数和子命令界面，负责 uedev 命令行界面、参数解析和子命令分发。
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="myagent",
+        prog="uedev",
         description="Agentic CLI for coding and automation workflows.",
     )
-    parser.add_argument("--version", action="version", version=f"myagent {__version__}")
+    parser.add_argument("--version", action="version", version=f"uedev {__version__}")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -85,6 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# 外部函数：作为程序入口加载配置并分派命令，负责 uedev 命令行界面、参数解析和子命令分发。
 def main() -> None:
     try:
         load_dotenv(Path(".env"))
@@ -146,6 +148,7 @@ def main() -> None:
         raise SystemExit(1)
 
 
+# 内部函数：读取 .env 文件并写入进程环境变量，支撑 CLI 启动流程。
 def load_dotenv(path: Path) -> None:
     if not path.exists():
         return
@@ -163,6 +166,7 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+# 外部函数：实现 init 命令的配置文件创建功能，负责 uedev 命令行界面、参数解析和子命令分发。
 def init_config(force: bool = False) -> None:
     env_path = Path(".env")
     if env_path.exists() and not force:
@@ -190,6 +194,7 @@ def init_config(force: bool = False) -> None:
     print("Created .env. Fill in OPENAI_API_KEY and OPENAI_MODEL before running the agent.")
 
 
+# 外部函数：实现 doctor 命令的环境检查展示，负责 uedev 命令行界面、参数解析和子命令分发。
 def doctor() -> None:
     print(f"Version: {__version__}")
     print(f"Working directory: {Path.cwd().resolve()}")
@@ -201,6 +206,7 @@ def doctor() -> None:
     print(f"UE_ENGINE_ROOT: {os.environ.get('UE_ENGINE_ROOT') or '(missing)'}")
 
 
+# 外部函数：处理 ue 子命令的界面分发，负责 uedev 命令行界面、参数解析和子命令分发。
 def handle_ue(args: argparse.Namespace) -> None:
     cwd = Path(args.cwd).resolve()
     if args.ue_command == "doctor":

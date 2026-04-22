@@ -1,17 +1,17 @@
 # s01-s12 分阶段实现对照
 
-本项目按 `D:\Code\learn-claude-code-main` README 的节奏，把 Claude Code 风格 harness 机制迁移到 UE agent CLI。实现方式保留本项目的 OpenAI-compatible Chat Completions 与 JSON 单动作协议。
+本项目按 `D:\Code\learn-claude-code-main` README 的节奏，把 Claude Code 风格 harness 机制迁移到 UE agent CLI。当前实现使用 OpenAI-compatible Chat Completions 的原生 tool/function calling；旧 JSON 单动作协议仅作为兼容兜底。
 
 ## s01 Agent Loop
 
-位置：`myagent.loop.AgentRuntime.run_turn`
+位置：`uedev.loop.AgentRuntime.run_turn`
 
 实现：
 
 - 用户消息进入 `messages`
-- 模型返回一个 JSON action
-- CLI 执行动作并追加 observation
-- 直到模型返回 `final`
+- 模型返回原生 `tool_calls` 或普通最终回答
+- CLI 执行工具并追加 `tool` observation
+- 直到模型返回普通最终回答
 
 ## s02 Tool Use
 
@@ -19,13 +19,13 @@
 
 实现：
 
-- 所有工具进入 dispatch map
-- 新增工具只加 handler，不改主 loop
+- 所有工具同时进入 `uedev.tool_specs` schema 和 dispatch map
+- 新增工具需要加 schema 与 handler，不改主 loop
 - 当前基础工具：`shell`、`read_file`、`write_file`、`edit_file`、`list_files`
 
 ## s03 TodoWrite
 
-位置：`myagent.tasks.TodoManager`
+位置：`uedev.tasks.TodoManager`
 
 实现：
 
@@ -47,7 +47,7 @@
 
 ## s05 Skill Loading
 
-位置：`myagent.skills.SkillLoader`
+位置：`uedev.skills.SkillLoader`
 
 实现：
 
@@ -58,7 +58,7 @@
 
 ## s06 Context Compact
 
-位置：`myagent.context`
+位置：`uedev.context`
 
 实现：
 
@@ -68,7 +68,7 @@
 
 ## s07 Task System
 
-位置：`myagent.tasks.TaskManager`
+位置：`uedev.tasks.TaskManager`
 
 实现：
 
@@ -82,7 +82,7 @@
 
 ## s08 Background Tasks
 
-位置：`myagent.background.BackgroundManager`
+位置：`uedev.background.BackgroundManager`
 
 实现：
 
@@ -92,7 +92,7 @@
 
 ## s09 Agent Teams
 
-位置：`myagent.team.MessageBus`、`TeamManager`
+位置：`uedev.team.MessageBus`、`TeamManager`
 
 实现：
 
@@ -106,7 +106,7 @@
 
 ## s10 Team Protocols
 
-位置：`myagent.team.TeamManager`
+位置：`uedev.team.TeamManager`
 
 实现：
 
@@ -130,7 +130,7 @@
 
 ## s12 Worktree Task Isolation
 
-位置：`myagent.worktrees.WorktreeManager`
+位置：`uedev.worktrees.WorktreeManager`
 
 实现：
 
@@ -145,7 +145,7 @@
 
 ## UE Agent 适配
 
-位置：`myagent.ue`
+位置：`uedev.ue`
 
 UE 工具作为同一 dispatch map 的领域工具存在：
 

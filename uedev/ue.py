@@ -27,12 +27,14 @@ class UeRunResult:
     stderr: str = ""
 
 
+# 内部函数：按当前平台把命令参数安全拼成可展示的命令行字符串。
 def quote_command(parts: list[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(parts)
     return " ".join(shlex.quote(part) for part in parts)
 
 
+# 外部函数：发现 UE 项目和编辑器路径，负责 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def discover_ue(cwd: Path) -> UeDiscovery:
     notes: list[str] = []
     project_path = _discover_project(cwd, notes)
@@ -45,6 +47,7 @@ def discover_ue(cwd: Path) -> UeDiscovery:
     )
 
 
+# 外部函数：渲染 UE doctor 检查结果，负责 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def render_doctor(discovery: UeDiscovery) -> str:
     lines = [
         "UE doctor",
@@ -58,6 +61,7 @@ def render_doctor(discovery: UeDiscovery) -> str:
     return "\n".join(lines)
 
 
+# 外部函数：包装 UE Python 脚本和 JSON 异常输出，负责 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def build_python_script(kind: str, user_script: str) -> str:
     """生成 UE 内执行脚本；所有输出走 JSON，方便 agent 解析观察结果。"""
 
@@ -107,6 +111,7 @@ print(json.dumps({"ok": True, "validated_count": len(loaded_assets), "result": s
     )
 
 
+# 外部函数：准备或执行 UE Python 脚本，负责 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def run_ue_python(
     cwd: Path,
     agent_dir: Path,
@@ -175,6 +180,7 @@ def run_ue_python(
     )
 
 
+# 外部函数：渲染 UE Python dry-run 或执行结果，负责 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def render_run_result(result: UeRunResult) -> str:
     lines = [
         f"script: {result.script_path}",
@@ -192,6 +198,7 @@ def render_run_result(result: UeRunResult) -> str:
     return "\n".join(lines)
 
 
+# 内部函数：处理 _discover_project 辅助逻辑，支撑 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def _discover_project(cwd: Path, notes: list[str]) -> Path | None:
     env_project = os.environ.get("UE_PROJECT_PATH")
     if env_project:
@@ -212,6 +219,7 @@ def _discover_project(cwd: Path, notes: list[str]) -> Path | None:
     return None
 
 
+# 内部函数：处理 _discover_editor 辅助逻辑，支撑 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def _discover_editor(notes: list[str]) -> tuple[Path | None, Path | None]:
     cmd = _existing_env_path("UE_EDITOR_CMD_PATH")
     gui = _existing_env_path("UE_EDITOR_PATH")
@@ -229,6 +237,7 @@ def _discover_editor(notes: list[str]) -> tuple[Path | None, Path | None]:
     return cmd, gui
 
 
+# 内部函数：处理 _existing_env_path 辅助逻辑，支撑 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def _existing_env_path(name: str) -> Path | None:
     value = os.environ.get(name)
     if not value:
@@ -236,9 +245,11 @@ def _existing_env_path(name: str) -> Path | None:
     return _maybe(Path(value).expanduser().resolve())
 
 
+# 内部函数：处理 _maybe 辅助逻辑，支撑 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def _maybe(path: Path) -> Path | None:
     return path if path.exists() else None
 
 
+# 内部函数：处理 _indent 辅助逻辑，支撑 Unreal Engine 发现、脚本包装、dry-run 和执行结果展示。
 def _indent(text: str) -> str:
     return "\n".join(f"    {line}" if line else "" for line in text.splitlines())

@@ -11,6 +11,7 @@ from .tasks import TaskManager
 class WorktreeManager:
     """s12：任务图负责目标，git worktree 负责隔离执行目录。"""
 
+    # 内部函数：初始化当前类实例，准备 git worktree 创建、运行、保留、删除和索引维护 所需状态。
     def __init__(self, cwd: Path, worktrees_dir: Path, task_manager: TaskManager):
         self.cwd = cwd
         self.worktrees_dir = worktrees_dir
@@ -19,6 +20,7 @@ class WorktreeManager:
         self.task_manager = task_manager
         self.worktrees_dir.mkdir(parents=True, exist_ok=True)
 
+    # 外部函数：实现 worktree_create 工具能力，创建隔离 worktree 并可绑定任务。
     def create(self, name: str, task_id: int | None = None, base_ref: str = "HEAD") -> str:
         self._validate_name(name)
         path = self.worktrees_dir / name
@@ -39,6 +41,7 @@ class WorktreeManager:
         self._emit("worktree.create.after", index[name])
         return json.dumps(index[name], ensure_ascii=False, indent=2)
 
+    # 外部函数：实现 worktree_list 和 CLI worktrees 展示，列出托管 worktree。
     def list_all(self) -> str:
         index = self._load_index()
         if not index:
@@ -48,6 +51,7 @@ class WorktreeManager:
             for name, item in sorted(index.items())
         )
 
+    # 外部函数：实现 worktree_run 工具能力，在指定 worktree 中执行命令。
     def run(self, name: str, command: str, timeout_seconds: int = 300) -> str:
         item = self._get(name)
         result = subprocess.run(
@@ -71,6 +75,7 @@ class WorktreeManager:
             ]
         )
 
+    # 外部函数：标记 worktree 为保留，负责 git worktree 创建、运行、保留、删除和索引维护。
     def keep(self, name: str) -> str:
         index = self._load_index()
         item = index.get(name)
@@ -81,6 +86,7 @@ class WorktreeManager:
         self._emit("worktree.keep", item)
         return f"Kept worktree {name}: {item['path']}"
 
+    # 外部函数：删除托管 worktree 并维护任务绑定，负责 git worktree 创建、运行、保留、删除和索引维护。
     def remove(self, name: str, force: bool = False, complete_task: bool = False) -> str:
         index = self._load_index()
         item = index.get(name)
@@ -109,26 +115,31 @@ class WorktreeManager:
         self._save_index(index)
         return f"Removed worktree {name}."
 
+    # 内部函数：处理 _get 辅助逻辑，支撑 git worktree 创建、运行、保留、删除和索引维护。
     def _get(self, name: str) -> dict[str, object]:
         item = self._load_index().get(name)
         if item is None:
             raise ValueError(f"unknown worktree: {name}")
         return item
 
+    # 内部函数：处理 _load_index 辅助逻辑，支撑 git worktree 创建、运行、保留、删除和索引维护。
     def _load_index(self) -> dict[str, dict[str, object]]:
         if not self.index_path.exists():
             return {}
         data = json.loads(self.index_path.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
 
+    # 内部函数：处理 _save_index 辅助逻辑，支撑 git worktree 创建、运行、保留、删除和索引维护。
     def _save_index(self, index: dict[str, dict[str, object]]) -> None:
         self.index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    # 内部函数：处理 _emit 辅助逻辑，支撑 git worktree 创建、运行、保留、删除和索引维护。
     def _emit(self, event: str, payload: dict[str, object]) -> None:
         record = {"event": event, "ts": time.time(), **payload}
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    # 内部函数：处理 _validate_name 辅助逻辑，支撑 git worktree 创建、运行、保留、删除和索引维护。
     def _validate_name(self, name: str) -> None:
         if not name or any(char in name for char in "\\/:*?\"<>| "):
             raise ValueError("worktree name must be non-empty and path-safe")

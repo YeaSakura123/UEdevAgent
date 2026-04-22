@@ -1,39 +1,22 @@
-# myAgentCli
+# uedev-cli
 
-`myagent` is a Python CLI agent harness for coding, local automation, and
+`uedev` is a Python CLI agent harness for coding, local automation, and
 Unreal Engine editor workflows. It keeps a conversation, lets the model request
 tools, asks before risky execution by default, and feeds observations back into
 the model until the task is complete.
 
-The current action protocol is intentionally simple and stable. New code should
-prefer the generic tool form:
+Tool use now goes through OpenAI-compatible native tool/function calling. Tool
+schemas live in `uedev.tool_specs`, while implementations live in
+`AgentRuntime._build_tool_handlers`. The loop executes returned `tool_calls`,
+adds `tool` result messages, and asks the model to continue until it gives a
+normal final answer.
+
+The older hand-written JSON action protocol is still accepted as a fallback for
+older models and transcripts:
 
 ```json
 {"type":"tool","name":"shell","input":{"command":"...","reason":"..."}}
-```
-
-Other built-in tools:
-
-```json
-{"type":"tool","name":"todo_update","input":{"items":[{"id":"1","text":"...","status":"pending"}]}}
-{"type":"tool","name":"subagent","input":{"prompt":"inspect tests and summarize"}}
-{"type":"tool","name":"task_create","input":{"subject":"Validate UE assets","description":"Run dry-run first"}}
-{"type":"tool","name":"background_run","input":{"command":"python -m unittest discover -s test","reason":"run tests"}}
-{"type":"tool","name":"spawn_teammate","input":{"name":"alice","role":"tester","prompt":"claim ready tasks"}}
-{"type":"tool","name":"worktree_create","input":{"name":"asset-validation","task_id":1}}
-{"type":"tool","name":"ue_doctor","input":{}}
-{"type":"tool","name":"ue_run_python","input":{"kind":"list_assets","mode":"commandlet","script":"","execute":false}}
-```
-
-The legacy shell form is still accepted:
-
-```json
 {"type":"shell","command":"...","reason":"..."}
-```
-
-or:
-
-```json
 {"type":"final","answer":"..."}
 ```
 
@@ -50,7 +33,7 @@ python -m pip install -e .
 Create local configuration:
 
 ```bash
-python -m myagent init
+uedev init
 ```
 
 Edit `.env`:
@@ -71,51 +54,57 @@ OpenAI-compatible Chat Completions endpoints.
 Run a single task:
 
 ```bash
-python -m myagent run "create a code folder and add helloworld.py"
+uedev run "create a code folder and add helloworld.py"
 ```
 
 Start an interactive session:
 
 ```bash
-python -m myagent chat
+uedev chat
+```
+
+During development, the module entry point works too:
+
+```bash
+python -m uedev chat
 ```
 
 Check configuration:
 
 ```bash
-python -m myagent doctor
+uedev doctor
 ```
 
 Show the persisted agent todo board:
 
 ```bash
-python -m myagent tasks
-python -m myagent tasks --graph
-python -m myagent team
-python -m myagent worktrees
+uedev tasks
+uedev tasks --graph
+uedev team
+uedev worktrees
 ```
 
 Inspect UE configuration without launching Unreal Engine:
 
 ```bash
-python -m myagent ue doctor --cwd D:\Path\To\GameProject
+uedev ue doctor --cwd D:\Path\To\GameProject
 ```
 
 Prepare a UE Python command without launching UE:
 
 ```bash
-python -m myagent ue run-python scripts\list_assets.py --cwd D:\Path\To\GameProject
-python -m myagent ue list-assets --cwd D:\Path\To\GameProject
-python -m myagent ue validate-assets --cwd D:\Path\To\GameProject
+uedev ue run-python scripts\list_assets.py --cwd D:\Path\To\GameProject
+uedev ue list-assets --cwd D:\Path\To\GameProject
+uedev ue validate-assets --cwd D:\Path\To\GameProject
 ```
 
 Useful options:
 
 ```bash
-python -m myagent chat --timeout 180
-python -m myagent run "inspect this project" --yes
-python -m myagent run "debug this folder" --verbose
-python -m myagent chat --allow-ue-execute
+uedev chat --timeout 180
+uedev run "inspect this project" --yes
+uedev run "debug this folder" --verbose
+uedev chat --allow-ue-execute
 ```
 
 By default, shell commands require confirmation before execution. UE execution is
@@ -126,7 +115,10 @@ even stricter: UE Python tools dry-run unless the command line explicitly passes
 
 - `run` handles one task and exits.
 - `chat` keeps the same message history across turns.
-- `chat` supports slash commands: `/help`, `/todos`, `/ue doctor`.
+- `chat` shows the current version, model, and working directory when it starts.
+- `chat` supports slash commands such as `/help`, `/todos`, and `/ue doctor`;
+  type `/` to autocomplete commands with descriptions.
+- `chat` keeps an in-session input history that can be browsed with the arrow keys.
 - The harness implements the staged mechanisms from `learn-claude-code-main`:
   loop, tool dispatch, TodoWrite, subagent, skill loading, context compact,
   persistent task graph, background tasks, team inbox/protocols, autonomous task

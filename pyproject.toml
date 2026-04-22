@@ -1,12 +1,13 @@
 [project]
-name = "my-agent-cli"
+name = "uedev-cli"
 version = "0.1.0"
-description = "A Python agent CLI for coding and automation workflows."
+description = "A Python UE development agent CLI for coding and automation workflows."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "openai>=1.0.0",
+    "prompt_toolkit>=3.0",
 ]
 keywords = ["agent", "cli", "automation", "coding-agent"]
 classifiers = [
@@ -19,7 +20,10 @@ classifiers = [
 ]
 
 [project.scripts]
-myagent = "myagent.cli:main"
+uedev = "uedev.cli:main"
+
+[tool.setuptools]
+packages = ["uedev"]
 
 [build-system]
 requires = ["setuptools>=68"]

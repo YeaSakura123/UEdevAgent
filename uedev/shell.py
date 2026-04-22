@@ -14,15 +14,18 @@ class ShellResult:
     stderr: str
 
 
+# 外部函数：提供当前平台 shell 名称，负责 shell 名称识别、执行确认和命令运行。
 def shell_name() -> str:
     return "PowerShell" if sys.platform == "win32" else "bash"
 
 
+# 外部函数：展示命令确认提示并读取用户选择，负责 shell 名称识别、执行确认和命令运行。
 def confirm_command(command: str, reason: str) -> bool:
     answer = input(f"\nRun command?\nReason: {reason}\n> {command}\n[y/N] ")
     return answer.strip().lower() == "y"
 
 
+# 外部函数：执行 shell 命令并返回 stdout、stderr 和退出码，负责 shell 名称识别、执行确认和命令运行。
 def run_shell(command: str, cwd: Path, timeout_seconds: int) -> ShellResult:
     if shell_name() == "PowerShell":
         args = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command]

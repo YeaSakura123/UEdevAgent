@@ -1,6 +1,6 @@
 ---
 name: ue-editor
-description: UE 编辑器自动化工作流，优先使用 dry-run、资源观察、Data Validation 和人工审批。
+description: UE 编辑器自动化工作流，优先使用资源观察、Data Validation 和人工审批。
 ---
 
 # UE 编辑器自动化技能
@@ -8,10 +8,8 @@ description: UE 编辑器自动化工作流，优先使用 dry-run、资源观�
 ## 使用原则
 
 1. 先调用 `ue_doctor`，确认 `.uproject` 与编辑器路径。
-2. 默认生成 dry-run 命令，不主动启动 UE。
-3. 对资源进行写操作前，先列出目标路径、预期改动和回滚方案。
-4. 优先选择 `commandlet` 执行只读扫描；只有必须依赖完整编辑器上下文时才使用 `full_editor`。
-5. 大批量资产操作前，要求用户确认 Git 状态或提交点。
+2. 对资源进行写操作前，先列出目标路径、预期改动和回滚方案。
+3. 大批量资产操作前，要求用户确认 Git 状态或提交点。
 
 ## 常见工具选择
 

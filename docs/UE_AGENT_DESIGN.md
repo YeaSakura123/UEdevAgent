@@ -45,11 +45,12 @@ Agent 可请求：
 - `ue_doctor`
 - `ue_run_python`
 
-`ue_run_python` 支持 `kind`：
+`ue_run_python` 支持：
 
-- `custom`：执行模型生成或用户给出的脚本。
-- `list_assets`：使用 `unreal.AssetRegistryHelpers` 列出 `/Game` 资源。
-- `validate_assets`：尝试调用 `EditorValidatorSubsystem` 做资源校验。
+- `script`：执行模型生成或用户给出的 inline UE Python 代码。
+- `script_path`：执行指定 `.py` 文件。
+
+执行前由 harness 展示将要启动的 UE 命令，并等待用户 y/N 确认。
 
 ## 可能出现的问题
 

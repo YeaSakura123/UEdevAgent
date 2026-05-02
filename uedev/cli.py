@@ -35,8 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--timeout", type=int, default=120, help="shell command timeout in seconds")
     run_parser.add_argument("-y", "--yes", action="store_true", help="execute shell commands without asking")
     run_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
-    run_parser.add_argument("--verbose", action="store_true", help="show internal iteration and protocol diagnostics")
-    run_parser.add_argument("--allow-ue-execute", action="store_true", help="allow the agent to launch Unreal Editor for UE Python tools")
+    run_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
     run_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
 
     chat_parser = subparsers.add_parser("chat", help="start an interactive agent chat session")
@@ -44,8 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--timeout", type=int, default=120, help="shell command timeout in seconds")
     chat_parser.add_argument("-y", "--yes", action="store_true", help="execute shell commands without asking")
     chat_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
-    chat_parser.add_argument("--verbose", action="store_true", help="show internal iteration and protocol diagnostics")
-    chat_parser.add_argument("--allow-ue-execute", action="store_true", help="allow the agent to launch Unreal Editor for UE Python tools")
+    chat_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
     chat_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
 
     task_parser = subparsers.add_parser("tasks", help="show the persisted agent todo list")
@@ -106,7 +104,6 @@ def main() -> None:
                     cwd=Path(args.cwd).resolve(),
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
-                    allow_ue_execute=args.allow_ue_execute,
                     context_threshold=args.context_threshold,
                 )
             )
@@ -119,7 +116,6 @@ def main() -> None:
                     cwd=Path(args.cwd).resolve(),
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
-                    allow_ue_execute=args.allow_ue_execute,
                     context_threshold=args.context_threshold,
                 )
             )
@@ -224,6 +220,7 @@ def handle_ue(args: argparse.Namespace) -> None:
             kind="custom",
             execute=args.execute,
             timeout_seconds=args.timeout,
+            source_script_path=script_path,
         )
         print(render_run_result(result))
         return

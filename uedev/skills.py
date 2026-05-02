@@ -20,6 +20,7 @@ class SkillLoader:
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
         self.skills = self._scan()
+        self._name_index = {_normalize_skill_name(name): name for name in self.skills}
 
     # 内部函数：处理 _scan 辅助逻辑，支撑 SKILL.md 扫描、描述展示和按需加载。
     def _scan(self) -> dict[str, Skill]:
@@ -43,7 +44,8 @@ class SkillLoader:
 
     # 外部函数：实现 load_skill 工具能力，按名称返回指定技能正文。
     def load(self, name: str) -> str:
-        skill = self.skills.get(name)
+        skill_name = self._name_index.get(_normalize_skill_name(name), name)
+        skill = self.skills.get(skill_name)
         if skill is None:
             available = ", ".join(sorted(self.skills)) or "(none)"
             return f"Error: unknown skill '{name}'. Available: {available}"
@@ -61,3 +63,7 @@ class SkillLoader:
                 key, value = line.split(":", 1)
                 meta[key.strip()] = value.strip().strip('"').strip("'")
         return meta, match.group(2).strip()
+
+
+def _normalize_skill_name(name: str) -> str:
+    return name.strip().lower()

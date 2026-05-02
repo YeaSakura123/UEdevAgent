@@ -51,7 +51,15 @@ class MessageBus:
 
         lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         path.write_text("", encoding="utf-8")
-        return [json.loads(line) for line in lines]
+        messages: list[dict[str, object]] = []
+        for line in lines:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(message, dict):
+                messages.append(message)
+        return messages
 
 
 class TeamManager:
@@ -170,9 +178,13 @@ class TeamManager:
     # 内部函数：处理 _load_config 辅助逻辑，支撑 队友状态、消息 inbox 和协作协议。
     def _load_config(self) -> dict[str, object]:
         if self.config_path.exists():
-            data = json.loads(self.config_path.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and "members" in data:
-                return data
+            try:
+                raw_text = self.config_path.read_text(encoding="utf-8").strip()
+                data = json.loads(raw_text) if raw_text else {}
+                if isinstance(data, dict) and "members" in data:
+                    return data
+            except json.JSONDecodeError:
+                pass
         return {"team_name": "ue-agent-team", "members": []}
 
     # 内部函数：处理 _save_config 辅助逻辑，支撑 队友状态、消息 inbox 和协作协议。
@@ -183,7 +195,13 @@ class TeamManager:
     def _load_requests(self) -> dict[str, object]:
         if not self.requests_path.exists():
             return {}
-        data = json.loads(self.requests_path.read_text(encoding="utf-8"))
+        try:
+            raw_text = self.requests_path.read_text(encoding="utf-8").strip()
+            if not raw_text:
+                return {}
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return {}
         return data if isinstance(data, dict) else {}
 
     # 内部函数：处理 _save_requests 辅助逻辑，支撑 队友状态、消息 inbox 和协作协议。

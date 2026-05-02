@@ -111,12 +111,20 @@ def get_tool_specs() -> list[ToolSpec]:
         function_tool("worktree_run", "Run a command inside a managed worktree.", {"name": string, "command": string, "timeout_seconds": integer}, ["name", "command"]),
         function_tool("worktree_keep", "Keep a managed worktree and detach it from cleanup.", {"name": string}, ["name"]),
         function_tool("worktree_remove", "Remove a managed worktree.", {"name": string, "force": boolean, "complete_task": boolean}, ["name"]),
-        function_tool("ue_doctor", "Inspect Unreal Engine project and editor configuration.", {}),
+        function_tool(
+            "ue_doctor",
+            "Inspect Unreal Engine project and editor configuration. Optional cwd points at a UE project or workspace directory.",
+            {"cwd": string},
+        ),
         function_tool(
             "ue_run_python",
-            "Run or dry-run an Unreal Engine Python script.",
-            {"script": string, "mode": string, "kind": string, "execute": boolean},
-            ["script"],
+            "Run Unreal Engine Python after user confirmation. Use script for inline Python code or script_path for a .py file path. Optional mode is commandlet or full_editor; optional cwd points at a UE project or workspace directory. To return data to the agent, set _uedev_result or call _uedev_emit(key, value); unreal.log output is captured as logs for diagnosis.",
+            {"script": string, "script_path": string, "mode": string, "cwd": string},
+        ),
+        function_tool(
+            "ue_stop_executor",
+            "Queue a stop request for the full_editor UE executor in the given cwd. Use only when the user wants the editor-side executor to stop polling.",
+            {"cwd": string},
         ),
     ]
 

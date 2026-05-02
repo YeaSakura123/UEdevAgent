@@ -6,7 +6,7 @@
 
 ## 当前亮点
 
-- **Agent loop 清晰**：LLM 输出 JSON action，CLI 执行工具并把 observation 回填，能讲清楚 ReAct / tool-use 的闭环。
+- **Agent loop 清晰**：LLM 通过原生 tool/function calling 请求工具，CLI 执行工具并把 observation 回填，能讲清楚 ReAct / tool-use 的闭环。
 - **工具协议可扩展**：从早期 `shell/final` 升级到 `tool` 分发，后续加 MCP、RAG、后台任务不需要重写 loop。
 - **安全边界明确**：shell 默认人工确认；UE 默认 dry-run；真正启动 UE 需要 `--execute` 或 `--allow-ue-execute`。
 - **UE 场景聚焦**：支持 `.uproject`/编辑器路径发现、UE Python 脚本包装、资源列表、Data Validation 脚本模板。

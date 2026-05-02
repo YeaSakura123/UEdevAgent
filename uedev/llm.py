@@ -103,14 +103,17 @@ def call_model(messages: list[ChatMessage], tools: list[dict[str, Any]] | None =
         raise RuntimeError(f"Model request failed: {error}") from error
 
     message = response.choices[0].message
-    tool_calls = [
-        ToolCall(
-            id=tool_call.id,
-            name=tool_call.function.name,
-            arguments=_parse_tool_arguments(tool_call.function.arguments),
-        )
-        for tool_call in (message.tool_calls or [])
-    ]
+    try:
+        tool_calls = [
+            ToolCall(
+                id=tool_call.id,
+                name=tool_call.function.name,
+                arguments=_parse_tool_arguments(tool_call.function.arguments or ""),
+            )
+            for tool_call in (message.tool_calls or [])
+        ]
+    except RuntimeError as error:
+        raise RuntimeError(f"Failed to parse model tool call arguments: {error}") from error
     content = message.content or ""
     if not content and not tool_calls:
         raise RuntimeError("Model returned an empty response.")

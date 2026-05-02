@@ -5,20 +5,11 @@ Unreal Engine editor workflows. It keeps a conversation, lets the model request
 tools, asks before risky execution by default, and feeds observations back into
 the model until the task is complete.
 
-Tool use now goes through OpenAI-compatible native tool/function calling. Tool
+Tool use goes through OpenAI-compatible native tool/function calling. Tool
 schemas live in `uedev.tool_specs`, while implementations live in
 `AgentRuntime._build_tool_handlers`. The loop executes returned `tool_calls`,
 adds `tool` result messages, and asks the model to continue until it gives a
 normal final answer.
-
-The older hand-written JSON action protocol is still accepted as a fallback for
-older models and transcripts:
-
-```json
-{"type":"tool","name":"shell","input":{"command":"...","reason":"..."}}
-{"type":"shell","command":"...","reason":"..."}
-{"type":"final","answer":"..."}
-```
 
 ## Install
 
@@ -104,18 +95,22 @@ Useful options:
 uedev chat --timeout 180
 uedev run "inspect this project" --yes
 uedev run "debug this folder" --verbose
-uedev chat --allow-ue-execute
 ```
 
 By default, shell commands require confirmation before execution. UE execution is
-even stricter: UE Python tools dry-run unless the command line explicitly passes
-`--execute` or the agent session passes `--allow-ue-execute`.
+also confirmed at execution time: agent-driven UE Python tools ask for y/N before
+launching Unreal Editor. Standalone `uedev ue ...` commands still require
+`--execute`; omitting it produces a dry-run command preview.
 
 ## Behavior
 
 - `run` handles one task and exits.
 - `chat` keeps the same message history across turns.
 - `chat` shows the current version, model, and working directory when it starts.
+- `chat` uses a Prompt Toolkit transcript-flow interface when a terminal is
+  available, so the next prompt appears directly after the latest answer.
+- `chat` shows per-turn thinking/tool events while running, then prints a
+  collapsed process summary before the final answer.
 - `chat` supports slash commands such as `/help`, `/todos`, and `/ue doctor`;
   type `/` to autocomplete commands with descriptions.
 - `chat` keeps an in-session input history that can be browsed with the arrow keys.
@@ -125,11 +120,12 @@ even stricter: UE Python tools dry-run unless the command line explicitly passes
   claiming, and task-aware git worktrees.
 - Commands run in the selected working directory.
 - Shell commands time out after 120 seconds by default.
-- Internal protocol diagnostics are hidden unless `--verbose` is enabled.
-- If a filesystem task is answered without using a shell action, the CLI asks
-  the model to choose an executable action instead.
+- Internal iteration and tool diagnostics are hidden unless `--verbose` is enabled.
+- If a filesystem task is answered without using a tool call, the CLI asks
+  the model to call the appropriate tool instead.
 - Todos are stored in `.agent/todos.json`.
 - UE-generated scripts are stored in `.agent/ue_scripts/`.
+- Manual validation steps are documented in `docs/VALIDATION.md`.
 
 ## Unreal Engine Direction
 

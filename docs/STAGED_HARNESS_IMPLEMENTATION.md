@@ -1,6 +1,6 @@
 # s01-s12 分阶段实现对照
 
-本项目按 `D:\Code\learn-claude-code-main` README 的节奏，把 Claude Code 风格 harness 机制迁移到 UE agent CLI。当前实现使用 OpenAI-compatible Chat Completions 的原生 tool/function calling；旧 JSON 单动作协议仅作为兼容兜底。
+本项目按 `D:\Code\learn-claude-code-main` README 的节奏，把 Claude Code 风格 harness 机制迁移到 UE agent CLI。当前实现使用 OpenAI-compatible Chat Completions 的原生 tool/function calling，模型正文不会再被当作工具动作解析。
 
 ## s01 Agent Loop
 
@@ -152,14 +152,12 @@ UE 工具作为同一 dispatch map 的领域工具存在：
 - `ue_doctor`
 - `ue_run_python`
 
-支持模板：
+支持输入：
 
-- `kind=custom`
-- `kind=list_assets`
-- `kind=validate_assets`
+- `script`：直接执行 inline UE Python 代码。
+- `script_path`：执行指定 `.py` 文件。
 
 安全边界：
 
-- 默认 dry-run
-- agent 会话必须传 `--allow-ue-execute` 才能真正执行 UE
+- agent 会话在启动 UE 前必须展示命令并等待用户 y/N 确认
 - 本项目开发和测试阶段不启动 UE

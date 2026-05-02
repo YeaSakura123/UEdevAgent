@@ -64,7 +64,13 @@ class TodoManager:
         if not self.path.exists():
             return []
 
-        data = json.loads(self.path.read_text(encoding="utf-8"))
+        try:
+            raw_text = self.path.read_text(encoding="utf-8").strip()
+            if not raw_text:
+                return []
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return []
         if not isinstance(data, list):
             return []
 
@@ -232,7 +238,13 @@ class TaskManager:
 
     # 内部函数：处理 _read_file 辅助逻辑，支撑 todo 列表和持久任务图管理。
     def _read_file(self, path: Path) -> dict[str, object]:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            raw_text = path.read_text(encoding="utf-8").strip()
+            if not raw_text:
+                raise ValueError(f"Empty task file: {path}")
+            data = json.loads(raw_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid task file: {path}: {error}") from error
         if not isinstance(data, dict):
             raise ValueError(f"Invalid task file: {path}")
         return data

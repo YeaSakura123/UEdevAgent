@@ -27,7 +27,44 @@ def micro_compact(messages: list[ChatMessage], keep_recent: int = 8, max_content
         content = messages[index].content
         if len(content) > max_content:
             first_line = content.splitlines()[0] if content else "Tool result"
-            messages[index] = ChatMessage(role="user", content=f"{first_line}\n[older observation compacted]")
+            messages[index] = ChatMessage(
+                role=messages[index].role,
+                content=f"{first_line}\n[older observation compacted]",
+                tool_call_id=messages[index].tool_call_id,
+                name=messages[index].name,
+            )
+
+
+def repair_tool_call_messages(messages: list[ChatMessage]) -> None:
+    """Keep OpenAI tool-call history valid after compaction or older sessions.
+
+    An assistant message with tool_calls must be followed immediately by one
+    tool message for every tool_call_id. If older compaction damaged that shape,
+    downgrade the assistant tool-call record to plain context before sending.
+    """
+
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.role != "assistant" or not message.tool_calls:
+            index += 1
+            continue
+
+        expected = [tool_call.id for tool_call in message.tool_calls]
+        cursor = index + 1
+        observed: list[str] = []
+        while cursor < len(messages) and messages[cursor].role == "tool":
+            if messages[cursor].tool_call_id:
+                observed.append(messages[cursor].tool_call_id)
+            cursor += 1
+
+        if observed[: len(expected)] != expected:
+            tool_names = ", ".join(tool_call.name for tool_call in message.tool_calls)
+            content = message.content.strip()
+            summary = f"{content}\n[tool calls omitted from compacted history: {tool_names}]".strip()
+            messages[index] = ChatMessage(role="assistant", content=summary)
+
+        index += 1
 
 
 # 内部函数：保存完整会话 transcript，供压缩后追溯原始上下文。

@@ -235,10 +235,14 @@ class UeTests(unittest.TestCase):
         os_module.environ["UE_EDITOR_PATH"] = str(editor)
         try:
             prepared = prepare_ue_python(root, root / ".agent", "print('ok')", mode="full_editor")
+            meta = json.loads((prepared.run_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(prepared.mode, "full_editor")
             self.assertIn("UnrealEditor.exe", prepared.command)
             self.assertIn("-ExecutePythonScript=", prepared.command)
             self.assertNotIn("set_keep_python_script_alive(True)", prepared.user_script_path.read_text(encoding="utf-8"))
+            self.assertEqual(prepared.user_script_path.read_text(encoding="utf-8"), "print('ok')")
+            self.assertEqual(meta["script_origin"], "inline")
+            self.assertIsNone(meta["source_script"])
             self.assertTrue(prepared.run_dir.exists())
             self.assertTrue((prepared.run_dir / "meta.json").exists())
             self.assertTrue(prepared.wrapper_path.exists())
@@ -279,6 +283,8 @@ class UeTests(unittest.TestCase):
             meta = json.loads((prepared.run_dir / "meta.json").read_text(encoding="utf-8"))
 
             self.assertEqual(prepared.user_script_path.read_text(encoding="utf-8"), "_uedev_result = {'from': 'source'}\n")
+            self.assertEqual(prepared.script_origin, "script_path")
+            self.assertEqual(meta["script_origin"], "script_path")
             self.assertEqual(meta["source_script"]["path"], str(source.resolve()))
             self.assertEqual(meta["source_script"]["available"], True)
             self.assertIn("sha256", meta["source_script"])
@@ -295,7 +301,9 @@ class UeTests(unittest.TestCase):
     def test_render_running_full_editor_result(self) -> None:
         result = UeRunResult(
             command="UnrealEditor.exe Demo.uproject",
-            script_path=Path("script.py"),
+            script_path=Path("wrapper.py"),
+            user_script_path=Path("user_script.py"),
+            wrapper_path=Path("wrapper.py"),
             executed=True,
             process_id=123,
             status="running",
@@ -305,6 +313,9 @@ class UeTests(unittest.TestCase):
 
         self.assertIn("run_id: ue_test", rendered)
         self.assertIn("status: running", rendered)
+        self.assertIn("user_script_path: user_script.py", rendered)
+        self.assertIn("wrapper_path: wrapper.py", rendered)
+        self.assertNotIn("script: wrapper.py", rendered)
         self.assertIn("process_id: 123", rendered)
 
     def test_run_python_dry_run_requires_editor_path(self) -> None:
@@ -321,8 +332,12 @@ class UeTests(unittest.TestCase):
         os_module.environ["UE_EDITOR_CMD_PATH"] = str(editor)
         try:
             result = run_ue_python(root, root / ".agent", "print('ok')", execute=False)
+            meta = json.loads((result.run_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertFalse(result.executed)
             self.assertIn("UnrealEditor-Cmd.exe", result.command)
+            self.assertEqual(result.script_origin, "inline")
+            self.assertEqual(meta["script_origin"], "inline")
+            self.assertIsNone(meta["source_script"])
             self.assertTrue(result.run_dir.exists())
             self.assertTrue((result.run_dir / "user_script.py").exists())
             self.assertTrue((result.run_dir / "wrapper.py").exists())

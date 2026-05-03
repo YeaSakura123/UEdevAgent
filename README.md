@@ -124,7 +124,7 @@ launching Unreal Editor. Standalone `uedev ue ...` commands still require
 - If a filesystem task is answered without using a tool call, the CLI asks
   the model to call the appropriate tool instead.
 - Todos are stored in `.agent/todos.json`.
-- UE-generated scripts are stored in `.agent/ue_scripts/`.
+- UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; the authoritative executed script snapshot is `user_script.py` in that run directory. `.agent/ue_scripts/` is a legacy location and is not the current execution entrypoint.
 - Manual validation steps are documented in `docs/VALIDATION.md`.
 
 ## Unreal Engine Direction

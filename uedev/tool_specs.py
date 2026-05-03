@@ -118,7 +118,7 @@ def get_tool_specs() -> list[ToolSpec]:
         ),
         function_tool(
             "ue_run_python",
-            "Run Unreal Engine Python after user confirmation. Use script for inline Python code or script_path for a .py file path. Optional mode is commandlet or full_editor; optional cwd points at a UE project or workspace directory. To return data to the agent, set _uedev_result or call _uedev_emit(key, value); unreal.log output is captured as logs for diagnosis.",
+            "Run Unreal Engine Python after user confirmation. Use script for complete inline Python code or script_path for an existing .py file path; do not pass inline runpy.run_path loader scripts. Optional mode is commandlet or full_editor; optional cwd points at a UE project or workspace directory. To return data to the agent, set _uedev_result or call _uedev_emit(key, value); unreal.log output is captured as logs for diagnosis.",
             {"script": string, "script_path": string, "mode": string, "cwd": string},
         ),
         function_tool(

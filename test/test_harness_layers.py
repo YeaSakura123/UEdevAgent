@@ -23,7 +23,13 @@ from uedev.loop import (
     defers_tool_confirmation,
     render_chat_banner,
     render_slash_help,
-    requires_tool_action,
+)
+from uedev.prompts import (
+    _join_sections,
+    build_prompt_bundle,
+    build_subagent_prompt,
+    build_system_prompt as build_prompt_system_prompt,
+    build_tool_confirmation_reminder,
 )
 from uedev.renderer import ConsoleRenderer, TuiRenderer
 from uedev.skills import SkillLoader
@@ -98,6 +104,33 @@ class SkillLoaderTests(unittest.TestCase):
             self.assertIn("Use UE Python", loader.load(" UE-EDITOR "))
 
 
+class PromptBuilderTests(unittest.TestCase):
+    def test_system_prompt_includes_static_and_dynamic_sections(self) -> None:
+        prompt = build_prompt_system_prompt(Path("ProjectRoot"), "PowerShell", "- ue-editor: UE workflow")
+
+        self.assertIn("You are a UE development agent", prompt)
+        self.assertIn("Perforce UE source control:", prompt)
+        self.assertIn("Before modifying any Perforce-controlled file, run `p4 edit <path>`.", prompt)
+        self.assertIn("Do not run `p4 submit` unless the user explicitly asks for submit.", prompt)
+        self.assertIn("UE safety:", prompt)
+        self.assertIn("Available skills:\n- ue-editor: UE workflow", prompt)
+        self.assertIn("Working directory: ProjectRoot", prompt)
+        self.assertIn("Shell: PowerShell", prompt)
+        self.assertIn("never an inline runpy.run_path loader", prompt)
+
+    def test_prompt_bundle_exposes_subagent_and_reminders(self) -> None:
+        bundle = build_prompt_bundle(Path("ProjectRoot"), "PowerShell", "(no skills found)")
+
+        self.assertEqual(bundle.subagent_prompt, build_subagent_prompt())
+        self.assertEqual(bundle.tool_confirmation_reminder, build_tool_confirmation_reminder())
+        self.assertIn("(no skills found)", bundle.system_prompt)
+
+    def test_prompt_sections_filter_none_and_empty_content(self) -> None:
+        prompt = _join_sections([lambda: "alpha", lambda: None, lambda: "   ", lambda: "beta"])
+
+        self.assertEqual(prompt, "alpha\n\nbeta")
+
+
 class ContextTests(unittest.TestCase):
     def test_micro_compact_old_tool_results(self) -> None:
         messages = [ChatMessage(role="user", content=f"Tool result for: read_file\n{'x' * 5000}") for _ in range(10)]
@@ -152,6 +185,21 @@ class ContextTests(unittest.TestCase):
 
             self.assertEqual(len(compacted), 1)
             self.assertTrue(list(Path(temp).glob("transcript_*.jsonl")))
+
+    def test_compact_locally_preserves_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            messages = [
+                ChatMessage(role="system", content="system rules"),
+                ChatMessage(role="user", content="hello"),
+                ChatMessage(role="assistant", content="hi"),
+            ]
+
+            compacted = compact_locally(messages, Path(temp), "test")
+
+            self.assertEqual(compacted[0].role, "system")
+            self.assertEqual(compacted[0].content, "system rules")
+            self.assertEqual(compacted[1].role, "user")
+            self.assertIn("[Compressed locally: test]", compacted[1].content)
 
     def test_estimate_tokens_accepts_native_tool_calls(self) -> None:
         messages = [
@@ -408,15 +456,6 @@ class SlashCommandTests(unittest.TestCase):
 
 
 class ToolRequirementTests(unittest.TestCase):
-    def test_low_intent_chat_does_not_require_tool_action(self) -> None:
-        self.assertFalse(requires_tool_action("test"))
-        self.assertFalse(requires_tool_action("hello"))
-        self.assertFalse(requires_tool_action("测试"))
-
-    def test_explicit_test_run_requires_tool_action(self) -> None:
-        self.assertTrue(requires_tool_action("run tests"))
-        self.assertTrue(requires_tool_action("pytest"))
-
     def test_ue_confirmation_deferral_is_not_final(self) -> None:
         self.assertTrue(
             defers_tool_confirmation(
@@ -443,6 +482,8 @@ class ToolSpecTests(unittest.TestCase):
             runtime = AgentRuntime(options)
 
             self.assertEqual(get_tool_names(), set(runtime.tools))
+            self.assertEqual(runtime.system_prompt, runtime.prompt_bundle.system_prompt)
+            self.assertIn("UE safety:", runtime.system_prompt)
 
     def test_ue_run_python_schema_hides_internal_execution_flags(self) -> None:
         specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
@@ -455,6 +496,7 @@ class ToolSpecTests(unittest.TestCase):
         self.assertIn("mode", properties)
         self.assertIn("_uedev_result", description)
         self.assertIn("_uedev_emit", description)
+        self.assertIn("do not pass inline runpy.run_path loader scripts", description)
         self.assertNotIn("kind", properties)
         self.assertNotIn("execute", properties)
 
@@ -527,6 +569,33 @@ class UeRuntimeToolTests(unittest.TestCase):
             script = runtime._resolve_ue_script({"script": "print('hello inline')"}, root)
 
             self.assertEqual(script, "print('hello inline')")
+
+    def test_ue_run_python_rejects_inline_runpy_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = self._runtime(root)
+
+            with self.assertRaisesRegex(ValueError, "Use script_path"):
+                runtime._resolve_ue_script(
+                    {
+                        "script": "import runpy\nrunpy.run_path('Scripts/hello.py', run_name='__main__')\n",
+                    },
+                    root,
+                )
+
+    def test_ue_run_python_allows_inline_business_script_with_runpy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = self._runtime(root)
+            inline_script = (
+                "import runpy\n"
+                "print('before child')\n"
+                "runpy.run_path('Scripts/child.py', run_name='__main__')\n"
+            )
+
+            script = runtime._resolve_ue_script({"script": inline_script}, root)
+
+            self.assertEqual(script, inline_script)
 
     def test_ue_run_python_requires_script_or_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -44,6 +44,7 @@ class UeRunResult:
     stderr_path: Path | None = None
     task_path: Path | None = None
     source_script_path: Path | None = None
+    script_origin: str = "inline"
     result_json: dict[str, Any] | None = None
     heartbeat_status: dict[str, Any] | None = None
 
@@ -67,6 +68,7 @@ class UePreparedRun:
     executor_path: Path | None
     executor_heartbeat_path: Path | None
     source_script_path: Path | None
+    script_origin: str
 
 
 def quote_command(parts: list[str]) -> str:
@@ -630,6 +632,7 @@ def prepare_ue_python(
     task_path = agent_dir / "ue_queue" / "pending" / f"{run_id}.task.json" if mode == "full_editor" else None
 
     user_script = build_python_script(kind, script, keep_editor_open=mode == "full_editor")
+    script_origin = "script_path" if source_script_path is not None else "inline"
     user_script_path.write_text(user_script, encoding="utf-8")
     wrapper_path.write_text(
         build_wrapper_script(
@@ -688,6 +691,7 @@ def prepare_ue_python(
             "events_path": str(events_path),
             "task_path": str(task_path) if task_path else None,
             "source_script": _source_script_meta(source_script_path),
+            "script_origin": script_origin,
         },
     )
     _write_latest(agent_dir, run_id, run_dir, "prepared")
@@ -710,6 +714,7 @@ def prepare_ue_python(
         executor_path=executor_path,
         executor_heartbeat_path=executor_heartbeat_path,
         source_script_path=source_script_path,
+        script_origin=script_origin,
     )
 
 
@@ -783,14 +788,22 @@ def render_run_result(result: UeRunResult) -> str:
         f"run_id: {result.run_id or '(legacy)'}",
         f"status: {result.status}",
         f"run_dir: {result.run_dir or '(none)'}",
-        f"script: {result.script_path}",
-        f"command: {result.command}",
-        f"executed: {result.executed}",
+        f"script_origin: {result.script_origin}",
     ]
     if result.user_script_path is not None:
         lines.append(f"user_script_path: {result.user_script_path}")
+    if result.wrapper_path is not None:
+        lines.append(f"wrapper_path: {result.wrapper_path}")
+    elif result.script_path is not None:
+        lines.append(f"script_path: {result.script_path}")
     if result.source_script_path is not None:
         lines.append(f"source_script_path: {result.source_script_path}")
+    lines.extend(
+        [
+            f"command: {result.command}",
+            f"executed: {result.executed}",
+        ]
+    )
     if result.result_path is not None:
         lines.append(f"result_path: {result.result_path}")
     if result.heartbeat_path is not None:
@@ -871,6 +884,7 @@ def _result_from_prepared(
         stderr_path=prepared.stderr_path,
         task_path=prepared.task_path,
         source_script_path=prepared.source_script_path,
+        script_origin=prepared.script_origin,
         result_json=result_json,
         heartbeat_status=heartbeat_status,
     )

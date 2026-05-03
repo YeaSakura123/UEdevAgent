@@ -82,7 +82,8 @@ def compact_locally(messages: list[ChatMessage], transcript_dir: Path, reason: s
     """不额外调用模型的保守压缩：保存原文，只留下任务连续性摘要。"""
 
     transcript = save_transcript(messages, transcript_dir)
-    recent = messages[-6:]
+    system_message = messages[0] if messages and messages[0].role == "system" else None
+    recent = [message for message in messages if message.role != "system"][-6:]
     summary_lines = [
         f"[Compressed locally: {reason}]",
         f"Full transcript saved at: {transcript}",
@@ -90,4 +91,7 @@ def compact_locally(messages: list[ChatMessage], transcript_dir: Path, reason: s
     ]
     for message in recent:
         summary_lines.append(f"{message.role}: {message.content[:1000]}")
-    return [ChatMessage(role="user", content="\n".join(summary_lines))]
+    compacted = [ChatMessage(role="user", content="\n".join(summary_lines))]
+    if system_message is not None:
+        return [system_message, *compacted]
+    return compacted

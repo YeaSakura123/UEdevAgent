@@ -30,6 +30,7 @@ from .events import (
     tool_start_event,
 )
 from .llm import ChatMessage, call_model
+from .prompts import PromptBundle, build_prompt_bundle, build_system_prompt as render_system_prompt
 from .renderer import ConsoleRenderer
 from .shell import confirm_command, run_shell, shell_name
 from .skills import SkillLoader
@@ -210,51 +211,7 @@ def create_chat_session(completer: Completer | None = None, input=None, output=N
 
 # 内部函数：构建系统提示词，描述工具协议、安全规则和当前工作目录。
 def build_system_prompt(cwd: Path, skills: SkillLoader) -> str:
-    return f"""You are a UE development agent running inside a command-line harness.
-
-Architecture rule: the model supplies agency; the harness supplies tools, observation, permissions, context, tasks, team coordination, and worktree isolation.
-Use the provided native tools when workspace, shell, UE, task, team, or file observation is required.
-When no tool is needed, answer normally in concise prose.
-
-Conversation behavior:
-- If the user is chatting, greeting, testing the interface, asking a conceptual question, or does not clearly ask you to inspect, modify, run, or check the workspace, answer directly with a final action.
-- Only call tools when the user asks for concrete local work or information that requires observing the workspace, shell, UE project, task state, or files.
-- Do not list files or inspect the workspace just because the user sends a short test message.
-- Do not ask the user for a natural-language confirmation before calling shell or UE execution tools. Call the appropriate tool; the harness will display the command and ask y/N before it executes.
-
-Use workspace-relative paths, not absolute paths, unless the user explicitly gives an absolute path.
-
-Core tools by lesson:
-- s01/s02 loop and tools: shell, read_file, write_file, edit_file, list_files
-- s03 planning: todo_update, todo_list
-- s04 context isolation: subagent
-- s05 on-demand knowledge: load_skill
-- s06 context management: compact
-- s07 persistent task graph: task_create, task_get, task_update, task_list, claim_task
-- s08 background execution: background_run, background_check
-- s09 team mailbox: spawn_teammate, list_teammates, send_message, read_inbox, broadcast
-- s10 protocols: shutdown_request, shutdown_response, plan_submit, plan_review
-- s11 autonomy: idle, claim_task
-- s12 worktree isolation: worktree_create, worktree_list, worktree_run, worktree_keep, worktree_remove
-- UE tools: ue_doctor, ue_run_python, ue_stop_executor. ue_run_python accepts inline script code or script_path for a .py file, then asks the user before launching UE.
-
-Skill usage:
-- Available skills are listed below as lightweight descriptions only.
-- If the user names a skill or the request clearly matches a skill description, call load_skill with that skill name before doing domain-specific work.
-- After load_skill returns, follow the loaded skill instructions for the current turn.
-
-UE safety:
-- Always call ue_doctor before UE editor operations.
-- ue_run_python must rely on the harness confirmation prompt before launching UE; do not ask for confirmation in the final answer and do not pass execute or kind.
-- Prefer commandlet mode for read-only automation. Use full_editor only when the user asks for full editor or an API needs it.
-- UE Python scripts should set _uedev_result or call _uedev_emit(key, value) for data the agent must report. unreal.log output is captured as logs, but structured results are preferred.
-- After ue_run_python returns, use the returned result/log summary to answer. Do not read .agent/ue_runs artifacts unless diagnosing a failed or incomplete run.
-
-Available skills:
-{skills.descriptions()}
-
-Working directory: {cwd}
-Shell: {shell_name()}"""
+    return render_system_prompt(cwd, shell_name(), skills.descriptions())
 
 
 # 外部函数：执行 run 命令的一次性 agent 任务，负责 agent 主循环、chat 界面、工具分发和运行时观察。
@@ -334,7 +291,12 @@ class AgentRuntime:
         self.bus = MessageBus(options.cwd / ".team")
         self.team = TeamManager(options.cwd / ".team", self.task_manager, self.bus)
         self.worktrees = WorktreeManager(options.cwd, options.cwd / ".worktrees", self.task_manager)
-        self.system_prompt = build_system_prompt(options.cwd, self.skill_loader)
+        self.prompt_bundle: PromptBundle = build_prompt_bundle(
+            options.cwd,
+            shell_name(),
+            self.skill_loader.descriptions(),
+        )
+        self.system_prompt = self.prompt_bundle.system_prompt
         self.tools = self._build_tool_handlers()
 
     # 内部函数：推进模型思考、工具执行和结果回填，是 agent 主循环的核心流程。
@@ -349,7 +311,6 @@ class AgentRuntime:
 
     # 外部函数：推进模型思考、工具执行和结果回填，按事件流暴露 agent 主循环过程。
     def run_turn_events(self, messages: list[ChatMessage], goal: str, turn_id: str | None = None) -> Iterator[AgentEvent]:
-        work_tool_used = False
         rounds_without_todo = 0
         tool_specs = get_tool_specs()
         current_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
@@ -370,9 +331,6 @@ class AgentRuntime:
                         rounds_without_todo = 0
                     else:
                         rounds_without_todo += 1
-
-                    if action.name not in {"todo_update", "todo_list", "compact", "read_inbox", "list_teammates", "task_list"}:
-                        work_tool_used = True
 
                     if is_error:
                         yield tool_error_event(action.name, output, current_turn_id)
@@ -399,7 +357,7 @@ class AgentRuntime:
                 continue
 
             final_answer = response.content.strip()
-            if self._defer_final_if_tool_needed(messages, goal, final_answer, work_tool_used, record_assistant=True):
+            if self._defer_final_if_tool_needed(messages, goal, final_answer, record_assistant=True):
                 continue
             yield final_event(final_answer, current_turn_id, _duration_ms(started_at))
             return
@@ -483,17 +441,13 @@ class AgentRuntime:
         messages: list[ChatMessage],
         goal: str,
         answer: str,
-        work_tool_used: bool,
         *,
         record_assistant: bool = False,
     ) -> bool:
         if defers_tool_confirmation(goal, answer):
             if record_assistant:
                 messages.append(ChatMessage(role="assistant", content=answer))
-            messages.append(ChatMessage(role="user", content=_TOOL_CONFIRMATION_REMINDER))
-            return True
-        if requires_tool_action(goal) and not work_tool_used:
-            messages.append(ChatMessage(role="user", content=_TOOL_REQUIRED_REMINDER))
+            messages.append(ChatMessage(role="user", content=self.prompt_bundle.tool_confirmation_reminder))
             return True
         return False
 
@@ -581,6 +535,7 @@ class AgentRuntime:
             if not prompt:
                 raise ValueError("subagent requires prompt")
             return self._run_subagent(prompt, str(tool_input.get("agent_type", "explore")))
+
 
         return {
             "shell": shell_tool,
@@ -710,10 +665,7 @@ class AgentRuntime:
         child_messages = [
             ChatMessage(
                 role="system",
-                content=(
-                    "You are a focused subagent with clean context. "
-                    "Use native tool calls. Use only read_file, list_files, or shell unless asked to write."
-                ),
+                content=self.prompt_bundle.subagent_prompt,
             ),
             ChatMessage(role="user", content=prompt),
         ]
@@ -762,16 +714,6 @@ def _duration_ms(started_at: float) -> int:
     return max(0, int((time.perf_counter() - started_at) * 1000))
 
 
-# 内部函数：判断用户目标是否必须使用工具，防止执行类任务直接 final。
-_TOOL_CONFIRMATION_REMINDER = (
-    "Do not ask the user to confirm tool execution in a final answer. "
-    "Call the appropriate tool now; the harness will show the command and ask y/N before execution."
-)
-
-
-_TOOL_REQUIRED_REMINDER = "The request requires harness work. Use one of the provided native tools before answering."
-
-
 def defers_tool_confirmation(goal: str, answer: str) -> bool:
     goal_text = goal.lower()
     answer_text = answer.lower()
@@ -782,59 +724,6 @@ def defers_tool_confirmation(goal: str, answer: str) -> bool:
     return any(token in answer_text for token in confirmation_tokens) and any(
         token in answer_text for token in action_tokens
     )
-
-
-def requires_tool_action(goal: str) -> bool:
-    normalized = goal.lower().strip()
-    low_intent_inputs = {"test", "ping", "hi", "hello", "hey", "你好", "在吗", "测试"}
-    if normalized in low_intent_inputs:
-        return False
-
-    tool_phrases = [
-        "run test",
-        "run tests",
-        "run the tests",
-        "run unit tests",
-        "pytest",
-        "unittest",
-        "test suite",
-    ]
-    if any(phrase in normalized for phrase in tool_phrases):
-        return True
-
-    keywords = [
-        "创建",
-        "新建",
-        "写入",
-        "修改",
-        "编辑",
-        "删除",
-        "移动",
-        "复制",
-        "运行",
-        "执行",
-        "测试",
-        "检查",
-        "验证",
-        "生成",
-        "ue",
-        "unreal",
-        "asset",
-        "create",
-        "write",
-        "edit",
-        "modify",
-        "delete",
-        "move",
-        "copy",
-        "run",
-        "execute",
-        "check",
-        "verify",
-        "generate",
-        "install",
-    ]
-    return any(keyword in normalized for keyword in keywords)
 
 
 # 内部函数：处理 _require_list_of_dicts 辅助逻辑，支撑 agent 主循环、chat 界面、工具分发和运行时观察。

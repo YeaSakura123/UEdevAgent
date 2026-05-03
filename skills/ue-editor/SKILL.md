@@ -18,6 +18,12 @@ description: UE 编辑器自动化工作流，优先使用资源观察、Data Va
 - 自定义脚本：`ue_run_python` with `kind=custom`
 - 编辑器路径检查：`ue_doctor`
 
+## 脚本执行方式
+
+- 临时脚本：直接把完整 UE Python 内容传给 `ue_run_python.script`，由 harness 写入 `.agent/ue_runs/<run_id>/user_script.py`。
+- 已存在的持久脚本：使用 `ue_run_python.script_path`，由 harness 读取原文件并在 run 目录中保存快照。
+- 不要把 `runpy.run_path(...)` loader 当作 inline `script` 传入；这会让 run 目录只保存跳转路径，无法追溯真实脚本内容。
+
 ## 风险提示
 
 - UE Python API 会随版本变化，失败时先保留脚本与命令，便于用户在 UE 输出日志中定位。

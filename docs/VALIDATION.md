@@ -16,14 +16,19 @@ python -m unittest discover -s test
 python -m uedev chat
 ```
 
-- Confirm the full-screen TUI opens with status, transcript, and input areas.
+- Confirm the coding-agent terminal UI opens with structured user, system, tool,
+  approval, and assistant blocks.
 - Type `test`; it should answer directly without tool activity.
 - Type `/`; slash commands should complete with descriptions.
 - Run `/help`, `/clear`, and `/ue doctor`.
+- Ask for a response with Markdown headings, a list, a table, and a code block;
+  the final answer should render as rich terminal Markdown.
 - Ask the agent to read a small file; the turn should show tool activity while
   running and collapse to a summary after the final answer.
 - Ask the agent to edit `test/main.py`; the turn should show edit activity and
   collapse after the final answer.
+- Run `python -m uedev chat --plain`; it should keep the script-friendly plain
+  transcript renderer.
 
 ## UE dry-run checks
 

@@ -45,6 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     chat_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
     chat_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
+    chat_parser.add_argument("--plain", action="store_true", help="use the script-friendly plain chat renderer")
 
     task_parser = subparsers.add_parser("tasks", help="show the persisted agent todo list")
     task_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
@@ -105,6 +106,7 @@ def main() -> None:
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
                     context_threshold=args.context_threshold,
+                    plain=args.plain,
                 )
             )
         elif args.command == "chat":

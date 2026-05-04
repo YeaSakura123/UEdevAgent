@@ -32,7 +32,7 @@ from .events import (
 from .llm import ChatMessage, call_model
 from .prompts import PromptBundle, build_prompt_bundle, build_system_prompt as render_system_prompt
 from .renderer import ConsoleRenderer
-from .shell import confirm_command, run_shell, shell_name
+from .shell import ApprovalProvider, confirm_command, run_shell, shell_name
 from .skills import SkillLoader
 from .tasks import TaskManager, TodoManager
 from .team import MessageBus, TeamManager
@@ -59,6 +59,7 @@ class AgentOptions:
     timeout_seconds: int
     verbose: bool
     context_threshold: int = 60000
+    plain: bool = False
 
 
 ToolHandler = Callable[[dict[str, object]], str]
@@ -157,19 +158,14 @@ def _is_subsequence(needle: str, haystack: str) -> bool:
 # 外部函数：生成 chat 启动界面的版本、模型和目录信息，负责 agent 主循环、chat 界面、工具分发和运行时观察。
 def render_chat_banner(options: AgentOptions) -> str:
     model = os.environ.get("OPENAI_MODEL") or "(missing)"
-    rows = [
-        f">_ uedev (v{__version__})",
-        "",
-        f"model:     {model}",
-        f"directory: {options.cwd}",
-    ]
-    width = max(len(row) for row in rows)
-    framed = ["╭" + "─" * (width + 2) + "╮"]
-    framed.extend(f"│ {row.ljust(width)} │" for row in rows)
-    framed.append("╰" + "─" * (width + 2) + "╯")
-    framed.append("")
-    framed.append('  Tip: Type "/" for commands; exit or Ctrl+C to quit.')
-    return "\n".join(framed)
+    return "\n".join(
+        [
+            f">_ uedev (v{__version__})",
+            f"model:     {model}",
+            f"directory: {options.cwd}",
+            'Tip: Type "/" for commands; exit or Ctrl+C to quit.',
+        ]
+    )
 
 
 # 内部函数：创建 Prompt Toolkit 会话，配置 slash 补全、输入历史和提示样式。
@@ -228,26 +224,23 @@ def run_agent(options: AgentOptions) -> None:
 
 # 外部函数：执行 chat 命令的交互式会话界面，负责 agent 主循环、chat 界面、工具分发和运行时观察。
 def run_chat(options: AgentOptions) -> None:
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            from .tui import ChatTuiApplication
+    if options.plain or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        run_plain_chat(options)
+        return
 
-            runtime = AgentRuntime(options)
-            ChatTuiApplication(
-                options=options,
-                runtime=runtime,
-                banner=render_chat_banner(options),
-                completer=SlashCommandCompleter(),
-            ).run()
-            return
-        except Exception as error:
-            print(f"TUI unavailable, falling back to console chat: {error}", file=sys.stderr)
+    from .tui import ChatTuiApplication
 
-    run_console_chat(options)
+    runtime = AgentRuntime(options)
+    ChatTuiApplication(
+        options=options,
+        runtime=runtime,
+        banner=render_chat_banner(options),
+        completer=SlashCommandCompleter(),
+    ).run()
 
 
 # 外部函数：执行非 TUI 的交互式 chat fallback，负责普通控制台事件流输出。
-def run_console_chat(options: AgentOptions) -> None:
+def run_plain_chat(options: AgentOptions) -> None:
     runtime = AgentRuntime(options)
     session = create_chat_session()
     messages = [
@@ -258,7 +251,7 @@ def run_console_chat(options: AgentOptions) -> None:
 
     print(render_chat_banner(options))
     while True:
-        query = session.prompt([("class:prompt", "\n› ")], **create_chat_prompt_options()).strip()
+        query = session.prompt([("class:prompt", "\n> ")], **create_chat_prompt_options()).strip()
         if query.lower() in {"", "quit", "exit"}:
             return
 
@@ -277,11 +270,11 @@ def run_console_chat(options: AgentOptions) -> None:
         for event in runtime.run_turn_events(messages, goal=query):
             renderer.render(event)
 
-
 class AgentRuntime:
     # 内部函数：初始化当前类实例，准备 agent 主循环、chat 界面、工具分发和运行时观察 所需状态。
-    def __init__(self, options: AgentOptions):
+    def __init__(self, options: AgentOptions, approval_provider: ApprovalProvider | None = None):
         self.options = options
+        self.approval_provider = approval_provider or confirm_command
         self.agent_dir = options.cwd / ".agent"
         self.agent_dir.mkdir(parents=True, exist_ok=True)
         self.todo_manager = TodoManager(self.agent_dir)
@@ -451,6 +444,9 @@ class AgentRuntime:
             return True
         return False
 
+    def _confirm(self, command: str, reason: str) -> bool:
+        return self.approval_provider(command, reason)
+
     def _build_tool_handlers(self) -> dict[str, ToolHandler]:
         # 内部函数：处理 shell 工具调用，确认权限后执行命令并格式化结果。
         def shell_tool(tool_input: dict[str, object]) -> str:
@@ -459,7 +455,7 @@ class AgentRuntime:
             if not command:
                 raise ValueError("shell command cannot be empty")
 
-            approved = self.options.auto_approve or confirm_command(command, reason)
+            approved = self.options.auto_approve or self._confirm(command, reason)
             if not approved:
                 return "The user rejected that command. Choose a safer command or finish."
 
@@ -480,7 +476,7 @@ class AgentRuntime:
             command = str(tool_input.get("command", "")).strip()
             timeout = int(tool_input.get("timeout_seconds") or tool_input.get("timeout") or self.options.timeout_seconds)
             reason = str(tool_input.get("reason") or "agent requested background command")
-            if not (self.options.auto_approve or confirm_command(command, reason)):
+            if not (self.options.auto_approve or self._confirm(command, reason)):
                 return "The user rejected that background command."
             return self.background.run(command, timeout)
 
@@ -497,7 +493,7 @@ class AgentRuntime:
                 kind="custom",
                 source_script_path=source_script_path,
             )
-            approved = confirm_command(
+            approved = self._confirm(
                 prepared.command,
                 "agent requested Unreal Engine Python execution",
             )
@@ -649,6 +645,8 @@ class AgentRuntime:
         if not script_path:
             if not script.strip():
                 raise ValueError("ue_run_python requires either script or script_path")
+            if _looks_like_inline_runpy_loader(script):
+                raise ValueError("Use script_path instead of passing an inline runpy.run_path loader script.")
             return script, None
 
         path = Path(script_path).expanduser()
@@ -717,12 +715,28 @@ def _duration_ms(started_at: float) -> int:
 def defers_tool_confirmation(goal: str, answer: str) -> bool:
     goal_text = goal.lower()
     answer_text = answer.lower()
-    if not any(token in goal_text for token in ["ue", "unreal", "editor", "脚本", "执行", "启动", "运行", ".py"]):
+    if not any(
+        token in goal_text
+        for token in ["ue", "unreal", "editor", "script", "execute", "launch", "run", "脚本", "执行", "启动", "运行", ".py"]
+    ):
         return False
     confirmation_tokens = ["confirm", "confirmation", "确认", "是否", "y/n", "[y/n]"]
     action_tokens = ["run", "execute", "launch", "start", "continue", "执行", "启动", "运行", "继续"]
     return any(token in answer_text for token in confirmation_tokens) and any(
         token in answer_text for token in action_tokens
+    )
+
+
+def _looks_like_inline_runpy_loader(script: str) -> bool:
+    lines = [
+        line.strip()
+        for line in script.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if len(lines) > 2:
+        return False
+    return any(line == "import runpy" or line.startswith("import runpy ") for line in lines) and any(
+        "runpy.run_path(" in line for line in lines
     )
 
 

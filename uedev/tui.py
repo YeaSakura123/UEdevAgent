@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import TYPE_CHECKING
 
+from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.output.base import Output
@@ -33,9 +34,9 @@ class ChatTuiApplication:
         self.input = input
         self.output = output
         self.renderer = TuiRenderer(banner=banner, verbose=options.verbose)
+        self.runtime.approval_provider = self.confirm_command
         self.messages = self._initial_messages()
 
-    # 外部函数：启动 transcript-flow chat，负责输入、slash command 和 agent 事件顺序输出。
     def run(self) -> None:
         from .loop import create_chat_prompt_options, create_chat_session
 
@@ -44,7 +45,7 @@ class ChatTuiApplication:
 
         while True:
             try:
-                query = session.prompt([("class:prompt", "\n› ")], **create_chat_prompt_options()).strip()
+                query = session.prompt([("class:prompt", "\n> ")], **create_chat_prompt_options()).strip()
             except (EOFError, KeyboardInterrupt):
                 return
 
@@ -62,14 +63,25 @@ class ChatTuiApplication:
 
             self._run_turn(query)
 
-    # 内部函数：创建一轮会话的初始上下文，负责保留系统提示和当前工作目录信息。
+    def confirm_command(self, command: str, reason: str) -> bool:
+        self.renderer.print_approval(command, reason)
+        session_kwargs = {}
+        if self.input is not None:
+            session_kwargs["input"] = self.input
+        if self.output is not None:
+            session_kwargs["output"] = self.output
+        session = PromptSession(**session_kwargs)
+        answer = session.prompt("Approve? [y/N] ").strip().lower()
+        approved = answer == "y"
+        self.renderer.print_system("Approved." if approved else "Rejected.")
+        return approved
+
     def _initial_messages(self) -> list[ChatMessage]:
         return [
             ChatMessage(role="system", content=self.runtime.system_prompt),
             ChatMessage(role="user", content=f"Working directory: {self.options.cwd}\nShell: {shell_name()}"),
         ]
 
-    # 内部函数：同步运行一轮 agent，负责按时间顺序把事件追加到 transcript。
     def _run_turn(self, goal: str) -> None:
         turn_id = f"turn-{uuid.uuid4().hex[:8]}"
         self.messages.append(ChatMessage(role="user", content=goal))

@@ -12,7 +12,7 @@ from prompt_toolkit.shortcuts.prompt import CompleteStyle
 
 from uedev.background import BackgroundManager
 from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import final_event, thinking_event, tool_result_event, tool_start_event
+from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.loop import (
     SLASH_COMMANDS,
@@ -32,6 +32,7 @@ from uedev.prompts import (
     build_tool_confirmation_reminder,
 )
 from uedev.renderer import ConsoleRenderer, TuiRenderer
+from uedev.shell import ShellResult, run_shell
 from uedev.skills import SkillLoader
 from uedev.tasks import TaskManager
 from uedev.team import MessageBus, TeamManager
@@ -298,9 +299,79 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertTrue(any(message.role == "tool" for message in messages))
 
 
+class ShellAndApprovalTests(unittest.TestCase):
+    def test_run_shell_returns_output_without_printing(self) -> None:
+        class FakeProcess:
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return "stdout text\n", "stderr text\n"
+
+            def kill(self):
+                pass
+
+        stdout = StringIO()
+        stderr = StringIO()
+        with tempfile.TemporaryDirectory() as temp:
+            with patch("uedev.shell.subprocess.Popen", return_value=FakeProcess()):
+                with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+                    result = run_shell("echo test", Path(temp), 1)
+
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(result.stdout, "stdout text\n")
+        self.assertEqual(result.stderr, "stderr text\n")
+
+    def test_runtime_uses_injected_approval_provider_for_shell(self) -> None:
+        approvals: list[tuple[str, str]] = []
+
+        def approve(command: str, reason: str) -> bool:
+            approvals.append((command, reason))
+            return True
+
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                ),
+                approval_provider=approve,
+            )
+
+            with patch("uedev.loop.run_shell", return_value=ShellResult("echo ok", 0, "ok\n", "")):
+                result = runtime.tools["shell"]({"command": "echo ok", "reason": "test approval"})
+
+        self.assertEqual(approvals, [("echo ok", "test approval")])
+        self.assertIn("exitCode: 0", result)
+        self.assertIn("ok", result)
+
+    def test_runtime_rejects_shell_when_approval_provider_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                ),
+                approval_provider=lambda command, reason: False,
+            )
+
+            result = runtime.tools["shell"]({"command": "echo no", "reason": "test rejection"})
+
+        self.assertIn("rejected", result)
+
+
 class RendererTests(unittest.TestCase):
     def test_tui_renderer_collapses_turn_after_final(self) -> None:
-        renderer = TuiRenderer("banner", verbose=True, stream=StringIO())
+        stream = StringIO()
+        renderer = TuiRenderer("banner", verbose=True, stream=stream)
         renderer.start_turn("turn-1", "read a file")
 
         renderer.render(thinking_event(1, 3, "turn-1"))
@@ -308,11 +379,42 @@ class RendererTests(unittest.TestCase):
         renderer.render(final_event("done", "turn-1"))
 
         text = renderer.render_text()
+        rendered = stream.getvalue()
 
-        self.assertIn("• Working", text)
-        self.assertIn("─ Worked", text)
+        self.assertIn("thinking:\nThinking... (1/3)", text)
+        self.assertIn("summary:\nWorked", text)
         self.assertIn("1 tool used", text)
-        self.assertIn("done", text)
+        self.assertIn("assistant:\ndone", text)
+        self.assertIn("assistant", rendered)
+
+    def test_tui_renderer_renders_markdown_final_answer(self) -> None:
+        stream = StringIO()
+        renderer = TuiRenderer("banner", verbose=False, stream=stream)
+        markdown = "# Title\n\n- item\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n```python\nprint('x')\n```"
+
+        renderer.start_turn("turn-1", "show markdown")
+        renderer.render(final_event(markdown, "turn-1"))
+
+        transcript = renderer.render_text()
+        rendered = stream.getvalue()
+
+        self.assertIn("assistant:\n# Title", transcript)
+        self.assertIn("Title", rendered)
+        self.assertIn("item", rendered)
+        self.assertIn("print", rendered)
+
+    def test_tui_renderer_renders_tool_errors(self) -> None:
+        stream = StringIO()
+        renderer = TuiRenderer("banner", verbose=False, stream=stream)
+        renderer.start_turn("turn-1", "fail")
+
+        renderer.render(tool_error_event("shell", "boom", "turn-1"))
+
+        text = renderer.render_text()
+        rendered = stream.getvalue()
+
+        self.assertIn("tool_error:\nFailed shell\nboom", text)
+        self.assertIn("Failed shell", rendered)
 
     def test_console_renderer_compacts_long_output(self) -> None:
         renderer = ConsoleRenderer(verbose=True, max_output_chars=24)
@@ -326,7 +428,6 @@ class RendererTests(unittest.TestCase):
         renderer = TuiRenderer("banner", verbose=True, stream=StringIO())
 
         renderer.print_banner()
-        renderer.print_user("read a file")
         renderer.start_turn("turn-1", "read a file")
         renderer.render(thinking_event(1, 3, "turn-1"))
         renderer.render(tool_start_event("read_file", {"path": "a.txt"}, "turn-1"))
@@ -335,12 +436,12 @@ class RendererTests(unittest.TestCase):
 
         transcript = renderer.render_text()
 
-        self.assertLess(transcript.index("banner"), transcript.index("› read a file"))
-        self.assertLess(transcript.index("› read a file"), transcript.index("• Working"))
-        self.assertLess(transcript.index("• Working"), transcript.index("• Running read_file"))
-        self.assertLess(transcript.index("• Running read_file"), transcript.index("• Ran read_file"))
-        self.assertLess(transcript.index("• Ran read_file"), transcript.index("─ Worked"))
-        self.assertLess(transcript.index("─ Worked"), transcript.index("• done"))
+        self.assertNotIn("user:\nread a file", transcript)
+        self.assertLess(transcript.index("banner:\nbanner"), transcript.index("thinking:\nThinking"))
+        self.assertLess(transcript.index("thinking:\nThinking"), transcript.index("tool_start:\nRunning read_file"))
+        self.assertLess(transcript.index("tool_start:\nRunning read_file"), transcript.index("tool_result:\nOK read_file"))
+        self.assertLess(transcript.index("tool_result:\nOK read_file"), transcript.index("summary:\nWorked"))
+        self.assertLess(transcript.index("summary:\nWorked"), transcript.index("assistant:\ndone"))
 
 
 class TaskAndTeamTests(unittest.TestCase):

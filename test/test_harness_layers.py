@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from io import StringIO
@@ -11,6 +12,7 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.shortcuts.prompt import CompleteStyle
 
 from uedev.background import BackgroundManager
+from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
 from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
@@ -21,9 +23,11 @@ from uedev.loop import (
     SlashCommandCompleter,
     create_chat_prompt_options,
     defers_tool_confirmation,
+    is_acknowledgement_answer,
     render_chat_banner,
     render_slash_help,
 )
+from uedev.permissions import classify_shell_command
 from uedev.prompts import (
     _join_sections,
     build_prompt_bundle,
@@ -37,8 +41,121 @@ from uedev.skills import SkillLoader
 from uedev.tasks import TaskManager
 from uedev.team import MessageBus, TeamManager
 from uedev.tool_specs import get_tool_names, get_tool_specs
+from uedev.tui import ChatTuiApplication
 from uedev.workspace import edit_file, read_file, write_file
 from uedev.worktrees import WorktreeManager
+
+
+def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "models": models
+                or {
+                    "first-model": {
+                        "model": "gpt-test",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "test-key",
+                    }
+                },
+                "ue": {"engines": ue_engines or {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def create_ue_engine_root(root: Path, *, commandlet: bool = True, gui: bool = True) -> None:
+    bin_dir = root / "Engine" / "Binaries" / "Win64"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if commandlet:
+        (bin_dir / "UnrealEditor-Cmd.exe").write_text("", encoding="utf-8")
+    if gui:
+        (bin_dir / "UnrealEditor.exe").write_text("", encoding="utf-8")
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_system_config_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ConfigError, "Config file not found"):
+                load_system_config(Path(temp) / "missing.json")
+
+    def test_invalid_system_config_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config_path = Path(temp) / "bad.json"
+            config_path.write_text("{bad", encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, "Invalid JSON"):
+                load_system_config(config_path)
+
+    def test_project_active_model_overrides_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "main-key",
+                    },
+                    "gpt-alt": {
+                        "model": "alt-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "alt-key",
+                    },
+                },
+            )
+            (agent_dir(root) / "config.json").parent.mkdir(parents=True)
+            (agent_dir(root) / "config.json").write_text(json.dumps({"version": 1, "active_model": "gpt-alt"}), encoding="utf-8")
+
+            profile = resolve_model_profile(root, load_system_config(config_path))
+
+            self.assertEqual(profile.name, "gpt-alt")
+            self.assertEqual(profile.model, "alt-model")
+
+    def test_first_model_is_default_when_default_model_is_omitted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "first": {
+                        "model": "first-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "first-key",
+                    },
+                    "second": {
+                        "model": "second-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "second-key",
+                    },
+                },
+            )
+
+            config = load_system_config(config_path)
+            profile = resolve_model_profile(root, config)
+
+            self.assertEqual(config.default_model, "first")
+            self.assertEqual(profile.name, "first")
+
+    def test_project_permission_mode_defaults_and_persists(self) -> None:
+        from uedev.config import save_project_permission_mode
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            self.assertEqual(load_project_config(root).permission_mode, "default")
+
+            save_project_permission_mode(root, "auto_review")
+            payload = json.loads((agent_dir(root) / "config.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["permission_mode"], "auto_review")
+            self.assertEqual(load_project_config(root).permission_mode, "auto_review")
 
 
 class WorkspaceToolTests(unittest.TestCase):
@@ -111,9 +228,16 @@ class PromptBuilderTests(unittest.TestCase):
 
         self.assertIn("You are a UE development agent", prompt)
         self.assertIn("Perforce UE source control:", prompt)
+        self.assertIn("use ue_doctor's Perforce result", prompt)
+        self.assertIn("do not run shell `p4 info` just to detect whether the project uses Perforce", prompt)
         self.assertIn("Before modifying any Perforce-controlled file, run `p4 edit <path>`.", prompt)
         self.assertIn("Do not run `p4 submit` unless the user explicitly asks for submit.", prompt)
         self.assertIn("UE safety:", prompt)
+        self.assertIn("Never answer with acknowledgements about future behavior", prompt)
+        self.assertIn("Do not use todo_update to acknowledge instructions", prompt)
+        self.assertIn("meaningful multi-step task tracking only", prompt)
+        self.assertIn("call ue_doctor directly and do not call list_files or shell `p4 info`", prompt)
+        self.assertIn("Only use shell `p4 info` for raw Perforce diagnostics", prompt)
         self.assertIn("Available skills:\n- ue-editor: UE workflow", prompt)
         self.assertIn("Working directory: ProjectRoot", prompt)
         self.assertIn("Shell: PowerShell", prompt)
@@ -240,6 +364,8 @@ class AgentEventLoopTests(unittest.TestCase):
     def test_run_turn_events_emits_tool_flow(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
             write_file(root, "a.txt", "hello")
             runtime = AgentRuntime(
                 AgentOptions(
@@ -260,8 +386,9 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("done"),
             ]
 
-            with patch("uedev.loop.call_model", side_effect=responses):
-                events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test"))
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", side_effect=responses):
+                    events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test"))
 
             event_types = [event.type for event in events]
             self.assertEqual(event_types[:3], ["thinking", "tool_start", "tool_result"])
@@ -272,6 +399,8 @@ class AgentEventLoopTests(unittest.TestCase):
     def test_run_turn_events_emits_tool_error(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
             runtime = AgentRuntime(
                 AgentOptions(
                     task="",
@@ -291,12 +420,80 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("failed cleanly"),
             ]
 
-            with patch("uedev.loop.call_model", side_effect=responses):
-                events = list(runtime.run_turn_events(messages, "use missing tool", turn_id="turn-test"))
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", side_effect=responses):
+                    events = list(runtime.run_turn_events(messages, "use missing tool", turn_id="turn-test"))
 
             self.assertIn("tool_error", [event.type for event in events])
             self.assertEqual(events[-1].type, "final")
             self.assertTrue(any(message.role == "tool" for message in messages))
+
+    def test_run_turn_events_rejects_acknowledgement_final_after_tool_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            write_file(root, "a.txt", "hello")
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=4,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [
+                ChatMessage(role="system", content=runtime.system_prompt),
+                ChatMessage(role="user", content="read a.txt"),
+            ]
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})]),
+                ModelResponse("已按你的要求执行，并会遵循该行为。"),
+                ModelResponse("a.txt contains: hello"),
+            ]
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", side_effect=responses):
+                    events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test"))
+
+            self.assertEqual(events[-1].type, "final")
+            self.assertEqual(events[-1].message, "a.txt contains: hello")
+            self.assertTrue(any(message.role == "system" and "Invalid final answer" in message.content for message in messages))
+
+    def test_plan_mode_requires_proposed_plan_final(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            runtime.collaboration_mode = "plan"
+            messages = [
+                ChatMessage(role="system", content=runtime.system_prompt),
+                ChatMessage(role="user", content="make a plan"),
+            ]
+            responses = [
+                ModelResponse("plain plan"),
+                ModelResponse("<proposed_plan>\n# Plan\n</proposed_plan>"),
+            ]
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", side_effect=responses):
+                    events = list(runtime.run_turn_events(messages, "make a plan", turn_id="turn-test"))
+
+            self.assertEqual(events[-1].type, "final")
+            self.assertEqual(events[-1].message, "<proposed_plan>\n# Plan\n</proposed_plan>")
+            self.assertTrue(any(message.role == "system" and "Plan Mode final answers" in message.content for message in messages))
 
 
 class ShellAndApprovalTests(unittest.TestCase):
@@ -342,10 +539,10 @@ class ShellAndApprovalTests(unittest.TestCase):
                 approval_provider=approve,
             )
 
-            with patch("uedev.loop.run_shell", return_value=ShellResult("echo ok", 0, "ok\n", "")):
-                result = runtime.tools["shell"]({"command": "echo ok", "reason": "test approval"})
+            with patch("uedev.loop.run_shell", return_value=ShellResult("curl https://example.com", 0, "ok\n", "")):
+                result = runtime.tools["shell"]({"command": "curl https://example.com", "reason": "test approval"})
 
-        self.assertEqual(approvals, [("echo ok", "test approval")])
+        self.assertEqual(approvals, [("curl https://example.com", "test approval")])
         self.assertIn("exitCode: 0", result)
         self.assertIn("ok", result)
 
@@ -363,9 +560,121 @@ class ShellAndApprovalTests(unittest.TestCase):
                 approval_provider=lambda command, reason: False,
             )
 
-            result = runtime.tools["shell"]({"command": "echo no", "reason": "test rejection"})
+            result = runtime.tools["shell"]({"command": "curl https://example.com", "reason": "test rejection"})
 
         self.assertIn("rejected", result)
+
+    def test_default_permission_allows_local_shell_without_approval(self) -> None:
+        approvals: list[tuple[str, str]] = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                ),
+                approval_provider=lambda command, reason: approvals.append((command, reason)) or False,
+            )
+
+            with patch("uedev.loop.run_shell", return_value=ShellResult("echo ok", 0, "ok\n", "")):
+                result = runtime.tools["shell"]({"command": "echo ok", "reason": "local"})
+
+        self.assertEqual(approvals, [])
+        self.assertIn("exitCode: 0", result)
+
+    def test_read_only_permission_requires_approval_for_write_file(self) -> None:
+        approvals: list[tuple[str, str]] = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                ),
+                approval_provider=lambda command, reason: approvals.append((command, reason)) or False,
+            )
+            runtime.permission_mode = "read_only"
+
+            result = runtime.tools["write_file"]({"path": "blocked.txt", "content": "no"})
+
+            self.assertIn("rejected", result)
+            self.assertEqual(approvals, [("write_file blocked.txt", "read-only mode requires approval before editing files")])
+            self.assertFalse((root / "blocked.txt").exists())
+
+    def test_auto_review_permission_denies_dangerous_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            runtime.permission_mode = "auto_review"
+
+            result = runtime.tools["shell"]({"command": "git reset --hard", "reason": "danger"})
+
+        self.assertIn("Tool denied by policy", result)
+
+    def test_full_access_permission_skips_network_approval(self) -> None:
+        approvals: list[tuple[str, str]] = []
+
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                ),
+                approval_provider=lambda command, reason: approvals.append((command, reason)) or False,
+            )
+            runtime.permission_mode = "full_access"
+
+            with patch("uedev.loop.run_shell", return_value=ShellResult("curl https://example.com", 0, "ok\n", "")):
+                result = runtime.tools["shell"]({"command": "curl https://example.com", "reason": "network"})
+
+        self.assertEqual(approvals, [])
+        self.assertIn("exitCode: 0", result)
+
+    def test_plan_mode_denies_write_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            runtime.collaboration_mode = "plan"
+
+            result = runtime.tools["write_file"]({"path": "blocked.txt", "content": "no"})
+
+            self.assertIn("Tool denied by policy", result)
+            self.assertFalse((root / "blocked.txt").exists())
+
+    def test_shell_command_classifier_marks_common_risks(self) -> None:
+        self.assertEqual(classify_shell_command("rg permission uedev"), "readonly")
+        self.assertEqual(classify_shell_command("git reset --hard"), "dangerous")
+        self.assertEqual(classify_shell_command("curl https://example.com"), "network")
 
 
 class RendererTests(unittest.TestCase):
@@ -447,7 +756,8 @@ class RendererTests(unittest.TestCase):
 class TaskAndTeamTests(unittest.TestCase):
     def test_task_dependencies_clear_on_completion(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            manager = TaskManager(Path(temp) / ".tasks")
+            state_dir = agent_dir(Path(temp))
+            manager = TaskManager(state_dir / "tasks")
             manager.create("A")
             manager.create("B", blocked_by=[1])
             manager.update(1, status="completed")
@@ -457,9 +767,10 @@ class TaskAndTeamTests(unittest.TestCase):
     def test_team_message_and_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            task_manager = TaskManager(root / ".tasks")
-            bus = MessageBus(root / ".team")
-            team = TeamManager(root / ".team", task_manager, bus)
+            state_dir = agent_dir(root)
+            task_manager = TaskManager(state_dir / "tasks")
+            bus = MessageBus(state_dir / "team")
+            team = TeamManager(state_dir / "team", task_manager, bus)
             task_manager.create("Ready task")
             team.spawn("alice", "coder")
 
@@ -471,9 +782,10 @@ class TaskAndTeamTests(unittest.TestCase):
     def test_team_state_tolerates_empty_or_bad_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            task_manager = TaskManager(root / ".tasks")
-            bus = MessageBus(root / ".team")
-            team = TeamManager(root / ".team", task_manager, bus)
+            state_dir = agent_dir(root)
+            task_manager = TaskManager(state_dir / "tasks")
+            bus = MessageBus(state_dir / "team")
+            team = TeamManager(state_dir / "team", task_manager, bus)
             team.config_path.write_text("", encoding="utf-8")
             team.requests_path.write_text("{bad", encoding="utf-8")
             (bus.inbox_dir / "lead.jsonl").write_text("{bad\n{\"content\":\"ok\"}\n", encoding="utf-8")
@@ -503,6 +815,9 @@ class SlashCommandTests(unittest.TestCase):
 
         self.assertIn("/help", help_text)
         self.assertIn("Show available chat slash commands.", help_text)
+        self.assertIn("/model", help_text)
+        self.assertIn("/plan", help_text)
+        self.assertIn("/permissions", help_text)
         self.assertIn("/ue doctor", help_text)
         self.assertIn("Inspect Unreal Engine project and editor configuration.", help_text)
         self.assertIn("/clear", help_text)
@@ -524,7 +839,7 @@ class SlashCommandTests(unittest.TestCase):
             self.assertIn("uedev", banner)
             self.assertIn("model:", banner)
             self.assertIn(str(Path(temp)), banner)
-            self.assertIn('Type "/" for commands', banner)
+            self.assertNotIn("Tip:", banner)
 
     def test_slash_completer_returns_all_commands_for_slash(self) -> None:
         completions = list(SlashCommandCompleter().get_completions(Document("/"), None))
@@ -548,12 +863,188 @@ class SlashCommandTests(unittest.TestCase):
         self.assertEqual(completions[0].text, "/doctor")
         self.assertIn("Inspect Unreal Engine project", str(completions[0].display_meta))
 
+    def test_slash_completer_lists_permission_modes(self) -> None:
+        completions = list(SlashCommandCompleter().get_completions(Document("/permissions "), None))
+
+        self.assertEqual(
+            [completion.text for completion in completions],
+            [
+                "/permissions read-only",
+                "/permissions default",
+                "/permissions auto-review",
+                "/permissions full-access",
+            ],
+        )
+        self.assertIn("Can read files", str(completions[0].display_meta))
+
+    def test_slash_completer_filters_permission_modes(self) -> None:
+        completions = list(SlashCommandCompleter().get_completions(Document("/permissions a"), None))
+
+        self.assertEqual([completion.text for completion in completions], ["/permissions auto-review"])
+
+    def test_model_slash_command_lists_switches_and_resets_project_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "main-key",
+                    },
+                    "gpt-alt": {
+                        "model": "gpt-alt-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "alt-key",
+                    },
+                },
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                self.assertTrue(runtime.handle_slash_command("/model", emit=output.append))
+                self.assertIn("fast", output[-1])
+                self.assertIn("default", output[-1])
+
+                self.assertTrue(runtime.handle_slash_command("/model gpt-alt", emit=output.append))
+                self.assertIn("Active model set to gpt-alt", output[-1])
+                project_config = json.loads((agent_dir(root) / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual(project_config["active_model"], "gpt-alt")
+                self.assertEqual(runtime.current_model_profile().name, "gpt-alt")
+
+                self.assertTrue(runtime.handle_slash_command("/model reset", emit=output.append))
+                self.assertIn("Active model reset to default profile fast", output[-1])
+                self.assertEqual(runtime.current_model_profile().name, "fast")
+
+    def test_plan_slash_command_switches_collaboration_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/plan", emit=output.append))
+            self.assertEqual(runtime.collaboration_mode, "plan")
+            self.assertIn("Plan Mode enabled", output[-1])
+
+            self.assertTrue(runtime.handle_slash_command("/plan status", emit=output.append))
+            self.assertIn("plan", output[-1])
+
+            self.assertTrue(runtime.handle_slash_command("/plan off", emit=output.append))
+            self.assertEqual(runtime.collaboration_mode, "default")
+
+    def test_paln_is_not_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/paln", emit=output.append))
+
+            self.assertEqual(runtime.collaboration_mode, "default")
+            self.assertIn("Unknown slash command", output[-1])
+
+    def test_permissions_slash_command_switches_session_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=False,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/permissions", emit=output.append))
+            self.assertIn("Permission mode: default", output[-1])
+            self.assertIn("session only", output[-1])
+
+            self.assertTrue(runtime.handle_slash_command("/permissions auto-review", emit=output.append))
+            self.assertEqual(runtime.permission_mode, "auto_review")
+            self.assertIn("Permission mode set to auto-review", output[-1])
+            self.assertFalse((agent_dir(root) / "config.json").exists())
+
+            self.assertTrue(runtime.handle_slash_command("/permissions invalid", emit=output.append))
+            self.assertIn("Unknown permission mode", output[-1])
+
     def test_chat_prompt_options_enable_block_cursor_and_completion(self) -> None:
         options = create_chat_prompt_options()
 
         self.assertTrue(options["complete_while_typing"])
-        self.assertEqual(options["complete_style"], CompleteStyle.MULTI_COLUMN)
+        self.assertEqual(options["complete_style"], CompleteStyle.COLUMN)
         self.assertEqual(options["cursor"].get_cursor_shape(None), CursorShape.BLINKING_BLOCK)
+
+    def test_tui_status_toolbar_and_shift_tab_exit_hook(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    }
+                },
+            )
+            options = AgentOptions(
+                task="",
+                max_steps=1,
+                auto_approve=True,
+                cwd=root,
+                timeout_seconds=120,
+                verbose=False,
+            )
+            runtime = AgentRuntime(options)
+            app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                toolbar = "".join(fragment[1] for fragment in app.status_bottom_toolbar())
+
+                self.assertIn("fast-model", toolbar)
+                self.assertIn(str(root), toolbar)
+                self.assertNotIn("Plan mode", toolbar)
+
+                runtime.collaboration_mode = "plan"
+                toolbar = "".join(fragment[1] for fragment in app.status_bottom_toolbar())
+
+                self.assertIn("fast-model", toolbar)
+                self.assertIn(str(root), toolbar)
+                self.assertIn("Plan mode", toolbar)
+                self.assertTrue(app.exit_plan_mode())
+                self.assertEqual(runtime.collaboration_mode, "default")
 
 
 class ToolRequirementTests(unittest.TestCase):
@@ -567,6 +1058,12 @@ class ToolRequirementTests(unittest.TestCase):
 
     def test_ordinary_answer_is_not_confirmation_deferral(self) -> None:
         self.assertFalse(defers_tool_confirmation("解释 kind 是什么", "kind 是内部模板选择器。"))
+
+
+    def test_acknowledgement_answer_is_not_valid_final_after_tools(self) -> None:
+        self.assertTrue(is_acknowledgement_answer("Understood. I’ll directly invoke the needed tool when required."))
+        self.assertTrue(is_acknowledgement_answer("已按你的要求执行，并会遵循该行为。"))
+        self.assertFalse(is_acknowledgement_answer("项目存在，EngineAssociation 是 5.7，Perforce 为 workspace/tracked。"))
 
 
 class ToolSpecTests(unittest.TestCase):
@@ -601,6 +1098,26 @@ class ToolSpecTests(unittest.TestCase):
         self.assertNotIn("kind", properties)
         self.assertNotIn("execute", properties)
 
+    def test_ue_doctor_schema_declares_perforce_status_scope(self) -> None:
+        specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
+
+        description = specs["ue_doctor"]["function"]["description"]
+
+        self.assertIn(".uproject discovery", description)
+        self.assertIn("EngineAssociation", description)
+        self.assertIn("Perforce read-only status", description)
+        self.assertIn("sole default check", description)
+        self.assertIn("do not follow with shell p4 info", description)
+
+    def test_todo_update_schema_rejects_acknowledgement_usage(self) -> None:
+        specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
+
+        description = specs["todo_update"]["function"]["description"]
+
+        self.assertIn("meaningful multi-step progress", description)
+        self.assertIn("Do not use this tool to acknowledge instructions", description)
+        self.assertIn("single status check", description)
+
 
 class UeRuntimeToolTests(unittest.TestCase):
     def _runtime(self, cwd: Path) -> AgentRuntime:
@@ -622,7 +1139,11 @@ class UeRuntimeToolTests(unittest.TestCase):
             ue_dir = root / "UEAgentDemo"
             launch_dir.mkdir()
             ue_dir.mkdir()
-            (ue_dir / "UEAgentDemo.uproject").write_text("{}", encoding="utf-8")
+            (ue_dir / "UEAgentDemo.uproject").write_text(json.dumps({"EngineAssociation": "5.4"}), encoding="utf-8")
+            engine_root = root / "UE_5.4"
+            create_ue_engine_root(engine_root)
+            config_path = root / "system-config.json"
+            write_system_config(config_path, ue_engines={"5.4": {"root": str(engine_root)}})
 
             options = AgentOptions(
                 task="",
@@ -634,10 +1155,12 @@ class UeRuntimeToolTests(unittest.TestCase):
             )
             runtime = AgentRuntime(options)
 
-            with patch.dict("os.environ", {}, clear=True):
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
                 result = runtime.tools["ue_doctor"]({"cwd": str(ue_dir)})
 
             self.assertIn(str((ue_dir / "UEAgentDemo.uproject").resolve()), result)
+            self.assertIn("EngineAssociation: 5.4", result)
+            self.assertIn("configured engine: 5.4", result)
 
     def test_ue_run_python_reads_script_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -718,8 +1241,9 @@ class WorktreeTests(unittest.TestCase):
     def test_worktree_index_starts_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            tasks = TaskManager(root / ".tasks")
-            manager = WorktreeManager(root, root / ".worktrees", tasks)
+            state_dir = agent_dir(root)
+            tasks = TaskManager(state_dir / "tasks")
+            manager = WorktreeManager(root, state_dir / "worktrees", tasks)
 
             self.assertIn("No managed", manager.list_all())
 

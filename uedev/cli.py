@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
 from . import __version__
+from .config import (
+    ConfigError,
+    active_model_name,
+    agent_dir,
+    default_system_config_path,
+    load_system_config,
+    load_project_config,
+    project_config_path,
+    project_config_template,
+    resolve_model_profile,
+    system_config_template,
+    write_json,
+)
 from .loop import AgentOptions, run_agent, run_chat
 from .shell import shell_name
 from .tasks import TaskManager, TodoManager
@@ -14,7 +26,6 @@ from .ue import discover_ue, render_doctor, render_run_result, run_ue_python
 from .worktrees import WorktreeManager
 
 
-# 外部函数：构建 CLI 参数和子命令界面，负责 uedev 命令行界面、参数解析和子命令分发。
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="uedev",
@@ -24,8 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="create a local .env configuration file")
-    init_parser.add_argument("--force", action="store_true", help="overwrite an existing .env file")
+    init_parser = subparsers.add_parser("init", help="create JSON configuration files")
+    init_parser.add_argument("--force", action="store_true", help="overwrite existing JSON config files")
 
     subparsers.add_parser("doctor", help="check local configuration")
 
@@ -33,7 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("task", nargs="+", help="task for the agent")
     run_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=8, help=argparse.SUPPRESS)
     run_parser.add_argument("--timeout", type=int, default=120, help="shell command timeout in seconds")
-    run_parser.add_argument("-y", "--yes", action="store_true", help="execute shell commands without asking")
+    run_parser.add_argument("-y", "--yes", action="store_true", help="start this run in full-access permission mode")
     run_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     run_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
     run_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
@@ -41,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser = subparsers.add_parser("chat", help="start an interactive agent chat session")
     chat_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=8, help=argparse.SUPPRESS)
     chat_parser.add_argument("--timeout", type=int, default=120, help="shell command timeout in seconds")
-    chat_parser.add_argument("-y", "--yes", action="store_true", help="execute shell commands without asking")
+    chat_parser.add_argument("-y", "--yes", action="store_true", help="start this chat in full-access permission mode")
     chat_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     chat_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
     chat_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
@@ -52,10 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_parser.add_argument("--graph", action="store_true", help="show persistent task graph instead of short todos")
 
     team_parser = subparsers.add_parser("team", help="show persistent teammate roster")
-    team_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .team state")
+    team_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
 
     worktree_parser = subparsers.add_parser("worktrees", help="show managed task worktrees")
-    worktree_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .worktrees state")
+    worktree_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
 
     ue_parser = subparsers.add_parser("ue", help="Unreal Engine helper commands")
     ue_subparsers = ue_parser.add_subparsers(dest="ue_command", required=True)
@@ -66,7 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     ue_run = ue_subparsers.add_parser("run-python", help="prepare or execute a UE Python script")
     ue_run.add_argument("script", help="path to a Python script to run inside UE")
     ue_run.add_argument("--cwd", default=str(Path.cwd()), help="UE project or workspace directory")
-    ue_run.add_argument("--mode", choices=["commandlet", "full_editor"], default="commandlet", help="UE Python execution mode")
+    ue_run.add_argument("--mode", choices=["commandlet", "full_editor"], default="full_editor", help="UE Python execution mode")
     ue_run.add_argument("--execute", action="store_true", help="actually launch UE; omitted means dry-run only")
     ue_run.add_argument("--timeout", type=int, default=300, help="UE process timeout in seconds")
 
@@ -85,15 +96,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# 外部函数：作为程序入口加载配置并分派命令，负责 uedev 命令行界面、参数解析和子命令分发。
 def main() -> None:
     try:
-        load_dotenv(Path(".env"))
         parser = build_parser()
         args = parser.parse_args()
 
         if args.command == "init":
-            init_config(force=args.force)
+            init_config(Path.cwd().resolve(), force=args.force)
         elif args.command == "doctor":
             doctor()
         elif args.command == "run":
@@ -106,7 +115,6 @@ def main() -> None:
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
                     context_threshold=args.context_threshold,
-                    plain=args.plain,
                 )
             )
         elif args.command == "chat":
@@ -119,23 +127,27 @@ def main() -> None:
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
                     context_threshold=args.context_threshold,
+                    plain=args.plain,
                 )
             )
         elif args.command == "tasks":
             cwd = Path(args.cwd).resolve()
+            state_dir = agent_dir(cwd)
             if args.graph:
-                print(TaskManager(cwd / ".tasks").list_all())
+                print(TaskManager(state_dir / "tasks").list_all())
             else:
-                print(TodoManager(cwd / ".agent").render_current())
+                print(TodoManager(state_dir).render_current())
         elif args.command == "team":
             cwd = Path(args.cwd).resolve()
-            task_manager = TaskManager(cwd / ".tasks")
-            bus = MessageBus(cwd / ".team")
-            print(TeamManager(cwd / ".team", task_manager, bus).list_all())
+            state_dir = agent_dir(cwd)
+            task_manager = TaskManager(state_dir / "tasks")
+            bus = MessageBus(state_dir / "team")
+            print(TeamManager(state_dir / "team", task_manager, bus).list_all())
         elif args.command == "worktrees":
             cwd = Path(args.cwd).resolve()
-            task_manager = TaskManager(cwd / ".tasks")
-            print(WorktreeManager(cwd, cwd / ".worktrees", task_manager).list_all())
+            state_dir = agent_dir(cwd)
+            task_manager = TaskManager(state_dir / "tasks")
+            print(WorktreeManager(cwd, state_dir / "worktrees", task_manager).list_all())
         elif args.command == "ue":
             handle_ue(args)
     except KeyboardInterrupt:
@@ -146,67 +158,57 @@ def main() -> None:
         raise SystemExit(1)
 
 
-# 内部函数：读取 .env 文件并写入进程环境变量，支撑 CLI 启动流程。
-def load_dotenv(path: Path) -> None:
-    if not path.exists():
-        return
+def init_config(cwd: Path, force: bool = False) -> None:
+    system_path = default_system_config_path()
+    project_path = project_config_path(cwd)
 
-    import os
-
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-
-        key, value = stripped.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
-
-
-# 外部函数：实现 init 命令的配置文件创建功能，负责 uedev 命令行界面、参数解析和子命令分发。
-def init_config(force: bool = False) -> None:
-    env_path = Path(".env")
-    if env_path.exists() and not force:
-        print(".env already exists. Use --force to overwrite it.")
-        return
-
-    example_path = Path(".env.example")
-    if example_path.exists():
-        content = example_path.read_text(encoding="utf-8")
+    if system_path.exists() and not force:
+        print(f"System config already exists: {system_path}")
     else:
-        content = "\n".join(
-            [
-                "OPENAI_API_KEY=",
-                "OPENAI_BASE_URL=https://api.openai.com/v1",
-                "OPENAI_MODEL=",
-                "UE_PROJECT_PATH=",
-                "UE_ENGINE_ROOT=",
-                "UE_EDITOR_CMD_PATH=",
-                "UE_EDITOR_PATH=",
-                "",
-            ]
-        )
+        write_json(system_path, system_config_template())
+        print(f"Created system config: {system_path}")
 
-    env_path.write_text(content, encoding="utf-8")
-    print("Created .env. Fill in OPENAI_API_KEY and OPENAI_MODEL before running the agent.")
+    if project_path.exists() and not force:
+        print(f"Project config already exists: {project_path}")
+    else:
+        write_json(project_path, project_config_template())
+        print(f"Created project config: {project_path}")
 
 
-# 外部函数：实现 doctor 命令的环境检查展示，负责 uedev 命令行界面、参数解析和子命令分发。
 def doctor() -> None:
+    cwd = Path.cwd().resolve()
     print(f"Version: {__version__}")
-    print(f"Working directory: {Path.cwd().resolve()}")
+    print(f"Working directory: {cwd}")
     print(f"Shell: {shell_name()}")
-    print(f"OPENAI_BASE_URL: {os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1')}")
-    print(f"OPENAI_MODEL: {os.environ.get('OPENAI_MODEL') or '(missing)'}")
-    print(f"OPENAI_API_KEY: {'set' if os.environ.get('OPENAI_API_KEY') else '(missing)'}")
-    print(f"UE_PROJECT_PATH: {os.environ.get('UE_PROJECT_PATH') or '(auto)'}")
-    print(f"UE_ENGINE_ROOT: {os.environ.get('UE_ENGINE_ROOT') or '(missing)'}")
+    print(f"System config: {default_system_config_path()}")
+    print(f"Project config: {project_config_path(cwd)}")
+    print(f"Permission mode: {load_project_config(cwd).permission_mode.replace('_', '-')}")
+
+    try:
+        config = load_system_config()
+        active = active_model_name(cwd, config)
+        profile = resolve_model_profile(cwd, config)
+    except ConfigError as error:
+        print(f"Config error: {error}")
+        return
+
+    print(f"Active model profile: {active}")
+    print(f"Model: {profile.model or '(missing)'}")
+    print(f"Base URL: {profile.base_url}")
+    print(f"API key: {'set' if profile.api_key else '(missing)'}")
+    if not config.ue_engines:
+        print("UE engines: (none)")
+        return
+
+    print("UE engines:")
+    for name, engine in sorted(config.ue_engines.items()):
+        alias_text = f" aliases={list(engine.aliases)}" if engine.aliases else ""
+        print(f"- {name}: {engine.root}{alias_text}")
 
 
-# 外部函数：处理 ue 子命令的界面分发，负责 uedev 命令行界面、参数解析和子命令分发。
 def handle_ue(args: argparse.Namespace) -> None:
     cwd = Path(args.cwd).resolve()
+    state_dir = agent_dir(cwd)
     if args.ue_command == "doctor":
         print(render_doctor(discover_ue(cwd)))
         return
@@ -216,7 +218,7 @@ def handle_ue(args: argparse.Namespace) -> None:
         script = script_path.read_text(encoding="utf-8")
         result = run_ue_python(
             cwd=cwd,
-            agent_dir=cwd / ".agent",
+            agent_dir=state_dir,
             script=script,
             mode=args.mode,
             kind="custom",
@@ -230,7 +232,7 @@ def handle_ue(args: argparse.Namespace) -> None:
     if args.ue_command in {"list-assets", "validate-assets"}:
         result = run_ue_python(
             cwd=cwd,
-            agent_dir=cwd / ".agent",
+            agent_dir=state_dir,
             script="",
             mode=args.mode,
             kind="list_assets" if args.ue_command == "list-assets" else "validate_assets",

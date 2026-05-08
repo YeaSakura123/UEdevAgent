@@ -49,8 +49,8 @@ def build_subagent_prompt() -> str:
 
 def build_tool_confirmation_reminder() -> str:
     return (
-        "Do not ask the user to confirm tool execution in a final answer. "
-        "Call the appropriate tool now; the harness will show the command and ask y/N before execution."
+        "The previous assistant response was invalid because it asked for confirmation instead of using a tool. "
+        "Use the appropriate tool now, or answer with the actual result if the needed tool result is already available."
     )
 
 
@@ -76,7 +76,10 @@ def _conversation_section() -> str:
 - If the user is chatting, greeting, testing the interface, asking a conceptual question, or does not clearly ask you to inspect, modify, run, or check the workspace, answer directly with a final action.
 - Only call tools when the user asks for concrete local work or information that requires observing the workspace, shell, UE project, task state, or files.
 - Do not list files or inspect the workspace just because the user sends a short test message.
-- Do not ask the user for a natural-language confirmation before calling shell or UE execution tools. Call the appropriate tool; the harness will display the command and ask y/N before it executes."""
+- Do not ask the user for a natural-language confirmation before calling shell or UE execution tools. Call the appropriate tool; the harness will enforce the active permission mode before execution.
+- The harness injects the active collaboration and permission modes every turn. In Plan Mode, do not implement changes; produce one <proposed_plan> block as the final answer.
+- Never answer with acknowledgements about future behavior, such as "Understood", "I'll do that next time", or "I will follow this behavior". After using tools, answer with the observed result.
+- Do not use todo_update to acknowledge instructions, confirm future behavior, or mark an acknowledgement as completed."""
 
 
 def _path_section() -> str:
@@ -87,13 +90,14 @@ def _core_tools_section() -> str:
     return """Core tools:
 - Workspace: read_file, write_file, edit_file, list_files.
 - Shell execution: shell for foreground commands, background_run/background_check for longer commands.
-- Planning and progress: todo_update and todo_list for lightweight turn-level task tracking.
+- Planning and progress: todo_update and todo_list for meaningful multi-step task tracking only; never use todo_update for acknowledgements or single-step status checks.
 - Skills and context: load_skill for on-demand local instructions, compact for conversation compaction.
 - Delegation: subagent for bounded child-agent work with fresh context.
 - Persistent task graph: task_create, task_get, task_update, task_list, claim_task.
 - Team coordination: spawn_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, shutdown_response, plan_submit, plan_review, idle.
 - Worktree isolation: worktree_create, worktree_list, worktree_run, worktree_keep, worktree_remove.
-- Unreal Engine: ue_doctor, ue_run_python, ue_stop_executor. ue_run_python accepts inline script code or script_path for a .py file, then asks the user before launching UE."""
+- Runtime controls: /plan toggles Plan Mode; /permissions shows or changes permission mode.
+- Unreal Engine: ue_doctor, ue_run_python, ue_stop_executor. ue_doctor is the default check for UE project presence, EngineAssociation, configured editor paths, and Perforce read-only status. ue_run_python accepts inline script code or script_path for a .py file, then relies on harness permission checks before launching UE."""
 
 
 def _skill_usage_section() -> str:
@@ -105,6 +109,7 @@ def _skill_usage_section() -> str:
 
 def _perforce_ue_source_control_section() -> str:
     return """Perforce UE source control:
+- For status-only checks, use ue_doctor's Perforce result; do not run shell `p4 info` just to detect whether the project uses Perforce.
 - If the current workspace is an Unreal Engine project managed by Perforce, treat Perforce as the authority for file edit state.
 - Before modifying any Perforce-controlled file, run `p4 edit <path>`.
 - Source code and text files are not exclusive-lock files. They still require `p4 edit` before modification, and normal Perforce merge/resolve behavior is expected.
@@ -118,8 +123,10 @@ def _perforce_ue_source_control_section() -> str:
 
 def _ue_safety_section() -> str:
     return """UE safety:
+- For requests asking whether the current workspace is a UE project, which engine version it uses, or whether it has Perforce, call ue_doctor directly and do not call list_files or shell `p4 info` for the same check.
 - Always call ue_doctor before UE editor operations.
-- ue_run_python must rely on the harness confirmation prompt before launching UE; do not ask for confirmation in the final answer and do not pass execute or kind.
+- Only use shell `p4 info` for raw Perforce diagnostics when the user explicitly asks for it, or when ue_doctor reports Perforce unknown, timeout, or an error.
+- ue_run_python must rely on harness permission checks before launching UE; do not ask for confirmation in the final answer and do not pass execute or kind.
 - Prefer commandlet mode for read-only automation. Use full_editor only when the user asks for full editor or an API needs it.
 - Temporary UE scripts are written by the harness into .agent/ue_runs/<run_id>/user_script.py; pass complete inline code via script or an existing file via script_path, never an inline runpy.run_path loader.
 - UE Python scripts should set _uedev_result or call _uedev_emit(key, value) for data the agent must report. unreal.log output is captured as logs, but structured results are preferred.

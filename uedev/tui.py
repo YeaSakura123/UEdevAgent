@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import shutil
 import uuid
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer
 from prompt_toolkit.input.base import Input
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.base import Output
 
+from .config import ConfigError
 from .events import stopped_event
 from .llm import ChatMessage
 from .renderer import TuiRenderer
@@ -40,12 +43,19 @@ class ChatTuiApplication:
     def run(self) -> None:
         from .loop import create_chat_prompt_options, create_chat_session
 
-        session = create_chat_session(completer=self.completer, input=self.input, output=self.output)
+        session = create_chat_session(
+            completer=self.completer,
+            input=self.input,
+            output=self.output,
+            key_bindings=self.create_key_bindings(),
+        )
         self.renderer.print_banner()
 
         while True:
             try:
-                query = session.prompt([("class:prompt", "\n> ")], **create_chat_prompt_options()).strip()
+                prompt_options = create_chat_prompt_options()
+                prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+                query = session.prompt([("class:prompt", "\n> ")], **prompt_options).strip()
             except (EOFError, KeyboardInterrupt):
                 return
 
@@ -58,10 +68,89 @@ class ChatTuiApplication:
                 self.renderer.print_system("Conversation context cleared.")
                 continue
 
+            if query.lower() == "/permissions":
+                selected = self.prompt_permission_mode(session)
+                if selected is None:
+                    continue
+                query = selected
+
             if self.runtime.handle_slash_command(query, emit=self.renderer.print_system):
                 continue
 
             self._run_turn(query)
+
+    def create_key_bindings(self) -> KeyBindings:
+        bindings = KeyBindings()
+
+        @bindings.add("s-tab")
+        def _exit_plan_mode(event) -> None:
+            if self.exit_plan_mode():
+                event.app.invalidate()
+
+        return bindings
+
+    def exit_plan_mode(self) -> bool:
+        if self.runtime.collaboration_mode != "plan":
+            return False
+        self.runtime.collaboration_mode = "default"
+        return True
+
+    def status_fragments(self):
+        model = self._status_model_name()
+        directory = str(self.options.cwd)
+        right = "Plan mode " if self.runtime.collaboration_mode == "plan" else ""
+        left_length = len(model) + 3 + len(directory)
+        right_length = len(right)
+        width = self._terminal_width()
+        fragments = [
+            ("", model),
+            ("", "   "),
+            ("", directory),
+        ]
+        if right:
+            fragments.append(("", " " * max(1, width - left_length - right_length)))
+            fragments.append(("", right))
+        return fragments
+
+    def status_bottom_toolbar(self):
+        return self.status_fragments()
+
+    def prompt_permission_mode(self, session: PromptSession) -> str | None:
+        from .loop import create_chat_prompt_options
+
+        def start_completion() -> None:
+            session.app.current_buffer.start_completion(select_first=True)
+
+        try:
+            prompt_options = create_chat_prompt_options()
+            prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+            selected = session.prompt(
+                [("class:prompt", "\n> ")],
+                default="/permissions ",
+                pre_run=start_completion,
+                **prompt_options,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return selected or None
+
+    def _status_model_name(self) -> str:
+        try:
+            profile = self.runtime.current_model_profile()
+        except ConfigError:
+            return "(missing config)"
+        return profile.model or profile.name or "(missing model)"
+
+    def plan_mode_bottom_toolbar(self):
+        return self.status_fragments()
+
+    def _terminal_width(self) -> int:
+        if self.output is not None:
+            try:
+                return int(self.output.get_size().columns)
+            except Exception:
+                pass
+        return shutil.get_terminal_size((80, 20)).columns
 
     def confirm_command(self, command: str, reason: str) -> bool:
         self.renderer.print_approval(command, reason)

@@ -7,20 +7,41 @@ import subprocess
 import time
 import uuid
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+
+from .config import ConfigError, SystemConfig, UeEngineProfile, load_system_config
 
 _LAST_RUN_TIME: datetime | None = None
 
 
 @dataclass(frozen=True)
+class PerforceDiscovery:
+    available: bool = False
+    in_workspace: bool = False
+    project_tracked: bool = False
+    client_name: str | None = None
+    client_root: Path | None = None
+    user_name: str | None = None
+    server_address: str | None = None
+    project_depot_path: str | None = None
+    opened_count: int | None = None
+    opened_preview: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class UeDiscovery:
-    project_path: Path | None
-    editor_cmd_path: Path | None
-    editor_gui_path: Path | None
-    notes: list[str]
+    project_path: Path | None = None
+    editor_cmd_path: Path | None = None
+    editor_gui_path: Path | None = None
+    notes: list[str] = field(default_factory=list)
+    engine_association: str | None = None
+    engine_name: str | None = None
+    engine_root: Path | None = None
+    perforce: PerforceDiscovery | None = None
 
 
 @dataclass(frozen=True)
@@ -87,14 +108,21 @@ def generate_run_id() -> str:
     return f"ue_{stamp}_{uuid.uuid4().hex[:8]}"
 
 
-def discover_ue(cwd: Path) -> UeDiscovery:
+def discover_ue(cwd: Path, system_config: SystemConfig | None = None) -> UeDiscovery:
     notes: list[str] = []
     project_path = _discover_project(cwd, notes)
-    editor_cmd_path, editor_gui_path = _discover_editor(notes)
+    engine_association = _discover_engine_association(project_path, notes)
+    engine = _resolve_engine(engine_association, notes, system_config)
+    editor_cmd_path, editor_gui_path = _discover_editor(engine, notes)
+    perforce = _discover_perforce(project_path.parent if project_path is not None else cwd, project_path)
     return UeDiscovery(
         project_path=project_path,
         editor_cmd_path=editor_cmd_path,
         editor_gui_path=editor_gui_path,
+        engine_association=engine_association,
+        engine_name=engine.name if engine else None,
+        engine_root=engine.root if engine else None,
+        perforce=perforce,
         notes=notes,
     )
 
@@ -102,10 +130,16 @@ def discover_ue(cwd: Path) -> UeDiscovery:
 def render_doctor(discovery: UeDiscovery) -> str:
     lines = [
         "UE doctor",
-        f"- project: {discovery.project_path or '(missing, set UE_PROJECT_PATH)'}",
-        f"- UnrealEditor-Cmd: {discovery.editor_cmd_path or '(missing, set UE_EDITOR_CMD_PATH or UE_ENGINE_ROOT)'}",
-        f"- UnrealEditor: {discovery.editor_gui_path or '(missing, set UE_EDITOR_PATH or UE_ENGINE_ROOT)'}",
+        _render_doctor_summary(discovery),
+        f"- project: {discovery.project_path or '(missing)'}",
+        f"- EngineAssociation: {discovery.engine_association or '(missing)'}",
+        f"- configured engine: {discovery.engine_name or '(missing)'}",
+        f"- engine root: {discovery.engine_root or '(missing)'}",
+        f"- UnrealEditor-Cmd: {discovery.editor_cmd_path or '(missing)'}",
+        f"- UnrealEditor: {discovery.editor_gui_path or '(missing)'}",
     ]
+    if discovery.perforce is not None:
+        lines.extend(_render_perforce(discovery.perforce))
     if discovery.notes:
         lines.append("- notes:")
         lines.extend(f"  - {note}" for note in discovery.notes)
@@ -609,12 +643,16 @@ def prepare_ue_python(
 ) -> UePreparedRun:
     discovery = discover_ue(cwd)
     if discovery.project_path is None:
-        raise RuntimeError("Cannot find .uproject. Set UE_PROJECT_PATH or run from a UE project directory.")
+        raise RuntimeError("Cannot find .uproject. Run from a UE project directory or pass --cwd.")
+    if discovery.engine_association is None:
+        raise RuntimeError("Cannot choose UE engine because the .uproject is missing EngineAssociation.")
+    if discovery.engine_root is None:
+        raise RuntimeError(f"Cannot choose UE engine for EngineAssociation {discovery.engine_association!r}. Run uedev ue doctor.")
 
     editor_path = discovery.editor_cmd_path if mode == "commandlet" else discovery.editor_gui_path
     if editor_path is None:
-        missing = "UE_EDITOR_CMD_PATH" if mode == "commandlet" else "UE_EDITOR_PATH"
-        raise RuntimeError(f"Cannot find UE editor executable. Set {missing} or UE_ENGINE_ROOT.")
+        missing = "UnrealEditor-Cmd.exe" if mode == "commandlet" else "UnrealEditor.exe"
+        raise RuntimeError(f"Cannot find {missing} under configured UE engine root: {discovery.engine_root}")
 
     run_id = generate_run_id()
     runs_dir = agent_dir / "ue_runs"
@@ -657,7 +695,6 @@ def prepare_ue_python(
             "-run=pythonscript",
             f"-script={wrapper_path}",
             "-unattended",
-            "-nop4",
             "-nosplash",
         ]
     elif mode == "full_editor":
@@ -668,7 +705,6 @@ def prepare_ue_python(
             str(editor_path),
             str(discovery.project_path),
             f"-ExecutePythonScript={executor_path}",
-            "-nop4",
             "-nosplash",
         ]
     else:
@@ -682,6 +718,9 @@ def prepare_ue_python(
             "mode": mode,
             "kind": kind,
             "project_path": str(discovery.project_path),
+            "engine_association": discovery.engine_association,
+            "engine_name": discovery.engine_name,
+            "engine_root": str(discovery.engine_root) if discovery.engine_root else None,
             "command": command,
             "created_at": _iso_now(),
             "user_script_path": str(user_script_path),
@@ -848,7 +887,7 @@ def render_run_result(result: UeRunResult) -> str:
         lines.append("stderr:")
         lines.append(result.stderr)
     if not result.executed:
-        lines.append("dry_run: true; add --execute for standalone UE CLI commands, or approve the agent confirmation prompt.")
+        lines.append("dry_run: true; add --execute for standalone UE CLI commands, or allow the agent permission check.")
     return "\n".join(lines)
 
 
@@ -1029,17 +1068,10 @@ def _iso_now() -> str:
 
 
 def _discover_project(cwd: Path, notes: list[str]) -> Path | None:
-    env_project = os.environ.get("UE_PROJECT_PATH")
-    if env_project:
-        path = Path(env_project).expanduser().resolve()
-        if path.exists() and path.suffix == ".uproject":
-            return path
-        notes.append(f"UE_PROJECT_PATH is set but invalid: {path}")
-
     for parent in [cwd.resolve(), *cwd.resolve().parents]:
         projects = sorted(parent.glob("*.uproject"))
         if projects:
-            return projects[0]
+            return projects[0].resolve()
 
     projects = sorted(cwd.glob("*.uproject"))
     if projects:
@@ -1048,28 +1080,66 @@ def _discover_project(cwd: Path, notes: list[str]) -> Path | None:
     return None
 
 
-def _discover_editor(notes: list[str]) -> tuple[Path | None, Path | None]:
-    cmd = _existing_env_path("UE_EDITOR_CMD_PATH")
-    gui = _existing_env_path("UE_EDITOR_PATH")
-    engine_root = os.environ.get("UE_ENGINE_ROOT")
-
-    if engine_root:
-        root = Path(engine_root).expanduser().resolve()
-        cmd = cmd or _maybe(root / "Engine" / "Binaries" / "Win64" / "UnrealEditor-Cmd.exe")
-        gui = gui or _maybe(root / "Engine" / "Binaries" / "Win64" / "UnrealEditor.exe")
-
-    if not cmd:
-        notes.append("UE commandlet executable not found from environment.")
-    if not gui:
-        notes.append("UE full editor executable not found from environment.")
-    return cmd, gui
-
-
-def _existing_env_path(name: str) -> Path | None:
-    value = os.environ.get(name)
-    if not value:
+def _discover_engine_association(project_path: Path | None, notes: list[str]) -> str | None:
+    if project_path is None:
         return None
-    return _maybe(Path(value).expanduser().resolve())
+    try:
+        data = json.loads(project_path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as error:
+        notes.append(f"Cannot parse .uproject JSON: {error}")
+        return None
+    if not isinstance(data, dict):
+        notes.append(".uproject must contain a JSON object.")
+        return None
+
+    value = data.get("EngineAssociation")
+    if not isinstance(value, str) or not value.strip():
+        notes.append(".uproject does not contain EngineAssociation; cannot choose UE engine automatically.")
+        return None
+    return value.strip()
+
+
+def _resolve_engine(
+    engine_association: str | None,
+    notes: list[str],
+    system_config: SystemConfig | None = None,
+) -> UeEngineProfile | None:
+    if engine_association is None:
+        return None
+    try:
+        config = system_config or load_system_config()
+    except ConfigError as error:
+        notes.append(str(error))
+        return None
+
+    if not config.ue_engines:
+        notes.append("No UE engines configured in system config.")
+        return None
+
+    exact = config.ue_engines.get(engine_association)
+    if exact is not None:
+        return exact
+
+    for engine in config.ue_engines.values():
+        if engine_association in engine.aliases:
+            return engine
+
+    available = ", ".join(sorted(config.ue_engines))
+    notes.append(f"EngineAssociation {engine_association!r} is not configured. Available UE engines: {available}")
+    return None
+
+
+def _discover_editor(engine: UeEngineProfile | None, notes: list[str]) -> tuple[Path | None, Path | None]:
+    if engine is None:
+        return None, None
+
+    cmd = _maybe(engine.editor_cmd_path)
+    gui = _maybe(engine.editor_gui_path)
+    if not cmd:
+        notes.append(f"UE commandlet executable not found: {engine.editor_cmd_path}")
+    if not gui:
+        notes.append(f"UE full editor executable not found: {engine.editor_gui_path}")
+    return cmd, gui
 
 
 def _maybe(path: Path) -> Path | None:
@@ -1078,3 +1148,183 @@ def _maybe(path: Path) -> Path | None:
 
 def _indent(text: str) -> str:
     return "\n".join(f"    {line}" if line else "" for line in text.splitlines())
+
+
+def _render_doctor_summary(discovery: UeDiscovery) -> str:
+    project = "yes" if discovery.project_path else "no"
+    engine = discovery.engine_association or "missing"
+    perforce = _perforce_summary(discovery.perforce)
+    return f"- summary: project={project}, engine={engine}, perforce={perforce}"
+
+
+def _perforce_summary(perforce: PerforceDiscovery | None) -> str:
+    if perforce is None:
+        return "unknown"
+    notes = " ".join(perforce.notes).lower()
+    if "timed out" in notes or "cannot run" in notes:
+        return "unknown"
+    if not perforce.available:
+        return "unavailable"
+    if not perforce.in_workspace:
+        return "available/not-workspace"
+    return "workspace/tracked" if perforce.project_tracked else "workspace/untracked"
+
+
+def _render_perforce(perforce: PerforceDiscovery) -> list[str]:
+    if not perforce.available:
+        lines = ["- Perforce: unavailable"]
+    elif not perforce.in_workspace:
+        lines = ["- Perforce: available (not a workspace)"]
+    else:
+        parts = ["available workspace"]
+        if perforce.client_name:
+            parts.append(f"client={perforce.client_name}")
+        if perforce.user_name:
+            parts.append(f"user={perforce.user_name}")
+        if perforce.server_address:
+            parts.append(f"server={perforce.server_address}")
+        lines = [f"- Perforce: {' '.join(parts)}"]
+        lines.append(f"- Perforce client root: {perforce.client_root or '(missing)'}")
+        lines.append(f"- Perforce project tracked: {perforce.project_depot_path or 'no'}")
+        opened = "unknown" if perforce.opened_count is None else str(perforce.opened_count)
+        lines.append(f"- Perforce opened files: {opened}")
+        if perforce.opened_preview:
+            lines.append("- Perforce opened preview:")
+            lines.extend(f"  - {item}" for item in perforce.opened_preview)
+
+    if perforce.notes:
+        lines.append("- Perforce notes:")
+        lines.extend(f"  - {note}" for note in perforce.notes)
+    return lines
+
+
+def _discover_perforce(cwd: Path, project_path: Path | None = None) -> PerforceDiscovery:
+    notes: list[str] = []
+    info = _run_p4(["info"], cwd, notes)
+    if info is None:
+        return PerforceDiscovery(notes=notes)
+
+    if info.returncode != 0:
+        message = _first_nonempty_line(info.stderr) or _first_nonempty_line(info.stdout)
+        if message:
+            notes.append(f"p4 info: {message}")
+        return PerforceDiscovery(available=True, notes=notes)
+
+    info_values = _parse_p4_info(info.stdout)
+    client_name = info_values.get("Client name")
+    client_root_text = info_values.get("Client root")
+    client_root = Path(client_root_text).expanduser().resolve() if client_root_text else None
+    user_name = info_values.get("User name")
+    server_address = info_values.get("Server address")
+    in_workspace = bool(client_name and client_root)
+    if not in_workspace:
+        notes.append("p4 info did not report both Client name and Client root.")
+
+    project_depot_path: str | None = None
+    project_tracked = False
+    if project_path is not None and in_workspace:
+        fstat = _run_p4(["fstat", str(project_path)], cwd, notes)
+        if fstat is not None:
+            if fstat.returncode == 0:
+                project_depot_path = _parse_p4_depot_file(fstat.stdout)
+                project_tracked = project_depot_path is not None
+                if project_depot_path is None:
+                    notes.append("p4 fstat succeeded but did not report a depotFile for the .uproject.")
+            else:
+                message = _first_nonempty_line(fstat.stderr) or _first_nonempty_line(fstat.stdout)
+                if _looks_like_untracked_p4_file(message):
+                    notes.append(".uproject is not tracked by Perforce.")
+                elif message:
+                    notes.append(f"p4 fstat: {message}")
+
+    opened_count: int | None = None
+    opened_preview: list[str] = []
+    if in_workspace:
+        opened = _run_p4(["opened"], cwd, notes)
+        if opened is not None:
+            opened_lines = [line.strip() for line in opened.stdout.splitlines() if line.strip()]
+            if opened.returncode == 0:
+                opened_count = len(opened_lines)
+                opened_preview = opened_lines[:10]
+            else:
+                message = _first_nonempty_line(opened.stderr) or _first_nonempty_line(opened.stdout)
+                if _looks_like_no_opened_files(message):
+                    opened_count = 0
+                elif message:
+                    notes.append(f"p4 opened: {message}")
+
+    return PerforceDiscovery(
+        available=True,
+        in_workspace=in_workspace,
+        project_tracked=project_tracked,
+        client_name=client_name,
+        client_root=client_root,
+        user_name=user_name,
+        server_address=server_address,
+        project_depot_path=project_depot_path,
+        opened_count=opened_count,
+        opened_preview=opened_preview,
+        notes=notes,
+    )
+
+
+def _discover_preforce(cwd: Path, project_path: Path | None = None) -> PerforceDiscovery:
+    return _discover_perforce(cwd, project_path)
+
+
+def _run_p4(args: list[str], cwd: Path, notes: list[str], timeout_seconds: int = 10) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ["p4", *args],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError:
+        notes.append("p4 executable not found on PATH.")
+        return None
+    except subprocess.TimeoutExpired:
+        notes.append(f"p4 {' '.join(args)} timed out after {timeout_seconds}s.")
+        return None
+    except OSError as error:
+        notes.append(f"Cannot run p4 {' '.join(args)}: {error}")
+        return None
+
+
+def _parse_p4_info(stdout: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in stdout.splitlines():
+        key, separator, value = line.partition(":")
+        if separator:
+            values[key.strip()] = value.strip()
+    return values
+
+
+def _parse_p4_depot_file(stdout: str) -> str | None:
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("... depotFile "):
+            return stripped.removeprefix("... depotFile ").strip() or None
+        if stripped.startswith("//"):
+            return stripped.split("#", 1)[0].strip() or None
+    return None
+
+
+def _first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _looks_like_untracked_p4_file(message: str) -> bool:
+    lowered = message.lower()
+    return "no such file" in lowered or "not in client view" in lowered or "file(s) not in client view" in lowered
+
+
+def _looks_like_no_opened_files(message: str) -> bool:
+    return "file(s) not opened" in message.lower()

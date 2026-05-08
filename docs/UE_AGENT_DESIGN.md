@@ -21,12 +21,11 @@
 - `UnrealEditor-Cmd.exe` 是否配置。
 - `UnrealEditor.exe` 是否配置。
 
-支持环境变量：
+配置来源：
 
-- `UE_PROJECT_PATH`
-- `UE_ENGINE_ROOT`
-- `UE_EDITOR_CMD_PATH`
-- `UE_EDITOR_PATH`
+UE engine paths are configured in `~/.uedev/config.json` under `ue.engines`.
+`uedev ue doctor` reads the project's `.uproject` `EngineAssociation` and
+matches it to an engine key or alias before deriving editor executable paths.
 
 ### `uedev ue run-python`
 

@@ -20,7 +20,15 @@ python -m uedev chat
   approval, and assistant blocks.
 - Type `test`; it should answer directly without tool activity.
 - Type `/`; slash commands should complete with descriptions.
-- Run `/help`, `/clear`, and `/ue doctor`.
+- Run `/help`, `/model`, `/plan`, `/plan off`, `/permissions`, `/clear`, and `/ue doctor`.
+- Confirm the TUI status bar below the input line shows the active model and
+  directory.
+- After `/plan`, confirm the same status bar shows `Plan mode (Shift+Tab to exit)`
+  on the right, and that Shift+Tab exits Plan Mode.
+- Run `/permissions`; the permission selector should open and support up/down
+  selection plus Enter. Also verify `/permissions read-only`, `/permissions default`,
+  `/permissions auto-review`, and `/permissions full-access`; the selected value
+  should affect only the current chat session.
 - Ask for a response with Markdown headings, a list, a table, and a code block;
   the final answer should render as rich terminal Markdown.
 - Ask the agent to read a small file; the turn should show tool activity while
@@ -32,12 +40,23 @@ python -m uedev chat
 
 ## UE dry-run checks
 
-Set these variables when needed:
+Configure UE engines in `~/.uedev/config.json`. The project's `.uproject`
+`EngineAssociation` must match one engine key or alias:
 
-```powershell
-$env:UE_PROJECT_PATH="D:\Path\Project.uproject"
-$env:UE_EDITOR_CMD_PATH="D:\Path\UnrealEditor-Cmd.exe"
-$env:UE_EDITOR_PATH="D:\Path\UnrealEditor.exe"
+```json
+{
+  "ue": {
+    "engines": {
+      "5.4": {
+        "root": "D:/Program Files/Epic Games/UE_5.4"
+      },
+      "5.5-source": {
+        "root": "D:/UE/UE_5.5_Source",
+        "aliases": ["5.5"]
+      }
+    }
+  }
+}
 ```
 
 Then run:
@@ -58,4 +77,5 @@ Only run this when the local UE project and editor paths are valid:
 python -m uedev ue list-assets --cwd . --execute
 ```
 
-Agent-driven UE execution must prompt for y/N before launching Unreal Editor.
+Agent-driven UE execution must follow the active `/permissions` mode before
+launching Unreal Editor.

@@ -2,7 +2,7 @@
 
 `uedev` is a Python CLI agent harness for coding, local automation, and
 Unreal Engine editor workflows. It keeps a conversation, lets the model request
-tools, asks before risky execution by default, and feeds observations back into
+tools, enforces configurable permission modes, and feeds observations back into
 the model until the task is complete.
 
 Tool use goes through OpenAI-compatible native tool/function calling. Tool
@@ -27,14 +27,30 @@ Create local configuration:
 uedev init
 ```
 
-Edit `.env`:
+Edit the system JSON config at `~/.uedev/config.json`:
 
-```bash
-OPENAI_API_KEY=your_api_key
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=your_model
-UE_PROJECT_PATH=D:\Path\To\Game.uproject
-UE_ENGINE_ROOT=D:\Program Files\Epic Games\UE_5.4
+```json
+{
+  "version": 1,
+  "models": {
+    "work": {
+      "model": "your_model",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "your_api_key"
+    }
+  },
+  "ue": {
+    "engines": {
+      "5.4": {
+        "root": "D:/Program Files/Epic Games/UE_5.4"
+      },
+      "5.5-source": {
+        "root": "D:/UE/UE_5.5_Source",
+        "aliases": ["5.5"]
+      }
+    }
+  }
+}
 ```
 
 The CLI uses the official `openai` Python package and supports
@@ -98,10 +114,11 @@ uedev run "inspect this project" --yes
 uedev run "debug this folder" --verbose
 ```
 
-By default, shell commands require confirmation before execution. UE execution is
-also confirmed at execution time: agent-driven UE Python tools ask for y/N before
-launching Unreal Editor. Standalone `uedev ue ...` commands still require
-`--execute`; omitting it produces a dry-run command preview.
+Permission mode is controlled in chat with `/permissions`. The available modes
+are `read-only`, `default`, `auto-review`, and `full-access`; the selected mode
+applies to the current chat session only. `--yes` starts that run or chat session
+in `full-access`. Standalone `uedev ue ...` commands still require `--execute`;
+omitting it produces a dry-run command preview.
 
 ## Behavior
 
@@ -115,8 +132,18 @@ launching Unreal Editor. Standalone `uedev ue ...` commands still require
   lists, links, code blocks, and tables.
 - `chat` shows per-turn thinking/tool events while running, then renders a
   collapsed process summary before the final answer.
-- `chat` supports slash commands such as `/help`, `/todos`, and `/ue doctor`;
+- `chat` supports slash commands such as `/help`, `/todos`, `/model`, `/plan`,
+  `/permissions`, and `/ue doctor`;
   type `/` to autocomplete commands with descriptions.
+- `/model` lists configured model profiles; `/model <profile>` stores the active
+  model for the current project in `.agent/config.json`; `/model reset` returns
+  to the first configured model, unless `default_model` is explicitly set.
+- `/plan` enters Plan Mode; `/plan off` exits it. In the TUI, Plan Mode shows a
+  right-aligned `Plan mode (Shift+Tab to exit)` hint on the status line directly
+  under the current input while the same line shows the active model and directory.
+- `/permissions` opens an interactive permission-mode selector in the TUI;
+  `/permissions <mode>` switches the current chat session between `read-only`,
+  `default`, `auto-review`, and `full-access`.
 - `chat` keeps an in-session input history that can be browsed with the arrow keys.
 - `chat --plain` keeps the script-friendly text renderer for pipes, non-TTY
   sessions, and automation.
@@ -130,6 +157,9 @@ launching Unreal Editor. Standalone `uedev ue ...` commands still require
 - If a filesystem task is answered without using a tool call, the CLI asks
   the model to call the appropriate tool instead.
 - Todos are stored in `.agent/todos.json`.
+- Persistent tasks are stored in `.agent/tasks/`.
+- Team state is stored in `.agent/team/`.
+- Managed worktree indexes and directories are stored in `.agent/worktrees/`.
 - UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; the authoritative executed script snapshot is `user_script.py` in that run directory. `.agent/ue_scripts/` is a legacy location and is not the current execution entrypoint.
 - Manual validation steps are documented in `docs/VALIDATION.md`.
 
@@ -138,11 +168,16 @@ launching Unreal Editor. Standalone `uedev ue ...` commands still require
 The project now includes first-class UE helper tools instead of relying on ad
 hoc shell commands:
 
-- `ue.doctor`: find Unreal Engine and `.uproject`
+- `ue.doctor`: find `.uproject`, read its `EngineAssociation`, and match a configured UE engine
 - `ue.run_python_commandlet`: call `UnrealEditor-Cmd.exe -run=pythonscript`
 - `ue.run_python_full_editor`: call `UnrealEditor-Cmd.exe -ExecutePythonScript`
 - `ue.list_assets`: wrap a UE Python script and return JSON
 - `ue.validate_assets`: run UE Data Validation and summarize results
+
+UE engine selection is driven by the project's `.uproject` `EngineAssociation`.
+The system config can store multiple UE versions under `ue.engines`; the doctor
+matches the project version to an engine key or alias and does not fall back to a
+different engine when the declared version is not configured.
 
 See:
 

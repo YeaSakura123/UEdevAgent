@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI, OpenAIError
+
+from .config import ModelProfile
 
 
 @dataclass(frozen=True)
@@ -76,21 +77,21 @@ def _parse_tool_arguments(raw_arguments: str) -> dict[str, Any]:
 
 
 # 外部函数：向模型发送消息，返回文本或原生 tool/function calling 结果。
-def call_model(messages: list[ChatMessage], tools: list[dict[str, Any]] | None = None) -> ModelResponse:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("OPENAI_MODEL")
+def call_model(
+    messages: list[ChatMessage],
+    profile: ModelProfile,
+    tools: list[dict[str, Any]] | None = None,
+) -> ModelResponse:
+    if not profile.api_key:
+        raise RuntimeError(f"Model profile {profile.name!r} is missing api_key in the system JSON config.")
+    if not profile.model:
+        raise RuntimeError(f"Model profile {profile.name!r} is missing model in the system JSON config.")
 
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY. Create .env from .env.example and set your API key.")
-    if not model:
-        raise RuntimeError("Missing OPENAI_MODEL. Set it in .env.")
-
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=120)
+    client = OpenAI(api_key=profile.api_key, base_url=profile.base_url.rstrip("/"), timeout=120)
 
     try:
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": profile.model,
             "messages": [_serialize_message(message) for message in messages],
             "temperature": 0.1,
         }

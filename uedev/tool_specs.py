@@ -51,7 +51,7 @@ def get_tool_specs() -> list[ToolSpec]:
         ),
         function_tool(
             "todo_update",
-            "Replace the lightweight todo list for the current agent turn.",
+            "Replace the lightweight todo list for meaningful multi-step progress in the current agent turn. Do not use this tool to acknowledge instructions, confirm future behavior, or mark a single status check as completed.",
             {
                 "items": {
                     "type": "array",
@@ -113,12 +113,12 @@ def get_tool_specs() -> list[ToolSpec]:
         function_tool("worktree_remove", "Remove a managed worktree.", {"name": string, "force": boolean, "complete_task": boolean}, ["name"]),
         function_tool(
             "ue_doctor",
-            "Inspect Unreal Engine project and editor configuration. Optional cwd points at a UE project or workspace directory.",
+            "Inspect Unreal Engine project state, including .uproject discovery, EngineAssociation, configured UE engine/editor paths, and Perforce read-only status. Use this as the sole default check for UE project/engine/Perforce questions; do not follow with shell p4 info unless the user explicitly requests raw p4 diagnostics or this tool reports unknown, timeout, or an error. Optional cwd points at a UE project or workspace directory.",
             {"cwd": string},
         ),
         function_tool(
             "ue_run_python",
-            "Run Unreal Engine Python after user confirmation. Use script for complete inline Python code or script_path for an existing .py file path; do not pass inline runpy.run_path loader scripts. Optional mode is commandlet or full_editor; optional cwd points at a UE project or workspace directory. To return data to the agent, set _uedev_result or call _uedev_emit(key, value); unreal.log output is captured as logs for diagnosis.",
+            "Run Unreal Engine Python after harness permission checks. Use script for complete inline Python code or script_path for an existing .py file path; do not pass inline runpy.run_path loader scripts. Optional mode is commandlet or full_editor; optional cwd points at a UE project or workspace directory. To return data to the agent, set _uedev_result or call _uedev_emit(key, value); unreal.log output is captured as logs for diagnosis.",
             {"script": string, "script_path": string, "mode": string, "cwd": string},
         ),
         function_tool(

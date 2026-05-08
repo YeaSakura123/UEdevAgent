@@ -72,7 +72,7 @@
 
 实现：
 
-- `.tasks/task_<id>.json`
+- `.agent/tasks/task_<id>.json`
 - `task_create`
 - `task_get`
 - `task_update`
@@ -96,8 +96,8 @@
 
 实现：
 
-- `.team/config.json` 保存成员
-- `.team/inbox/*.jsonl` 作为队友 inbox
+- `.agent/team/config.json` 保存成员
+- `.agent/team/inbox/*.jsonl` 作为队友 inbox
 - `spawn_teammate`
 - `list_teammates`
 - `send_message`
@@ -114,7 +114,7 @@
 - `shutdown_response`
 - `plan_submit`
 - `plan_review`
-- `.team/requests.json` 保存 request_id 与状态
+- `.agent/team/requests.json` 保存 request_id 与状态
 
 ## s11 Autonomous Agents
 
@@ -122,7 +122,7 @@
 
 实现：
 
-- 队友可以从 `.tasks` 中认领 ready task
+- 队友可以从 `.agent/tasks` 中认领 ready task
 - ready 条件：`pending`、无 owner、无 `blockedBy`
 - `idle` 工具更新成员状态
 
@@ -134,8 +134,8 @@
 
 实现：
 
-- `.worktrees/index.json`
-- `.worktrees/events.jsonl`
+- `.agent/worktrees/index.json`
+- `.agent/worktrees/events.jsonl`
 - `worktree_create`
 - `worktree_list`
 - `worktree_run`

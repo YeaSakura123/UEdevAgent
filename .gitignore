@@ -6,7 +6,7 @@ __pycache__/
 build/
 dist/
 .tmp/
-test/
+test/coin_game.html
 *.egg-info/
 .pytest_cache/
 .ruff_cache/

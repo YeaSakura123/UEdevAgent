@@ -23,8 +23,8 @@ classifiers = [
 [project.scripts]
 uedev = "uedev.cli:main"
 
-[tool.setuptools]
-packages = ["uedev"]
+[tool.setuptools.packages.find]
+include = ["uedev*"]
 
 [build-system]
 requires = ["setuptools>=68"]

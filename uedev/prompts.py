@@ -97,7 +97,9 @@ def _core_tools_section() -> str:
 - Team coordination: spawn_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, shutdown_response, plan_submit, plan_review, idle.
 - Worktree isolation: worktree_create, worktree_list, worktree_run, worktree_keep, worktree_remove.
 - Runtime controls: /plan toggles Plan Mode; /permissions shows or changes permission mode.
-- Unreal Engine: ue_doctor, ue_run_python, ue_stop_executor. ue_doctor is the default check for UE project presence, EngineAssociation, configured editor paths, and Perforce read-only status. ue_run_python accepts inline script code or script_path for a .py file, then relies on harness permission checks before launching UE."""
+- Unreal Engine: ue_doctor, ue_run_python, ue_stop_executor. ue_doctor is the default check for UE project presence, EngineAssociation, configured editor paths, and Perforce read-only status. ue_run_python accepts inline script code or script_path for a .py file, then relies on harness permission checks before launching UE.
+- Perforce: p4_status, p4_file_state, p4_opened, p4_checkout, p4_add, p4_delete, p4_reconcile, p4_diff. Use these structured tools for Perforce workspace state and pending changelist edits instead of shell p4 commands.
+- MCP: configured MCP tools appear as mcp__server__tool. Call them like ordinary tools when useful; do not generate MCP JSON-RPC manually because the harness manages MCP protocol, process lifecycle, and permissions."""
 
 
 def _skill_usage_section() -> str:
@@ -111,14 +113,14 @@ def _perforce_ue_source_control_section() -> str:
     return """Perforce UE source control:
 - For status-only checks, use ue_doctor's Perforce result; do not run shell `p4 info` just to detect whether the project uses Perforce.
 - If the current workspace is an Unreal Engine project managed by Perforce, treat Perforce as the authority for file edit state.
-- Before modifying any Perforce-controlled file, run `p4 edit <path>`.
-- Source code and text files are not exclusive-lock files. They still require `p4 edit` before modification, and normal Perforce merge/resolve behavior is expected.
+- Before modifying any Perforce-controlled file, use p4_checkout.
+- Source code and text files are not exclusive-lock files. They still require p4_checkout before modification, and normal Perforce merge/resolve behavior is expected.
 - Unreal binary assets such as `.uasset`, `.umap`, `.ubulk`, `.uexp`, and similar files are exclusive-lock files. The agent must successfully acquire the Perforce checkout before changing them.
-- If `p4 edit` reports that a binary asset is locked or opened by another user/workspace, stop and report the conflict instead of trying to bypass it.
-- For new files, run `p4 add <path>`. For deleted files, run `p4 delete <path>`.
-- After filesystem changes, run `p4 reconcile` or `p4 reconcile <path>` to detect missed adds, edits, and deletes.
-- Run `p4 opened` before and after the edit session, and summarize opened files before finishing.
-- Do not run `p4 submit` unless the user explicitly asks for submit. By default, leave files opened or prepare a shelved changelist if requested."""
+- If p4_checkout reports that a binary asset is locked or opened by another user/workspace, stop and report the conflict instead of trying to bypass it.
+- For new files, use p4_add. For deleted files, use p4_delete.
+- After filesystem changes, use p4_reconcile to detect missed adds, edits, and deletes.
+- Use p4_opened before and after the edit session, and summarize opened files before finishing.
+- Do not run shell `p4 submit`, and do not submit by default. Leave files opened in a pending changelist unless a future explicit submit/shelve tool exists."""
 
 
 def _ue_safety_section() -> str:
@@ -126,6 +128,7 @@ def _ue_safety_section() -> str:
 - For requests asking whether the current workspace is a UE project, which engine version it uses, or whether it has Perforce, call ue_doctor directly and do not call list_files or shell `p4 info` for the same check.
 - Always call ue_doctor before UE editor operations.
 - Only use shell `p4 info` for raw Perforce diagnostics when the user explicitly asks for it, or when ue_doctor reports Perforce unknown, timeout, or an error.
+- For Perforce edit workflows, prefer p4_* tools over shell p4 commands so permission checks and binary asset conflict handling are enforced.
 - ue_run_python must rely on harness permission checks before launching UE; do not ask for confirmation in the final answer and do not pass execute or kind.
 - Prefer commandlet mode for read-only automation. Use full_editor only when the user asks for full editor or an API needs it.
 - Temporary UE scripts are written by the harness into .agent/ue_runs/<run_id>/user_script.py; pass complete inline code via script or an existing file via script_path, never an inline runpy.run_path loader.

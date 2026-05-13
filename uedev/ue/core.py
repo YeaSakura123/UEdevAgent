@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .config import ConfigError, SystemConfig, UeEngineProfile, load_system_config
+from ..config import ConfigError, SystemConfig, UeEngineProfile, load_system_config
 
 _LAST_RUN_TIME: datetime | None = None
 

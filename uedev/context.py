@@ -23,7 +23,8 @@ def micro_compact(messages: list[ChatMessage], keep_recent: int = 8, max_content
         for index, message in enumerate(messages)
         if message.role in {"user", "tool"} and message.content.startswith("Tool result for:")
     ]
-    for index in tool_indices[:-keep_recent]:
+    compact_indices = tool_indices if keep_recent <= 0 else tool_indices[:-keep_recent]
+    for index in compact_indices:
         content = messages[index].content
         if len(content) > max_content:
             first_line = content.splitlines()[0] if content else "Tool result"

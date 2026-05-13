@@ -1,0 +1,167 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+import uuid
+from io import StringIO
+from pathlib import Path
+from unittest.mock import patch
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def workspace_temp_dir():
+    root = Path.cwd() / ".tmp" / "tests"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"case_{uuid.uuid4().hex}"
+    path.mkdir()
+    yield str(path)
+
+
+
+from uedev.background import BackgroundManager
+from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.loop import (
+    SLASH_COMMANDS,
+    AgentOptions,
+    AgentRuntime,
+    SlashCommandCompleter,
+    create_chat_prompt_options,
+    defers_tool_confirmation,
+    is_acknowledgement_answer,
+    render_chat_banner,
+    render_slash_help,
+)
+from uedev.permissions import classify_shell_command
+from uedev.prompts import (
+    _join_sections,
+    build_prompt_bundle,
+    build_subagent_prompt,
+    build_system_prompt as build_prompt_system_prompt,
+    build_tool_confirmation_reminder,
+)
+from uedev.renderer import ConsoleRenderer, TuiRenderer
+from uedev.shell import ShellResult, run_shell
+from uedev.skills import SkillLoader
+from uedev.tasks import TaskManager
+from uedev.team import MessageBus, TeamManager
+from uedev.tool_specs import get_tool_names, get_tool_specs
+from uedev.workspace import edit_file, read_file, write_file
+from uedev.worktrees import WorktreeManager
+
+
+def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "models": models
+                or {
+                    "first-model": {
+                        "model": "gpt-test",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "test-key",
+                    }
+                },
+                "ue": {"engines": ue_engines or {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def create_ue_engine_root(root: Path, *, commandlet: bool = True, gui: bool = True) -> None:
+    bin_dir = root / "Engine" / "Binaries" / "Win64"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    if commandlet:
+        (bin_dir / "UnrealEditor-Cmd.exe").write_text("", encoding="utf-8")
+    if gui:
+        (bin_dir / "UnrealEditor.exe").write_text("", encoding="utf-8")
+
+
+class ConfigTests(unittest.TestCase):
+    def test_missing_system_config_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            with self.assertRaisesRegex(ConfigError, "Config file not found"):
+                load_system_config(Path(temp) / "missing.json")
+
+    def test_invalid_system_config_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "bad.json"
+            config_path.write_text("{bad", encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, "Invalid JSON"):
+                load_system_config(config_path)
+
+    def test_project_active_model_overrides_default(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "main-key",
+                    },
+                    "gpt-alt": {
+                        "model": "alt-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "alt-key",
+                    },
+                },
+            )
+            (agent_dir(root) / "config.json").parent.mkdir(parents=True)
+            (agent_dir(root) / "config.json").write_text(json.dumps({"version": 1, "active_model": "gpt-alt"}), encoding="utf-8")
+
+            profile = resolve_model_profile(root, load_system_config(config_path))
+
+            self.assertEqual(profile.name, "gpt-alt")
+            self.assertEqual(profile.model, "alt-model")
+
+    def test_first_model_is_default_when_default_model_is_omitted(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "first": {
+                        "model": "first-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "first-key",
+                    },
+                    "second": {
+                        "model": "second-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "second-key",
+                    },
+                },
+            )
+
+            config = load_system_config(config_path)
+            profile = resolve_model_profile(root, config)
+
+            self.assertEqual(config.default_model, "first")
+            self.assertEqual(profile.name, "first")
+
+    def test_project_permission_mode_defaults_and_persists(self) -> None:
+        from uedev.config import save_project_permission_mode
+
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+
+            self.assertEqual(load_project_config(root).permission_mode, "default")
+
+            save_project_permission_mode(root, "auto_review")
+            payload = json.loads((agent_dir(root) / "config.json").read_text(encoding="utf-8"))
+
+            self.assertEqual(payload["permission_mode"], "auto_review")
+            self.assertEqual(load_project_config(root).permission_mode, "auto_review")

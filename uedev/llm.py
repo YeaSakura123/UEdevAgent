@@ -4,7 +4,11 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from openai import OpenAI, OpenAIError
+try:
+    from openai import OpenAI, OpenAIError
+except ModuleNotFoundError:  # pragma: no cover - only used in minimal test environments.
+    OpenAI = None  # type: ignore[assignment]
+    OpenAIError = Exception  # type: ignore[assignment]
 
 from .config import ModelProfile
 
@@ -82,6 +86,8 @@ def call_model(
     profile: ModelProfile,
     tools: list[dict[str, Any]] | None = None,
 ) -> ModelResponse:
+    if OpenAI is None:
+        raise RuntimeError("The openai package is required to call a model.")
     if not profile.api_key:
         raise RuntimeError(f"Model profile {profile.name!r} is missing api_key in the system JSON config.")
     if not profile.model:

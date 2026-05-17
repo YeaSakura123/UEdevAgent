@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -41,6 +42,7 @@ from uedev.loop import (
     defers_tool_confirmation,
     is_acknowledgement_answer,
     render_chat_banner,
+    render_workspace_diff,
     render_slash_help,
 )
 from uedev.permissions import classify_shell_command
@@ -61,23 +63,30 @@ from uedev.workspace import edit_file, read_file, write_file
 from uedev.worktrees import WorktreeManager
 
 
-def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+def write_system_config(
+    config_path: Path,
+    *,
+    models: dict[str, dict[str, object]] | None = None,
+    ue_engines: dict[str, dict[str, object]] | None = None,
+    display: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "version": 1,
+        "models": models
+        or {
+            "first-model": {
+                "model": "gpt-test",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "test-key",
+            }
+        },
+        "ue": {"engines": ue_engines or {}},
+    }
+    if display is not None:
+        payload["display"] = display
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "models": models
-                or {
-                    "first-model": {
-                        "model": "gpt-test",
-                        "base_url": "https://api.openai.com/v1",
-                        "api_key": "test-key",
-                    }
-                },
-                "ue": {"engines": ue_engines or {}},
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -97,11 +106,17 @@ class SlashCommandTests(unittest.TestCase):
 
         self.assertIn("/help", help_text)
         self.assertIn("Show available chat slash commands.", help_text)
+        self.assertIn("/diff", help_text)
+        self.assertIn("Show Git and Perforce workspace changes.", help_text)
         self.assertIn("/model", help_text)
         self.assertIn("/plan", help_text)
         self.assertIn("/permissions", help_text)
+        self.assertIn("/history", help_text)
+        self.assertIn("Load a previous conversation from this project.", help_text)
         self.assertIn("/ue doctor", help_text)
         self.assertIn("Inspect Unreal Engine project and editor configuration.", help_text)
+        self.assertIn("/compact", help_text)
+        self.assertIn("Compact the current conversation context.", help_text)
         self.assertIn("/clear", help_text)
         self.assertIn("Reset the current chat conversation context.", help_text)
 
@@ -133,6 +148,11 @@ class SlashCommandTests(unittest.TestCase):
         completions = list(SlashCommandCompleter().get_completions(Document("/ue"), None))
 
         self.assertEqual([completion.text for completion in completions], ["/ue doctor"])
+
+    def test_slash_completer_filters_diff_command(self) -> None:
+        completions = list(SlashCommandCompleter().get_completions(Document("/dif"), None))
+
+        self.assertEqual([completion.text for completion in completions], ["/diff"])
 
     def test_slash_completer_matches_fuzzy_ue_doctor(self) -> None:
         completions = list(SlashCommandCompleter().get_completions(Document("/ud"), None))
@@ -279,6 +299,132 @@ class SlashCommandTests(unittest.TestCase):
 
             self.assertTrue(runtime.handle_slash_command("/permissions invalid", emit=output.append))
             self.assertIn("Unknown permission mode", output[-1])
+
+    def test_diff_slash_command_rejects_arguments(self) -> None:
+        with workspace_temp_dir() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/diff Source/A.cpp", emit=output.append))
+
+            self.assertEqual(output[-1], "Usage: /diff")
+
+    def test_diff_slash_command_renders_git_and_perforce_status(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path, display={"diff_output_max_chars": 50})
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            def fake_run(args, **kwargs):
+                if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                    return subprocess.CompletedProcess(args, 0, "true\n", "")
+                if args == ["git", "status", "--short", "--branch"]:
+                    return subprocess.CompletedProcess(args, 0, "## No commits yet on master\n M Source/A.cpp\nA  README.md\n?? Content/\n", "")
+                if args == ["git", "diff", "--no-ext-diff"]:
+                    return subprocess.CompletedProcess(args, 0, "x" * 80, "")
+                if args == ["git", "diff", "--cached", "--no-ext-diff"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                raise AssertionError(f"unexpected command: {args}")
+
+            with (
+                patch("uedev.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
+                patch(
+                    "uedev.runtime.agent.p4_status",
+                    return_value=json.dumps(
+                        {
+                            "ok": True,
+                            "available": True,
+                            "in_workspace": True,
+                            "project_tracked": True,
+                            "client_name": "UnrealCode_WS",
+                            "client_root": str(root),
+                            "user_name": "admin",
+                            "server_address": "perforce:1666",
+                            "project_depot_path": "//depot/Project.uproject",
+                            "opened_count": 1,
+                            "opened_preview": ["SHOULD_NOT_PRINT"],
+                            "notes": [],
+                        }
+                    ),
+                ) as status,
+                patch(
+                    "uedev.runtime.agent.p4_opened",
+                    return_value=json.dumps(
+                        {
+                            "ok": True,
+                            "status": "completed",
+                            "command": "p4 opened",
+                            "exit_code": 0,
+                            "stdout": "SHOULD_NOT_PRINT",
+                            "stderr": "",
+                            "opened_count": 1,
+                            "opened": ["//depot/A.cpp#1 - edit default change (text)"],
+                        }
+                    ),
+                ) as opened,
+            ):
+                self.assertTrue(runtime.handle_slash_command("/diff", emit=output.append))
+
+            rendered = output[-1]
+            self.assertIn("branch: master (no commits)", rendered)
+            self.assertIn("status: staged 1, unstaged 1, untracked 1", rendered)
+            self.assertIn("unstaged diff:", rendered)
+            self.assertIn("staged diff: none", rendered)
+            self.assertIn("truncated at 50 chars", rendered)
+            self.assertIn("workspace: UnrealCode_WS", rendered)
+            self.assertIn("project: tracked //depot/Project.uproject", rendered)
+            self.assertIn("opened: 1", rendered)
+            self.assertIn("edit", rendered)
+            self.assertIn("text", rendered)
+            self.assertIn("//depot/A.cpp", rendered)
+            self.assertNotIn('"stdout"', rendered)
+            self.assertNotIn("opened_preview", rendered)
+            self.assertNotIn("SHOULD_NOT_PRINT", rendered)
+            status.assert_called_once_with(root)
+            opened.assert_called_once_with(root)
+
+    def test_workspace_diff_continues_to_p4_when_not_git_repository(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+
+            def fake_run(args, **kwargs):
+                if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                    return subprocess.CompletedProcess(args, 128, "", "not a git repository")
+                raise AssertionError(f"unexpected command: {args}")
+
+            with (
+                patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
+                patch("uedev.runtime.agent.p4_status", return_value='{"ok": false, "available": false}') as status,
+                patch("uedev.runtime.agent.p4_opened", return_value='{"ok": true, "opened_count": 0}') as opened,
+            ):
+                rendered = render_workspace_diff(root, 120, 20000)
+
+            self.assertIn("Git: not a repository", rendered)
+            self.assertIn("status: unavailable", rendered)
+            self.assertIn("opened: none", rendered)
+            status.assert_called_once_with(root)
+            opened.assert_called_once_with(root)
 
     def test_chat_prompt_options_enable_block_cursor_and_completion(self) -> None:
         options = create_chat_prompt_options()

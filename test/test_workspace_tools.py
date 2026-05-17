@@ -23,7 +23,15 @@ def workspace_temp_dir():
 
 from uedev.background import BackgroundManager
 from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.context import (
+    SUMMARY_PREFIX,
+    build_compacted_history,
+    build_compaction_request,
+    compact_locally,
+    estimate_tokens,
+    micro_compact,
+    repair_tool_call_messages,
+)
 from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.loop import (
@@ -216,6 +224,55 @@ class ContextTests(unittest.TestCase):
             self.assertEqual(compacted[0].content, "system rules")
             self.assertEqual(compacted[1].role, "user")
             self.assertIn("[Compressed locally: test]", compacted[1].content)
+
+    def test_build_compaction_request_omits_runtime_state(self) -> None:
+        messages = [
+            ChatMessage(role="system", content="system rules"),
+            ChatMessage(role="system", content="<runtime-state>\nmode"),
+            ChatMessage(role="user", content="old request"),
+        ]
+
+        request = build_compaction_request(messages, "test")
+
+        self.assertFalse(any(message.content.startswith("<runtime-state>") for message in request))
+        self.assertIn("Compaction reason: test", request[-1].content)
+
+    def test_build_compacted_history_uses_summary_prefix_and_filters_internal_users(self) -> None:
+        messages = [
+            ChatMessage(role="system", content="system rules"),
+            ChatMessage(role="user", content="Working directory: D:/Code\nShell: PowerShell"),
+            ChatMessage(role="user", content=f"{SUMMARY_PREFIX}\nold summary"),
+            ChatMessage(role="user", content="keep this request"),
+            ChatMessage(role="user", content="Tool result for: read_file\nold observation"),
+            ChatMessage(role="system", content="<runtime-state>\nmode"),
+        ]
+
+        compacted = build_compacted_history(messages, "new summary")
+
+        self.assertEqual(compacted[0].role, "system")
+        self.assertEqual(compacted[0].content, "system rules")
+        rendered = "\n".join(message.content for message in compacted)
+        self.assertIn("keep this request", rendered)
+        self.assertIn(f"{SUMMARY_PREFIX}\nnew summary", rendered)
+        self.assertNotIn("Working directory:", rendered)
+        self.assertNotIn("old summary", rendered)
+        self.assertNotIn("Tool result for:", rendered)
+        self.assertNotIn("<runtime-state>", rendered)
+
+    def test_build_compacted_history_respects_user_token_budget(self) -> None:
+        messages = [
+            ChatMessage(role="system", content="system rules"),
+            ChatMessage(role="user", content="small one"),
+            ChatMessage(role="user", content="x" * 1000),
+            ChatMessage(role="user", content="small two"),
+        ]
+
+        compacted = build_compacted_history(messages, "summary", max_user_tokens=50)
+        rendered = "\n".join(message.content for message in compacted)
+
+        self.assertIn("small one", rendered)
+        self.assertIn("small two", rendered)
+        self.assertNotIn("x" * 1000, rendered)
 
     def test_estimate_tokens_accepts_native_tool_calls(self) -> None:
         messages = [

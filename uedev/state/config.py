@@ -13,6 +13,8 @@ from ..permissions import PermissionMode, normalize_permission_mode
 CONFIG_VERSION = 1
 SYSTEM_CONFIG_DIR = ".uedev"
 CONFIG_FILE = "config.json"
+DEFAULT_CONTEXT_WINDOW = 256 * 1024
+DEFAULT_DIFF_OUTPUT_MAX_CHARS = 20000
 
 
 class ConfigError(RuntimeError):
@@ -25,6 +27,7 @@ class ModelProfile:
     model: str
     base_url: str
     api_key: str
+    context_window: int = DEFAULT_CONTEXT_WINDOW
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,7 @@ class SystemConfig:
     models: dict[str, ModelProfile]
     ue_engines: dict[str, UeEngineProfile]
     mcp_servers: dict[str, McpServerConfig]
+    diff_output_max_chars: int = DEFAULT_DIFF_OUTPUT_MAX_CHARS
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,7 @@ def system_config_template() -> dict[str, Any]:
                 "model": "",
                 "base_url": "https://your.api.com/v1",
                 "api_key": "",
+                "context_window": DEFAULT_CONTEXT_WINDOW,
             }
         },
         "ue": {
@@ -86,6 +91,9 @@ def system_config_template() -> dict[str, Any]:
                     "root": "D:/Program Files/Epic Games/UE_5.4",
                 }
             }
+        },
+        "display": {
+            "diff_output_max_chars": DEFAULT_DIFF_OUTPUT_MAX_CHARS,
         },
         "mcp": {
             "servers": {},
@@ -138,6 +146,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
             model=str(raw.get("model") or "").strip(),
             base_url=str(raw.get("base_url") or "https://your.api.com/v1"),
             api_key=str(raw.get("api_key") or "").strip(),
+            context_window=_optional_positive_int(raw.get("context_window"), DEFAULT_CONTEXT_WINDOW, config_path, f"models.{name}.context_window"),
         )
         models[name] = profile
 
@@ -169,8 +178,16 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
         engines[name] = UeEngineProfile(name=name, root=Path(root).expanduser().resolve(), aliases=aliases)
 
     mcp_servers = _parse_mcp_servers(data.get("mcp", {}), config_path)
+    diff_output_max_chars = _parse_display_config(data.get("display", {}), config_path)
 
-    return SystemConfig(path=config_path, default_model=default_model, models=models, ue_engines=engines, mcp_servers=mcp_servers)
+    return SystemConfig(
+        path=config_path,
+        default_model=default_model,
+        models=models,
+        ue_engines=engines,
+        mcp_servers=mcp_servers,
+        diff_output_max_chars=diff_output_max_chars,
+    )
 
 
 def load_project_config(cwd: Path) -> ProjectConfig:
@@ -248,7 +265,10 @@ def format_model_profiles(cwd: Path, system_config: SystemConfig | None = None) 
             markers.append("default")
         suffix = f" ({', '.join(markers)})" if markers else ""
         key_state = "set" if profile.api_key else "missing"
-        lines.append(f"- {name}{suffix}: {profile.model or '(missing model)'} api_key={key_state} base_url={profile.base_url}")
+        lines.append(
+            f"- {name}{suffix}: {profile.model or '(missing model)'} "
+            f"context_window={profile.context_window} api_key={key_state} base_url={profile.base_url}"
+        )
     return "\n".join(lines)
 
 
@@ -266,6 +286,20 @@ def _optional_string_tuple(value: object, path: Path, label: str) -> tuple[str, 
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ConfigError(f"{label} must be an array of strings: {path}")
     return tuple(item.strip() for item in value if item.strip())
+
+
+def _optional_positive_int(value: object, default: int, path: Path, label: str) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be a positive integer: {path}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as error:
+        raise ConfigError(f"{label} must be a positive integer: {path}") from error
+    if parsed <= 0:
+        raise ConfigError(f"{label} must be a positive integer: {path}")
+    return parsed
 
 
 def _parse_mcp_servers(raw_mcp: object, config_path: Path) -> dict[str, McpServerConfig]:
@@ -312,6 +346,19 @@ def _parse_mcp_servers(raw_mcp: object, config_path: Path) -> dict[str, McpServe
             timeout_seconds=timeout_seconds,
         )
     return servers
+
+
+def _parse_display_config(raw_display: object, config_path: Path) -> int:
+    if raw_display is None:
+        return DEFAULT_DIFF_OUTPUT_MAX_CHARS
+    if not isinstance(raw_display, dict):
+        raise ConfigError(f"System config display must be an object: {config_path}")
+    return _optional_positive_int(
+        raw_display.get("diff_output_max_chars"),
+        DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+        config_path,
+        "display.diff_output_max_chars",
+    )
 
 
 def _is_safe_mcp_name(value: str) -> bool:

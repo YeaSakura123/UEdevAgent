@@ -5,12 +5,13 @@ import uuid
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer
+from prompt_toolkit.completion import Completer, WordCompleter
 from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.base import Output
 
 from ..config import ConfigError
+from ..history import HistoryEntry, HistoryError, HistoryRecorder, ensure_system_prompt, list_history_entries, load_history_file
 from .events import stopped_event
 from ..llm import ChatMessage
 from .renderer import TuiRenderer
@@ -39,6 +40,7 @@ class ChatTuiApplication:
         self.renderer = TuiRenderer(banner=banner, verbose=options.verbose)
         self.runtime.approval_provider = self.confirm_command
         self.messages = self._initial_messages()
+        self.history = HistoryRecorder(self.runtime.agent_dir, self.messages)
 
     def run(self) -> None:
         from ..loop import create_chat_prompt_options, create_chat_session
@@ -64,8 +66,15 @@ class ChatTuiApplication:
 
             if query.lower() == "/clear":
                 self.messages = self._initial_messages()
+                self.history.reset(self.messages)
                 self.renderer.clear()
                 self.renderer.print_system("Conversation context cleared.")
+                continue
+
+            if query.lower() == "/history":
+                selected = self.prompt_history_selection(session)
+                if selected is not None:
+                    self.load_history(selected)
                 continue
 
             if query.lower() == "/permissions":
@@ -74,7 +83,7 @@ class ChatTuiApplication:
                     continue
                 query = selected
 
-            if self.runtime.handle_slash_command(query, emit=self.renderer.print_system):
+            if self.runtime.handle_slash_command(query, emit=self.renderer.print_system, messages=self.messages):
                 continue
 
             self._run_turn(query)
@@ -134,6 +143,49 @@ class ChatTuiApplication:
             return None
         return selected or None
 
+    def prompt_history_selection(self, session: PromptSession) -> HistoryEntry | None:
+        from ..loop import create_chat_prompt_options
+
+        entries = list_history_entries(self.runtime.agent_dir)
+        if not entries:
+            self.renderer.print_system("No history found for this project.")
+            return None
+
+        labels = [f"{index}. {entry.label}" for index, entry in enumerate(entries, start=1)]
+        by_label = {label: entry for label, entry in zip(labels, entries)}
+
+        def start_completion() -> None:
+            session.app.current_buffer.start_completion(select_first=True)
+
+        try:
+            prompt_options = create_chat_prompt_options()
+            prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+            selected = session.prompt(
+                [("class:prompt", "\nHistory> ")],
+                completer=WordCompleter(labels, ignore_case=True, sentence=True),
+                pre_run=start_completion,
+                **prompt_options,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if not selected:
+            return None
+        entry = by_label.get(selected)
+        if entry is None:
+            self.renderer.print_system(f"Unknown history selection: {selected}")
+        return entry
+
+    def load_history(self, entry: HistoryEntry) -> None:
+        try:
+            messages = ensure_system_prompt(load_history_file(entry.path), self.runtime.system_prompt)
+        except HistoryError as error:
+            self.renderer.print_system(f"Failed to load history: {error}")
+            return
+        self.messages = messages
+        self.history.reset(self.messages)
+        self.renderer.render_history(self.messages, str(entry.path))
+
     def _status_model_name(self) -> str:
         try:
             profile = self.runtime.current_model_profile()
@@ -173,10 +225,9 @@ class ChatTuiApplication:
 
     def _run_turn(self, goal: str) -> None:
         turn_id = f"turn-{uuid.uuid4().hex[:8]}"
-        self.messages.append(ChatMessage(role="user", content=goal))
         self.renderer.start_turn(turn_id, goal)
         try:
-            for event in self.runtime.run_turn_events(self.messages, goal=goal, turn_id=turn_id):
+            for event in self.runtime.run_turn_events(self.messages, goal=goal, turn_id=turn_id, history=self.history):
                 self.renderer.render(event)
         except Exception as error:
             self.renderer.render(stopped_event(f"Error: {error}", turn_id=turn_id))

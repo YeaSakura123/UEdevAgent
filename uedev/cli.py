@@ -47,7 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("-y", "--yes", action="store_true", help="start this run in full-access permission mode")
     run_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     run_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
-    run_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
+    run_parser.add_argument(
+        "--context-threshold",
+        type=int,
+        default=None,
+        help="estimated token threshold for auto compact; defaults to 90%% of the active model context_window",
+    )
 
     chat_parser = subparsers.add_parser("chat", help="start an interactive agent chat session")
     chat_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=8, help=argparse.SUPPRESS)
@@ -55,7 +60,12 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("-y", "--yes", action="store_true", help="start this chat in full-access permission mode")
     chat_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
     chat_parser.add_argument("--verbose", action="store_true", help="show internal iteration and tool diagnostics")
-    chat_parser.add_argument("--context-threshold", type=int, default=60000, help="estimated token threshold for auto compact")
+    chat_parser.add_argument(
+        "--context-threshold",
+        type=int,
+        default=None,
+        help="estimated token threshold for auto compact; defaults to 90%% of the active model context_window",
+    )
     chat_parser.add_argument("--plain", action="store_true", help="use the script-friendly plain chat renderer")
 
     task_parser = subparsers.add_parser("tasks", help="show the persisted agent todo list")

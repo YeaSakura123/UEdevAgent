@@ -8,15 +8,27 @@ from pathlib import Path
 from .llm import ChatMessage
 
 
-# 内部函数：估算当前消息上下文大小，用于判断是否需要压缩。
+SUMMARY_PREFIX = "[Conversation summary]"
+RUNTIME_STATE_MARKER = "<runtime-state>"
+COMPACT_USER_MESSAGE_MAX_TOKENS = 20000
+SUMMARIZATION_PROMPT = """You are compacting a long agent conversation so another model turn can continue from a short replacement history.
+
+Write a concise but complete handoff summary. Preserve:
+- the user's current goal and relevant prior requests
+- completed work and important observations
+- files, commands, tools, task ids, and decisions that matter
+- outstanding work, blockers, and next steps
+
+Do not include filler, greetings, or speculation. The result will replace older conversation history."""
+
+
 def estimate_tokens(messages: list[ChatMessage]) -> int:
     raw = json.dumps([asdict(message) for message in messages], ensure_ascii=False)
     return max(1, len(raw) // 4)
 
 
-# 内部函数：压缩旧工具结果，降低 agent loop 的上下文占用。
 def micro_compact(messages: list[ChatMessage], keep_recent: int = 8, max_content: int = 4000) -> None:
-    """轻量压缩旧观察结果，保留最近几轮，降低上下文膨胀。"""
+    """Compact older tool observations without breaking tool-call identity."""
 
     tool_indices = [
         index
@@ -68,19 +80,95 @@ def repair_tool_call_messages(messages: list[ChatMessage]) -> None:
         index += 1
 
 
-# 内部函数：保存完整会话 transcript，供压缩后追溯原始上下文。
 def save_transcript(messages: list[ChatMessage], transcript_dir: Path) -> Path:
     transcript_dir.mkdir(parents=True, exist_ok=True)
-    path = transcript_dir / f"transcript_{int(time.time())}.jsonl"
+    path = transcript_dir / f"transcript_{time.time_ns()}.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         for message in messages:
             handle.write(json.dumps(asdict(message), ensure_ascii=False) + "\n")
     return path
 
 
-# 内部函数：生成本地压缩后的上下文摘要，替换过长会话历史。
+def is_runtime_state_message(message: ChatMessage) -> bool:
+    return message.role == "system" and message.content.startswith(RUNTIME_STATE_MARKER)
+
+
+def is_summary_message(message: ChatMessage) -> bool:
+    return message.role == "user" and message.content.startswith(SUMMARY_PREFIX)
+
+
+def is_real_user_message(message: ChatMessage) -> bool:
+    if message.role != "user":
+        return False
+    content = message.content.strip()
+    if not content:
+        return False
+    if content.startswith(SUMMARY_PREFIX):
+        return False
+    if content.startswith("Tool result for:"):
+        return False
+    if content.startswith("Working directory:"):
+        return False
+    if content.startswith("<background-results>") or content.startswith("<inbox>"):
+        return False
+    return True
+
+
+def latest_real_user_message(messages: list[ChatMessage]) -> ChatMessage | None:
+    for message in reversed(messages):
+        if is_real_user_message(message):
+            return message
+    return None
+
+
+def build_compaction_request(messages: list[ChatMessage], reason: str) -> list[ChatMessage]:
+    request = [
+        message
+        for message in messages
+        if not is_runtime_state_message(message)
+    ]
+    request.append(
+        ChatMessage(
+            role="user",
+            content=f"{SUMMARIZATION_PROMPT}\n\nCompaction reason: {reason}",
+        )
+    )
+    return request
+
+
+def build_compacted_history(
+    messages: list[ChatMessage],
+    summary: str,
+    max_user_tokens: int = COMPACT_USER_MESSAGE_MAX_TOKENS,
+) -> list[ChatMessage]:
+    system_message = next(
+        (message for message in messages if message.role == "system" and not is_runtime_state_message(message)),
+        None,
+    )
+    selected_users: list[ChatMessage] = []
+    used_tokens = 0
+    for message in reversed(messages):
+        if not is_real_user_message(message):
+            continue
+        message_tokens = estimate_tokens([message])
+        if used_tokens + message_tokens > max_user_tokens:
+            continue
+        selected_users.append(message)
+        used_tokens += message_tokens
+
+    selected_users.reverse()
+    summary_content = summary.strip()
+    if not summary_content.startswith(SUMMARY_PREFIX):
+        summary_content = f"{SUMMARY_PREFIX}\n{summary_content}".strip()
+
+    compacted = [*selected_users, ChatMessage(role="user", content=summary_content)]
+    if system_message is not None:
+        return [system_message, *compacted]
+    return compacted
+
+
 def compact_locally(messages: list[ChatMessage], transcript_dir: Path, reason: str) -> list[ChatMessage]:
-    """不额外调用模型的保守压缩：保存原文，只留下任务连续性摘要。"""
+    """Legacy local compaction used by older tests and callers."""
 
     transcript = save_transcript(messages, transcript_dir)
     system_message = messages[0] if messages and messages[0].role == "system" else None

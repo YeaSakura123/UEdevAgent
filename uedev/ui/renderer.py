@@ -63,6 +63,8 @@ except ModuleNotFoundError:  # pragma: no cover - only used in minimal test envi
             print(str(renderable), file=self.file)
 
 from .events import AgentEvent
+from ..context import SUMMARY_PREFIX, is_runtime_state_message
+from ..llm import ChatMessage
 
 
 @dataclass
@@ -115,6 +117,9 @@ class ConsoleRenderer:
             if self.verbose and event.step and event.total:
                 return f"Thinking... ({event.step}/{event.total})"
             return "Thinking..."
+
+        if event.type == "compact":
+            return event.message
 
         if event.type == "tool_start":
             suffix = f" {self._format_input(event.input)}" if event.input else ""
@@ -196,6 +201,7 @@ class TuiRenderer:
 
     def start_turn(self, turn_id: str, user_message: str) -> None:
         self.turns.append(TurnViewState(turn_id=turn_id, user_message=user_message))
+        self._record("user", user_message)
         self.running = True
 
     def add_system_message(self, message: str) -> None:
@@ -211,6 +217,9 @@ class TuiRenderer:
             if self.verbose or not any(existing.type == "thinking" for existing in turn.events):
                 self._record("thinking", self._thinking_text(event))
                 self._print(Text(self._thinking_text(event), style="dim"))
+        elif event.type == "compact":
+            self._record("compact", event.message)
+            self._print(_block("system", Text(event.message), style="bold blue"))
         elif event.type == "tool_start":
             self._record("tool_start", self._tool_start_text(event))
             self._print(self._tool_block(event.name, self._tool_start_text(event), "yellow"))
@@ -237,6 +246,40 @@ class TuiRenderer:
         self.system_messages.clear()
         self.transcript_lines.clear()
         self.running = False
+
+    def render_history(self, messages: list[ChatMessage], source: str) -> None:
+        self.clear()
+        self.print_system(f"Loaded history: {source}")
+        for message in messages:
+            if message.role == "system":
+                if is_runtime_state_message(message):
+                    continue
+                continue
+            if message.role == "user":
+                content = message.content.strip()
+                if not content or content.startswith("Working directory:"):
+                    continue
+                if content.startswith(SUMMARY_PREFIX):
+                    self._record("compact", content)
+                    self._print(_block("system", Text(content), style="bold blue"))
+                    continue
+                self.print_user(message.content)
+                continue
+            if message.role == "assistant":
+                if message.content.strip():
+                    self._record("assistant", message.content)
+                    self._print(self._assistant_block(message.content))
+                elif message.tool_calls:
+                    names = ", ".join(tool_call.name for tool_call in message.tool_calls)
+                    rendered = f"Tool calls: {names}"
+                    self._record("assistant", rendered)
+                    self._print(_block("assistant", Text(rendered), style="bold green"))
+                continue
+            if message.role == "tool":
+                rendered = message.content.strip()
+                name = message.name or "tool"
+                self._record("tool_result", rendered)
+                self._print(self._tool_block(name, rendered, "green"))
 
     def status_text(self) -> str:
         return "uedev chat | running" if self.running else "uedev chat | ready"

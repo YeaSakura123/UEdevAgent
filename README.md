@@ -36,8 +36,12 @@ Edit the system JSON config at `~/.uedev/config.json`:
     "work": {
       "model": "your_model",
       "base_url": "https://api.openai.com/v1",
-      "api_key": "your_api_key"
+      "api_key": "your_api_key",
+      "context_window": 262144
     }
+  },
+  "display": {
+    "diff_output_max_chars": 20000
   },
   "ue": {
     "engines": {
@@ -55,6 +59,11 @@ Edit the system JSON config at `~/.uedev/config.json`:
 
 The CLI uses the official `openai` Python package and supports
 OpenAI-compatible Chat Completions endpoints.
+`context_window` is optional for each model profile and defaults to 262144
+estimated tokens. Auto compaction defaults to 90% of that window unless
+`--context-threshold` is supplied.
+`display.diff_output_max_chars` controls per-section `/diff` output truncation
+and defaults to 20000 characters.
 
 ## Usage
 
@@ -132,9 +141,11 @@ omitting it produces a dry-run command preview.
   lists, links, code blocks, and tables.
 - `chat` shows per-turn thinking/tool events while running, then renders a
   collapsed process summary before the final answer.
-- `chat` supports slash commands such as `/help`, `/todos`, `/model`, `/plan`,
-  `/permissions`, and `/ue doctor`;
+- `chat` supports slash commands such as `/help`, `/diff`, `/todos`, `/history`,
+  `/model`, `/plan`, `/permissions`, `/compact`, and `/ue doctor`;
   type `/` to autocomplete commands with descriptions.
+- `/diff` shows a human-readable Git status/diff summary and Perforce workspace
+  status plus opened files for the current workspace.
 - `/model` lists configured model profiles; `/model <profile>` stores the active
   model for the current project in `.agent/config.json`; `/model reset` returns
   to the first configured model, unless `default_model` is explicitly set.
@@ -144,6 +155,12 @@ omitting it produces a dry-run command preview.
 - `/permissions` opens an interactive permission-mode selector in the TUI;
   `/permissions <mode>` switches the current chat session between `read-only`,
   `default`, `auto-review`, and `full-access`.
+- `/compact` summarizes and rewrites the model context while keeping the visible
+  chat transcript intact.
+- `/history` lists previous conversations for the current project and lets an
+  interactive TUI user choose one with the arrow keys; plain chat falls back to
+  a numbered list. It loads `.agent/history/session_*.jsonl`; compact snapshots
+  in `.agent/transcripts/` are not shown as conversation history.
 - `chat` keeps an in-session input history that can be browsed with the arrow keys.
 - `chat --plain` keeps the script-friendly text renderer for pipes, non-TTY
   sessions, and automation.

@@ -30,7 +30,7 @@ except ModuleNotFoundError as error:
 from uedev.background import BackgroundManager
 from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
 from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.events import compact_event, final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.loop import (
     SLASH_COMMANDS,
@@ -195,12 +195,28 @@ class RendererTests(unittest.TestCase):
 
         transcript = renderer.render_text()
 
-        self.assertNotIn("user:\nread a file", transcript)
+        self.assertIn("user:\nread a file", transcript)
         self.assertLess(transcript.index("banner:\nbanner"), transcript.index("thinking:\nThinking"))
+        self.assertLess(transcript.index("user:\nread a file"), transcript.index("thinking:\nThinking"))
         self.assertLess(transcript.index("thinking:\nThinking"), transcript.index("tool_start:\nRunning read_file"))
         self.assertLess(transcript.index("tool_start:\nRunning read_file"), transcript.index("tool_result:\nOK read_file"))
         self.assertLess(transcript.index("tool_result:\nOK read_file"), transcript.index("summary:\nWorked"))
         self.assertLess(transcript.index("summary:\nWorked"), transcript.index("assistant:\ndone"))
+
+    def test_tui_renderer_records_compact_without_clearing_transcript(self) -> None:
+        renderer = TuiRenderer("banner", verbose=True, stream=StringIO())
+
+        renderer.print_banner()
+        renderer.start_turn("turn-1", "new task")
+        renderer.render(compact_event("Conversation compacted.", "turn-1"))
+        renderer.render(final_event("done", "turn-1"))
+
+        transcript = renderer.render_text()
+
+        self.assertIn("banner:\nbanner", transcript)
+        self.assertIn("user:\nnew task", transcript)
+        self.assertIn("compact:\nConversation compacted.", transcript)
+        self.assertIn("assistant:\ndone", transcript)
 
 class TaskAndTeamTests(unittest.TestCase):
     def test_task_dependencies_clear_on_completion(self) -> None:

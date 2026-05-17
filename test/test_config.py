@@ -22,7 +22,17 @@ def workspace_temp_dir():
 
 
 from uedev.background import BackgroundManager
-from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.config import (
+    DEFAULT_CONTEXT_WINDOW,
+    DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+    ConfigError,
+    agent_dir,
+    format_model_profiles,
+    load_project_config,
+    load_system_config,
+    resolve_model_profile,
+    system_config_template,
+)
 from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
@@ -55,23 +65,30 @@ from uedev.workspace import edit_file, read_file, write_file
 from uedev.worktrees import WorktreeManager
 
 
-def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+def write_system_config(
+    config_path: Path,
+    *,
+    models: dict[str, dict[str, object]] | None = None,
+    ue_engines: dict[str, dict[str, object]] | None = None,
+    display: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "version": 1,
+        "models": models
+        or {
+            "first-model": {
+                "model": "gpt-test",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "test-key",
+            }
+        },
+        "ue": {"engines": ue_engines or {}},
+    }
+    if display is not None:
+        payload["display"] = display
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "models": models
-                or {
-                    "first-model": {
-                        "model": "gpt-test",
-                        "base_url": "https://api.openai.com/v1",
-                        "api_key": "test-key",
-                    }
-                },
-                "ue": {"engines": ue_engines or {}},
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -151,6 +168,79 @@ class ConfigTests(unittest.TestCase):
 
             self.assertEqual(config.default_model, "first")
             self.assertEqual(profile.name, "first")
+
+    def test_model_context_window_defaults_to_256k_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "default-window": {
+                        "model": "default-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "small-window": {
+                        "model": "small-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "context_window": 4096,
+                    },
+                },
+            )
+
+            config = load_system_config(config_path)
+
+            self.assertEqual(config.models["default-window"].context_window, DEFAULT_CONTEXT_WINDOW)
+            self.assertEqual(config.models["small-window"].context_window, 4096)
+            self.assertIn("context_window=4096", format_model_profiles(root, config))
+
+    def test_invalid_model_context_window_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "bad": {
+                        "model": "bad-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "context_window": 0,
+                    },
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "models.bad.context_window"):
+                load_system_config(config_path)
+
+    def test_diff_output_max_chars_defaults_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(config_path)
+
+            config = load_system_config(config_path)
+
+            self.assertEqual(config.diff_output_max_chars, DEFAULT_DIFF_OUTPUT_MAX_CHARS)
+
+            write_system_config(config_path, display={"diff_output_max_chars": 1234})
+
+            self.assertEqual(load_system_config(config_path).diff_output_max_chars, 1234)
+
+    def test_invalid_diff_output_max_chars_raises(self) -> None:
+        for value in (0, -1, "many"):
+            with self.subTest(value=value):
+                with workspace_temp_dir() as temp:
+                    config_path = Path(temp) / "system-config.json"
+                    write_system_config(config_path, display={"diff_output_max_chars": value})
+
+                    with self.assertRaisesRegex(ConfigError, "display.diff_output_max_chars"):
+                        load_system_config(config_path)
+
+    def test_system_config_template_includes_diff_output_limit(self) -> None:
+        template = system_config_template()
+
+        self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
 
     def test_project_permission_mode_defaults_and_persists(self) -> None:
         from uedev.config import save_project_permission_mode

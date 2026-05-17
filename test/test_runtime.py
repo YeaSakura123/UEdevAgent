@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 import uuid
@@ -23,8 +24,9 @@ def workspace_temp_dir():
 
 from uedev.background import BackgroundManager
 from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.history import HistoryRecorder, load_history_file
 from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.loop import (
     SLASH_COMMANDS,
@@ -35,6 +37,7 @@ from uedev.loop import (
     defers_tool_confirmation,
     is_acknowledgement_answer,
     render_chat_banner,
+    render_workspace_diff,
     render_slash_help,
 )
 from uedev.permissions import classify_shell_command
@@ -55,23 +58,30 @@ from uedev.workspace import edit_file, read_file, write_file
 from uedev.worktrees import WorktreeManager
 
 
-def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+def write_system_config(
+    config_path: Path,
+    *,
+    models: dict[str, dict[str, object]] | None = None,
+    ue_engines: dict[str, dict[str, object]] | None = None,
+    display: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "version": 1,
+        "models": models
+        or {
+            "first-model": {
+                "model": "gpt-test",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "test-key",
+            }
+        },
+        "ue": {"engines": ue_engines or {}},
+    }
+    if display is not None:
+        payload["display"] = display
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "models": models
-                or {
-                    "first-model": {
-                        "model": "gpt-test",
-                        "base_url": "https://api.openai.com/v1",
-                        "api_key": "test-key",
-                    }
-                },
-                "ue": {"engines": ue_engines or {}},
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -141,6 +151,390 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertEqual(event_types[-1], "final")
             self.assertEqual(events[1].name, "read_file")
             self.assertEqual(events[-1].message, "done")
+
+    def test_run_turn_events_records_session_history(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", return_value=ModelResponse("done")):
+                    events = list(runtime.run_turn_events(messages, "remember this", turn_id="turn-test", history=history))
+
+            self.assertEqual(events[-1].type, "final")
+            loaded = load_history_file(history.path or Path())
+            rendered = "\n".join(message.content for message in loaded)
+            self.assertIn("remember this", rendered)
+            self.assertIn("done", rendered)
+
+    def test_run_turn_events_compacts_before_new_goal_when_threshold_is_exceeded(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=2,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                    context_threshold=3000,
+                )
+            )
+            messages = [
+                ChatMessage(role="system", content=runtime.system_prompt),
+                ChatMessage(role="assistant", content="old observation " + ("x" * 8000)),
+            ]
+            responses = [ModelResponse("short summary"), ModelResponse("done")]
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", side_effect=responses) as mock_call:
+                    events = list(runtime.run_turn_events(messages, "new task", turn_id="turn-test"))
+
+            self.assertEqual(events[0].type, "compact")
+            self.assertEqual(events[-1].type, "final")
+            compaction_messages = mock_call.call_args_list[0].args[0]
+            self.assertNotIn("new task", "\n".join(message.content for message in compaction_messages))
+            normal_messages = mock_call.call_args_list[1].args[0]
+            rendered = "\n".join(message.content for message in normal_messages)
+            self.assertIn(SUMMARY_PREFIX, rendered)
+            self.assertIn("new task", rendered)
+            self.assertIn("tools", mock_call.call_args_list[1].kwargs)
+
+    def test_default_context_threshold_uses_model_context_window(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "small": {
+                        "model": "small-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "context_window": 1000,
+                    }
+                },
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                self.assertEqual(runtime._context_threshold(), 900)
+
+    def test_explicit_context_threshold_overrides_model_context_window(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                    context_threshold=123,
+                )
+            )
+
+            self.assertEqual(runtime._context_threshold(), 123)
+
+    def test_diff_slash_command_renders_git_and_perforce_status(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path, display={"diff_output_max_chars": 50})
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            def fake_run(args, **kwargs):
+                if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                    return subprocess.CompletedProcess(args, 0, "true\n", "")
+                if args == ["git", "status", "--short", "--branch"]:
+                    return subprocess.CompletedProcess(args, 0, "## No commits yet on master\n M Source/A.cpp\nA  README.md\n?? Content/\n", "")
+                if args == ["git", "diff", "--no-ext-diff"]:
+                    return subprocess.CompletedProcess(args, 0, "x" * 80, "")
+                if args == ["git", "diff", "--cached", "--no-ext-diff"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                raise AssertionError(f"unexpected command: {args}")
+
+            with (
+                patch("uedev.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
+                patch(
+                    "uedev.runtime.agent.p4_status",
+                    return_value=json.dumps(
+                        {
+                            "ok": True,
+                            "available": True,
+                            "in_workspace": True,
+                            "project_tracked": True,
+                            "client_name": "UnrealCode_WS",
+                            "client_root": str(root),
+                            "user_name": "admin",
+                            "server_address": "perforce:1666",
+                            "project_depot_path": "//depot/Project.uproject",
+                            "opened_count": 1,
+                            "opened_preview": ["SHOULD_NOT_PRINT"],
+                            "notes": [],
+                        }
+                    ),
+                ) as status,
+                patch(
+                    "uedev.runtime.agent.p4_opened",
+                    return_value=json.dumps(
+                        {
+                            "ok": True,
+                            "status": "completed",
+                            "command": "p4 opened",
+                            "exit_code": 0,
+                            "stdout": "SHOULD_NOT_PRINT",
+                            "stderr": "",
+                            "opened_count": 1,
+                            "opened": ["//depot/A.cpp#1 - edit default change (text)"],
+                        }
+                    ),
+                ) as opened,
+            ):
+                self.assertTrue(runtime.handle_slash_command("/diff", emit=output.append))
+
+            rendered = output[-1]
+            self.assertIn("branch: master (no commits)", rendered)
+            self.assertIn("status: staged 1, unstaged 1, untracked 1", rendered)
+            self.assertIn("note: untracked files are not included in git diff output.", rendered)
+            self.assertIn("unstaged diff:", rendered)
+            self.assertIn("staged diff: none", rendered)
+            self.assertIn("truncated at 50 chars", rendered)
+            self.assertIn("workspace: UnrealCode_WS", rendered)
+            self.assertIn("project: tracked //depot/Project.uproject", rendered)
+            self.assertIn("opened: 1", rendered)
+            self.assertIn("edit", rendered)
+            self.assertIn("text", rendered)
+            self.assertIn("//depot/A.cpp", rendered)
+            self.assertNotIn('"stdout"', rendered)
+            self.assertNotIn("opened_preview", rendered)
+            self.assertNotIn("SHOULD_NOT_PRINT", rendered)
+            status.assert_called_once_with(root)
+            opened.assert_called_once_with(root)
+
+    def test_diff_slash_command_rejects_arguments(self) -> None:
+        with workspace_temp_dir() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/diff Source/A.cpp", emit=output.append))
+
+            self.assertEqual(output[-1], "Usage: /diff")
+
+    def test_workspace_diff_continues_to_p4_when_not_git_repository(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+
+            def fake_run(args, **kwargs):
+                if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                    return subprocess.CompletedProcess(args, 128, "", "not a git repository")
+                raise AssertionError(f"unexpected command: {args}")
+
+            with (
+                patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
+                patch("uedev.runtime.agent.p4_status", return_value='{"ok": false, "available": false}') as status,
+                patch("uedev.runtime.agent.p4_opened", return_value='{"ok": true, "opened_count": 0}') as opened,
+            ):
+                rendered = render_workspace_diff(root, 120, 20000)
+
+            self.assertIn("Git: not a repository", rendered)
+            self.assertIn("status: unavailable", rendered)
+            self.assertIn("opened: none", rendered)
+            status.assert_called_once_with(root)
+            opened.assert_called_once_with(root)
+
+    def test_workspace_diff_falls_back_to_raw_p4_output_for_invalid_json(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+
+            def fake_run(args, **kwargs):
+                if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                    return subprocess.CompletedProcess(args, 128, "", "not a git repository")
+                raise AssertionError(f"unexpected command: {args}")
+
+            with (
+                patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
+                patch("uedev.runtime.agent.p4_status", return_value="not-json-" + ("x" * 80)),
+                patch("uedev.runtime.agent.p4_opened", return_value='{"ok": true, "opened": []}'),
+            ):
+                rendered = render_workspace_diff(root, 120, 30)
+
+            self.assertIn("p4_status: raw output", rendered)
+            self.assertIn("truncated at 30 chars", rendered)
+
+    def test_workspace_diff_renders_p4_command_failure_without_duplicate_stdout(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+
+            def fake_run(args, **kwargs):
+                if args == ["git", "rev-parse", "--is-inside-work-tree"]:
+                    return subprocess.CompletedProcess(args, 128, "", "not a git repository")
+                raise AssertionError(f"unexpected command: {args}")
+
+            with (
+                patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
+                patch("uedev.runtime.agent.p4_status", return_value='{"ok": true, "available": true, "in_workspace": true, "project_tracked": false}'),
+                patch(
+                    "uedev.runtime.agent.p4_opened",
+                    return_value=json.dumps(
+                        {
+                            "ok": False,
+                            "command": "p4 opened",
+                            "exit_code": 1,
+                            "stdout": "duplicate stdout",
+                            "stderr": "client unknown",
+                        }
+                    ),
+                ),
+            ):
+                rendered = render_workspace_diff(root, 120, 20000)
+
+            self.assertIn("opened: failed", rendered)
+            self.assertIn("command: p4 opened", rendered)
+            self.assertIn("exitCode: 1", rendered)
+            self.assertIn("client unknown", rendered)
+            self.assertNotIn("duplicate stdout", rendered)
+
+    def test_compact_slash_command_rewrites_model_context(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [
+                ChatMessage(role="system", content=runtime.system_prompt),
+                ChatMessage(role="user", content="old request"),
+            ]
+            output: list[str] = []
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", return_value=ModelResponse("manual summary")) as mock_call:
+                    self.assertTrue(runtime.handle_slash_command("/compact", emit=output.append, messages=messages))
+
+            self.assertIn("Conversation compacted", output[-1])
+            self.assertIn(SUMMARY_PREFIX, "\n".join(message.content for message in messages))
+            self.assertTrue(list((agent_dir(root) / "transcripts").glob("transcript_*.jsonl")))
+            self.assertEqual(mock_call.call_count, 1)
+            self.assertNotIn("tools", mock_call.call_args.kwargs)
+
+    def test_compact_transcript_includes_normal_final_answers(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", return_value=ModelResponse("previous answer")):
+                    events = list(runtime.run_turn_events(messages, "first task", turn_id="turn-test"))
+                self.assertEqual(events[-1].type, "final")
+
+                with patch("uedev.loop.call_model", return_value=ModelResponse("manual summary")):
+                    self.assertTrue(runtime.handle_slash_command("/compact", emit=lambda _message: None, messages=messages))
+
+            transcript = max((agent_dir(root) / "transcripts").glob("transcript_*.jsonl"))
+            transcript_text = transcript.read_text(encoding="utf-8")
+
+            self.assertIn('"role": "assistant"', transcript_text)
+            self.assertIn("previous answer", transcript_text)
+
+    def test_compact_tool_uses_model_summary_and_preserves_current_goal(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="compact", arguments={})]),
+                ModelResponse("tool summary"),
+                ModelResponse("done"),
+            ]
+
+            with patch("uedev.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.loop.call_model", side_effect=responses) as mock_call:
+                    events = list(runtime.run_turn_events(messages, "continue current task", turn_id="turn-test"))
+
+            self.assertIn("compact", [event.type for event in events])
+            self.assertEqual(events[-1].type, "final")
+            rendered = "\n".join(message.content for message in messages)
+            self.assertIn(SUMMARY_PREFIX, rendered)
+            self.assertIn("continue current task", rendered)
+            self.assertNotIn("tools", mock_call.call_args_list[1].kwargs)
 
     def test_run_turn_events_emits_tool_error(self) -> None:
         with workspace_temp_dir() as temp:

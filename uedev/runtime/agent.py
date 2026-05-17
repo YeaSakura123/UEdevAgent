@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 import uuid
@@ -59,15 +60,31 @@ from ..config import (
     resolve_model_profile,
     save_project_active_model,
 )
-from ..context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from ..context import (
+    build_compacted_history,
+    build_compaction_request,
+    estimate_tokens,
+    latest_real_user_message,
+    micro_compact,
+    repair_tool_call_messages,
+    save_transcript,
+)
 from ..events import (
     AgentEvent,
+    compact_event,
     final_event,
     stopped_event,
     thinking_event,
     tool_error_event,
     tool_result_event,
     tool_start_event,
+)
+from ..history import (
+    HistoryError,
+    HistoryRecorder,
+    ensure_system_prompt,
+    list_history_entries,
+    load_history_file,
 )
 from ..llm import ChatMessage, call_model
 from ..mcp.registry import McpToolRegistry, is_mcp_tool_name
@@ -117,7 +134,7 @@ class AgentOptions:
     cwd: Path
     timeout_seconds: int
     verbose: bool
-    context_threshold: int = 60000
+    context_threshold: int | None = None
     plain: bool = False
 
 
@@ -133,17 +150,19 @@ class ToolAction:
 
 SLASH_COMMANDS = [
     ("/help", "Show available chat slash commands."),
+    ("/diff", "Show Git and Perforce workspace changes."),
     ("/todos", "Show the current lightweight todo list."),
     ("/tasks", "Show the persistent task graph."),
     ("/team", "Show the persistent teammate roster."),
     ("/inbox", "Show pending messages for the lead agent."),
+    ("/history", "Load a previous conversation from this project."),
     ("/model", "List or switch model profiles for this project."),
     ("/mcp", "Show configured MCP server status and tools."),
     ("/plan", "Enter, leave, or inspect Plan Mode."),
     ("/permissions", "Show or switch the current permission mode."),
     ("/doctor", "Inspect Unreal Engine project and editor configuration."),
     ("/ue doctor", "Inspect Unreal Engine project and editor configuration."),
-    ("/compact", "Explain how to compact or reset chat context."),
+    ("/compact", "Compact the current conversation context."),
     ("/clear", "Reset the current chat conversation context."),
 ]
 
@@ -154,6 +173,281 @@ def render_slash_help() -> str:
     lines = ["Chat commands:"]
     lines.extend(f"  {command.ljust(width)}  {description}" for command, description in SLASH_COMMANDS)
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class _CommandCapture:
+    args: list[str]
+    exit_code: int | None
+    stdout: str = ""
+    stderr: str = ""
+    status: str = "completed"
+
+    @property
+    def command(self) -> str:
+        return " ".join(self.args)
+
+
+def render_workspace_diff(cwd: Path, timeout_seconds: int, max_output_chars: int) -> str:
+    return "\n\n".join(
+        [
+            _render_git_diff(cwd, timeout_seconds, max_output_chars),
+            _render_perforce_diff(cwd, max_output_chars),
+        ]
+    )
+
+
+def _render_git_diff(cwd: Path, timeout_seconds: int, max_output_chars: int) -> str:
+    probe = _run_readonly_command(["git", "rev-parse", "--is-inside-work-tree"], cwd, timeout_seconds)
+    if probe.status == "missing":
+        return f"Git:\n{probe.stderr.strip()}"
+    if probe.exit_code != 0:
+        return "Git:\nGit: not a repository"
+
+    status = _run_readonly_command(["git", "status", "--short", "--branch"], cwd, timeout_seconds)
+    unstaged = _run_readonly_command(["git", "diff", "--no-ext-diff"], cwd, timeout_seconds)
+    staged = _run_readonly_command(["git", "diff", "--cached", "--no-ext-diff"], cwd, timeout_seconds)
+
+    lines = [
+        "Git:",
+        *_render_git_status(status, max_output_chars),
+        "",
+        _render_patch_section("unstaged diff", unstaged, max_output_chars),
+        _render_patch_section("staged diff", staged, max_output_chars),
+    ]
+    return "\n".join(lines)
+
+
+def _render_perforce_diff(cwd: Path, max_output_chars: int) -> str:
+    try:
+        status_raw = p4_status(cwd)
+    except Exception as error:
+        status_raw = f"p4_status failed: {error}"
+    try:
+        opened_raw = p4_opened(cwd)
+    except Exception as error:
+        opened_raw = f"p4_opened failed: {error}"
+
+    lines = ["Perforce:"]
+    status_data = _parse_json_object(status_raw)
+    if status_data is None:
+        lines.extend(["p4_status: raw output", _truncate_diff_output(status_raw.rstrip() or "(no status output)", max_output_chars)])
+    else:
+        lines.extend(_render_p4_status_summary(status_data))
+
+    lines.append("")
+    opened_data = _parse_json_object(opened_raw)
+    if opened_data is None:
+        lines.extend(["opened: raw output", _truncate_diff_output(opened_raw.rstrip() or "(no opened output)", max_output_chars)])
+    else:
+        lines.extend(_render_p4_opened_summary(opened_data, max_output_chars))
+    return "\n".join(lines)
+
+
+def _run_readonly_command(args: list[str], cwd: Path, timeout_seconds: int) -> _CommandCapture:
+    try:
+        result = subprocess.run(
+            args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError:
+        return _CommandCapture(args, None, stderr=f"{args[0]} executable not found on PATH.", status="missing")
+    except subprocess.TimeoutExpired:
+        return _CommandCapture(args, 124, stderr=f"{' '.join(args)} timed out after {timeout_seconds}s.", status="timeout")
+    except OSError as error:
+        return _CommandCapture(args, None, stderr=f"Cannot run {' '.join(args)}: {error}", status="error")
+    return _CommandCapture(args, result.returncode, result.stdout, result.stderr)
+
+
+def _format_command_output(result: _CommandCapture, empty_message: str, max_output_chars: int) -> str:
+    parts: list[str] = []
+    if result.exit_code not in (0, None):
+        parts.append(f"exitCode: {result.exit_code}")
+    if result.stdout.strip():
+        parts.append(_truncate_diff_output(result.stdout.rstrip(), max_output_chars))
+    elif result.exit_code == 0:
+        parts.append(empty_message)
+    if result.stderr.strip():
+        parts.append("stderr:")
+        parts.append(_truncate_diff_output(result.stderr.rstrip(), max_output_chars))
+    if not parts:
+        return empty_message
+    return "\n".join(parts)
+
+
+def _render_git_status(result: _CommandCapture, max_output_chars: int) -> list[str]:
+    if result.exit_code != 0:
+        return ["status: failed", _format_command_output(result, "(no status output)", max_output_chars)]
+
+    branch = "(unknown)"
+    file_lines: list[str] = []
+    staged = 0
+    unstaged = 0
+    untracked = 0
+
+    for line in result.stdout.splitlines():
+        if line.startswith("## "):
+            branch = _format_git_branch(line[3:].strip())
+            continue
+        if not line.strip():
+            continue
+        file_lines.append(line)
+        if line.startswith("??"):
+            untracked += 1
+            continue
+        if len(line) >= 2:
+            if line[0] not in {" ", "?", "!"}:
+                staged += 1
+            if line[1] not in {" ", "?", "!"}:
+                unstaged += 1
+
+    lines = [
+        f"branch: {branch}",
+        f"status: staged {staged}, unstaged {unstaged}, untracked {untracked}",
+    ]
+    if untracked:
+        lines.append("note: untracked files are not included in git diff output.")
+    if file_lines:
+        lines.append("")
+        lines.append("status files:")
+        lines.append(_truncate_diff_output("\n".join(f"  {line}" for line in file_lines), max_output_chars))
+    return lines
+
+
+def _format_git_branch(raw: str) -> str:
+    prefix = "No commits yet on "
+    if raw.startswith(prefix):
+        return f"{raw[len(prefix):]} (no commits)"
+    return raw or "(unknown)"
+
+
+def _render_patch_section(label: str, result: _CommandCapture, max_output_chars: int) -> str:
+    if result.exit_code != 0:
+        return f"{label}: failed\n{_format_command_output(result, '(no output)', max_output_chars)}"
+    output = result.stdout.rstrip()
+    if not output:
+        return f"{label}: none"
+    return f"{label}:\n{_truncate_diff_output(output, max_output_chars)}"
+
+
+def _parse_json_object(raw: str) -> dict[str, Any] | None:
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _render_p4_status_summary(data: dict[str, Any]) -> list[str]:
+    available = bool(data.get("available"))
+    in_workspace = bool(data.get("in_workspace"))
+    project_tracked = bool(data.get("project_tracked"))
+    lines: list[str] = []
+
+    if not available:
+        lines.append("status: unavailable")
+    elif not in_workspace:
+        lines.append("status: available (not a workspace)")
+
+    if available and in_workspace:
+        lines.append(f"workspace: {_display_value(data.get('client_name'))}")
+        lines.append(f"user: {_display_value(data.get('user_name'))}")
+        lines.append(f"server: {_display_value(data.get('server_address'))}")
+        lines.append(f"root: {_display_value(data.get('client_root'))}")
+        project = _display_value(data.get("project_depot_path"))
+        lines.append(f"project: {'tracked' if project_tracked else 'untracked'}" + (f" {project}" if project != "(unknown)" else ""))
+
+    opened_count = data.get("opened_count")
+    if opened_count is not None:
+        lines.append(f"opened count: {opened_count}")
+
+    notes = _string_items(data.get("notes"))
+    if notes:
+        lines.append("notes:")
+        lines.extend(f"  - {note}" for note in notes)
+    return lines or ["status: unknown"]
+
+
+def _render_p4_opened_summary(data: dict[str, Any], max_output_chars: int) -> list[str]:
+    if not bool(data.get("ok")):
+        lines = ["opened: failed"]
+        command = data.get("command")
+        if command:
+            lines.append(f"command: {command}")
+        if data.get("exit_code") is not None:
+            lines.append(f"exitCode: {data.get('exit_code')}")
+        stderr = str(data.get("stderr") or "").strip()
+        stdout = str(data.get("stdout") or "").strip()
+        if stderr:
+            lines.append("stderr:")
+            lines.append(_truncate_diff_output(stderr, max_output_chars))
+        elif stdout:
+            lines.append("stdout:")
+            lines.append(_truncate_diff_output(stdout, max_output_chars))
+        return lines
+
+    opened = _dedupe_preserve_order(_string_items(data.get("opened")))
+    if not opened:
+        return ["opened: none"]
+
+    opened_lines = "\n".join(_format_p4_opened_line(line) for line in opened)
+    return [
+        f"opened: {data.get('opened_count', len(opened))}",
+        _truncate_diff_output(opened_lines, max_output_chars),
+    ]
+
+
+def _format_p4_opened_line(line: str) -> str:
+    stripped = line.strip()
+    if " - " not in stripped:
+        return f"  {stripped}"
+    path_part, detail = stripped.split(" - ", 1)
+    path = path_part.rsplit("#", 1)[0] if "#" in path_part else path_part
+    detail_parts = detail.split()
+    action = detail_parts[0] if detail_parts else "?"
+    file_type = "-"
+    type_start = detail.find("(")
+    type_end = detail.find(")", type_start + 1)
+    if type_start >= 0 and type_end > type_start:
+        file_type = detail[type_start + 1 : type_end].strip() or "-"
+    return f"  {action:<5} {file_type:<9} {path}"
+
+
+def _string_items(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
+
+
+def _display_value(value: object) -> str:
+    text = str(value or "").strip()
+    return text or "(unknown)"
+
+
+def _truncate_diff_output(value: str, max_output_chars: int) -> str:
+    limit = max(1, max_output_chars)
+    if len(value) <= limit:
+        return value
+    return (
+        f"{value[:limit]}\n"
+        f"... truncated at {limit} chars; increase display.diff_output_max_chars in ~/.uedev/config.json ..."
+    )
 
 
 class SlashCommandCompleter(Completer):
@@ -322,7 +616,6 @@ def run_agent(options: AgentOptions) -> None:
     runtime = AgentRuntime(options)
     messages = [
         ChatMessage(role="system", content=runtime.system_prompt),
-        ChatMessage(role="user", content=f"Task: {options.task}"),
     ]
     renderer = ConsoleRenderer(verbose=options.verbose)
     for event in runtime.run_turn_events(messages, goal=options.task):
@@ -354,6 +647,7 @@ def run_plain_chat(options: AgentOptions) -> None:
         ChatMessage(role="system", content=runtime.system_prompt),
         ChatMessage(role="user", content=f"Working directory: {options.cwd}\nShell: {shell_name()}"),
     ]
+    history = HistoryRecorder(runtime.agent_dir, messages)
     renderer = ConsoleRenderer(verbose=options.verbose)
 
     print(render_chat_banner(options))
@@ -367,15 +661,55 @@ def run_plain_chat(options: AgentOptions) -> None:
                 ChatMessage(role="system", content=runtime.system_prompt),
                 ChatMessage(role="user", content=f"Working directory: {options.cwd}\nShell: {shell_name()}"),
             ]
+            history.reset(messages)
             print("Conversation context cleared.")
             continue
 
-        if runtime.handle_slash_command(query):
+        if query.lower() == "/history":
+            loaded = _handle_plain_history(runtime, session)
+            if loaded is not None:
+                messages = loaded
+                history.reset(messages)
             continue
 
-        messages.append(ChatMessage(role="user", content=query))
-        for event in runtime.run_turn_events(messages, goal=query):
+        if runtime.handle_slash_command(query, messages=messages):
+            continue
+
+        for event in runtime.run_turn_events(messages, goal=query, history=history):
             renderer.render(event)
+
+
+def _handle_plain_history(runtime: "AgentRuntime", session: PromptSession) -> list[ChatMessage] | None:
+    entries = list_history_entries(runtime.agent_dir)
+    if not entries:
+        print("No history found for this project.")
+        return None
+
+    for index, entry in enumerate(entries, start=1):
+        print(f"{index}. {entry.label}")
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("History selection requires an interactive terminal.")
+        return None
+
+    raw = session.prompt("Load history number: ").strip()
+    if not raw:
+        return None
+    try:
+        selected = entries[int(raw) - 1]
+    except (ValueError, IndexError):
+        print(f"Invalid history selection: {raw}")
+        return None
+
+    try:
+        messages = ensure_system_prompt(load_history_file(selected.path), runtime.system_prompt)
+    except HistoryError as error:
+        print(f"Failed to load history: {error}")
+        return None
+
+    print(f"Loaded history: {selected.path}")
+    return messages
+
 
 class AgentRuntime:
     # 内部函数：初始化当前类实例，准备 agent 主循环、chat 界面、工具分发和运行时观察 所需状态。
@@ -415,19 +749,59 @@ class AgentRuntime:
         return final_answer
 
     # 外部函数：推进模型思考、工具执行和结果回填，按事件流暴露 agent 主循环过程。
-    def run_turn_events(self, messages: list[ChatMessage], goal: str, turn_id: str | None = None) -> Iterator[AgentEvent]:
+    def run_turn_events(
+        self,
+        messages: list[ChatMessage],
+        goal: str,
+        turn_id: str | None = None,
+        history: HistoryRecorder | None = None,
+    ) -> Iterator[AgentEvent]:
         rounds_without_todo = 0
         current_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
         started_at = time.perf_counter()
         tool_names_this_turn: list[str] = []
+        goal_message = ChatMessage(role="user", content=goal)
+        goal_already_appended = bool(messages and messages[-1].role == "user" and messages[-1].content == goal)
+        if goal_already_appended:
+            messages.pop()
+        context_threshold = self._context_threshold()
+        if estimate_tokens([*messages, goal_message]) > context_threshold:
+            try:
+                transcript = self._compact_messages(messages, "automatic threshold before user turn")
+            except Exception as error:
+                yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
+                return
+            yield compact_event(
+                f"Conversation compacted before this turn. Full transcript saved at: {transcript}",
+                current_turn_id,
+                str(transcript),
+            )
+        messages.append(goal_message)
+        if history is not None:
+            history.append(goal_message)
 
         for step in range(1, self.options.max_steps + 1):
             self._inject_runtime_observations(messages)
+            if estimate_tokens(messages) > context_threshold:
+                try:
+                    transcript = self._compact_messages(messages, "automatic threshold during turn", preserve_last_user=True)
+                except Exception as error:
+                    yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
+                    return
+                yield compact_event(
+                    f"Conversation compacted during this turn. Full transcript saved at: {transcript}",
+                    current_turn_id,
+                    str(transcript),
+                )
+                self._inject_runtime_observations(messages)
             yield thinking_event(step, self.options.max_steps, current_turn_id)
 
             response = call_model(messages, self.current_model_profile(), tools=self.tool_specs)
             if response.tool_calls:
-                messages.append(ChatMessage(role="assistant", content=response.content, tool_calls=response.tool_calls))
+                assistant_message = ChatMessage(role="assistant", content=response.content, tool_calls=response.tool_calls)
+                messages.append(assistant_message)
+                if history is not None:
+                    history.append(assistant_message)
                 for tool_call in response.tool_calls:
                     action = ToolAction(name=tool_call.name, input=tool_call.arguments)
                     tool_names_this_turn.append(action.name)
@@ -448,48 +822,68 @@ class AgentRuntime:
                         tool_content += "\n<reminder>Update your todos before continuing.</reminder>"
                         rounds_without_todo = 0
 
-                    messages.append(
-                        ChatMessage(
-                            role="tool",
-                            content=tool_content,
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                        )
+                    tool_message = ChatMessage(
+                        role="tool",
+                        content=tool_content,
+                        tool_call_id=tool_call.id,
+                        name=tool_call.name,
                     )
+                    messages.append(tool_message)
+                    if history is not None:
+                        history.append(tool_message)
 
                     if action.name == "compact":
-                        messages[:] = compact_locally(messages, self.agent_dir / "transcripts", "manual compact tool")
+                        try:
+                            transcript = self._compact_messages(messages, "manual compact tool", preserve_last_user=True)
+                        except Exception as error:
+                            yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
+                            return
+                        yield compact_event(
+                            f"Conversation compacted by compact tool. Full transcript saved at: {transcript}",
+                            current_turn_id,
+                            str(transcript),
+                        )
                         break
                 continue
 
             final_answer = response.content.strip()
             if self.collaboration_mode == "plan" and not is_proposed_plan(final_answer):
-                messages.append(ChatMessage(role="assistant", content=final_answer))
-                messages.append(
-                    ChatMessage(
-                        role="system",
-                        content=(
-                            "Invalid final answer: Plan Mode final answers must be wrapped exactly in "
-                            "<proposed_plan> and </proposed_plan>. Do not implement changes while Plan Mode is active."
-                        ),
-                    )
+                assistant_message = ChatMessage(role="assistant", content=final_answer)
+                retry_message = ChatMessage(
+                    role="system",
+                    content=(
+                        "Invalid final answer: Plan Mode final answers must be wrapped exactly in "
+                        "<proposed_plan> and </proposed_plan>. Do not implement changes while Plan Mode is active."
+                    ),
                 )
+                messages.append(assistant_message)
+                messages.append(retry_message)
+                if history is not None:
+                    history.append(assistant_message)
                 continue
             if tool_names_this_turn and is_acknowledgement_answer(final_answer):
-                messages.append(ChatMessage(role="assistant", content=final_answer))
-                messages.append(
-                    ChatMessage(
-                        role="system",
-                        content=(
-                            "Invalid final answer: do not acknowledge instructions or future behavior. "
-                            "Answer the user's request using the latest tool result. "
-                            "Do not call todo_update for acknowledgements."
-                        ),
-                    )
+                assistant_message = ChatMessage(role="assistant", content=final_answer)
+                retry_message = ChatMessage(
+                    role="system",
+                    content=(
+                        "Invalid final answer: do not acknowledge instructions or future behavior. "
+                        "Answer the user's request using the latest tool result. "
+                        "Do not call todo_update for acknowledgements."
+                    ),
                 )
+                messages.append(assistant_message)
+                messages.append(retry_message)
+                if history is not None:
+                    history.append(assistant_message)
                 continue
             if self._defer_final_if_tool_needed(messages, goal, final_answer, record_assistant=True):
+                if history is not None:
+                    history.append(ChatMessage(role="assistant", content=final_answer))
                 continue
+            assistant_message = ChatMessage(role="assistant", content=final_answer)
+            messages.append(assistant_message)
+            if history is not None:
+                history.append(assistant_message)
             yield final_event(final_answer, current_turn_id, _duration_ms(started_at))
             return
 
@@ -501,7 +895,12 @@ class AgentRuntime:
         return
 
     # 外部函数：处理 chat 内本地 slash command，负责 agent 主循环、chat 界面、工具分发和运行时观察。
-    def handle_slash_command(self, query: str, emit: Callable[[str], None] = print) -> bool:
+    def handle_slash_command(
+        self,
+        query: str,
+        emit: Callable[[str], None] = print,
+        messages: list[ChatMessage] | None = None,
+    ) -> bool:
         if not query.startswith("/"):
             return False
 
@@ -509,6 +908,15 @@ class AgentRuntime:
         command = raw_command.lower()
         if command == "/help":
             emit(render_slash_help())
+            return True
+        if command == "/diff":
+            try:
+                emit(render_workspace_diff(self.options.cwd, self.options.timeout_seconds, self._diff_output_max_chars()))
+            except ConfigError as error:
+                emit(f"Config error: {error}")
+            return True
+        if raw_command.split(maxsplit=1)[0].lower() == "/diff":
+            emit("Usage: /diff")
             return True
         if command == "/todos":
             emit(self.todo_manager.render_current())
@@ -521,6 +929,9 @@ class AgentRuntime:
             return True
         if command == "/inbox":
             emit(json.dumps(self.bus.read_inbox("lead"), ensure_ascii=False, indent=2))
+            return True
+        if command == "/history":
+            emit("Use /history inside chat to choose and load a previous conversation.")
             return True
         if command == "/model":
             try:
@@ -553,7 +964,15 @@ class AgentRuntime:
             emit(render_doctor(discover_ue(self.options.cwd)))
             return True
         if command == "/compact":
-            emit("Use the compact tool during an agent turn, or /clear to reset chat context.")
+            if messages is None:
+                emit("Use /compact inside chat to compact the current conversation context.")
+                return True
+            try:
+                transcript = self._compact_messages(messages, "manual slash command")
+            except Exception as error:
+                emit(f"Conversation compact failed: {error}")
+                return True
+            emit(f"Conversation compacted. Full transcript saved at: {transcript}")
             return True
 
         emit(f"Unknown slash command: {query}")
@@ -585,13 +1004,38 @@ class AgentRuntime:
         self.permission_mode = mode
         return f"Permission mode set to {permission_mode_label(mode)} for this chat session."
 
+    def _compact_messages(self, messages: list[ChatMessage], reason: str, preserve_last_user: bool = False) -> Path:
+        original_messages = list(messages)
+        transcript = save_transcript(original_messages, self.agent_dir / "transcripts")
+        working_messages = list(original_messages)
+        micro_compact(working_messages)
+        repair_tool_call_messages(working_messages)
+
+        request = build_compaction_request(working_messages, reason)
+        response = call_model(request, self.current_model_profile())
+        summary = response.content.strip()
+        if not summary:
+            raise RuntimeError("Compaction model returned an empty summary.")
+
+        summary_payload = f"Reason: {reason}\nFull transcript saved at: {transcript}\n\n{summary}"
+        compacted = build_compacted_history(working_messages, summary_payload)
+        preserved_user = latest_real_user_message(original_messages) if preserve_last_user else None
+        if preserved_user is not None:
+            compacted = [
+                message
+                for message in compacted
+                if not (message.role == "user" and message.content == preserved_user.content)
+            ]
+            compacted.append(preserved_user)
+
+        messages[:] = compacted
+        repair_tool_call_messages(messages)
+        return transcript
+
     # 内部函数：处理 _inject_runtime_observations 辅助逻辑，支撑 agent 主循环、chat 界面、工具分发和运行时观察。
     def _inject_runtime_observations(self, messages: list[ChatMessage]) -> None:
         micro_compact(messages)
         repair_tool_call_messages(messages)
-        if estimate_tokens(messages) > self.options.context_threshold:
-            messages[:] = compact_locally(messages, self.agent_dir / "transcripts", "automatic threshold")
-            repair_tool_call_messages(messages)
         self._inject_runtime_state(messages)
 
         notifications = self.background.drain()
@@ -663,6 +1107,14 @@ class AgentRuntime:
 
     def render_models(self) -> str:
         return format_model_profiles(self.options.cwd)
+
+    def _context_threshold(self) -> int:
+        if self.options.context_threshold is not None:
+            return self.options.context_threshold
+        return max(1, int(self.current_model_profile().context_window * 0.9))
+
+    def _diff_output_max_chars(self) -> int:
+        return load_system_config().diff_output_max_chars
 
     def switch_model(self, name: str) -> str:
         if not name:

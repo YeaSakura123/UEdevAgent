@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 import uuid
@@ -9,7 +9,7 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
-from uedev.tasks import TodoManager
+from uedev.state.tasks import TodoManager
 from uedev.ue import (
     UeRunResult,
     _discover_perforce,
@@ -85,7 +85,7 @@ class UeDiscoveryTests(unittest.TestCase):
         config_path = root / "system-config.json"
         write_system_config(config_path, "5.4", engine_root)
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             result = discover_ue(root)
 
         self.assertEqual(result.project_path, project.resolve())
@@ -103,7 +103,7 @@ class UeDiscoveryTests(unittest.TestCase):
         config_path = root / "system-config.json"
         write_system_config(config_path, "5.5-source", engine_root, aliases=["5.5"])
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             result = discover_ue(root)
 
         self.assertEqual(result.engine_association, "5.5")
@@ -118,7 +118,7 @@ class UeDiscoveryTests(unittest.TestCase):
         config_path = root / "system-config.json"
         write_system_config(config_path, "5.4", engine_root)
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             result = discover_ue(root)
 
         self.assertEqual(result.engine_association, "5.6")
@@ -157,7 +157,7 @@ class UeDiscoveryTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 1, stdout="File(s) not opened on this client.\n", stderr="")
             raise AssertionError(f"unexpected p4 command: {command}")
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             with patch("uedev.ue.subprocess.run", side_effect=fake_run):
                 rendered = render_doctor(discover_ue(root))
 

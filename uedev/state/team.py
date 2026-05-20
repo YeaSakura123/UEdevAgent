@@ -5,7 +5,7 @@ import time
 import uuid
 from pathlib import Path
 
-from .tasks import TaskManager
+from uedev.state.tasks import TaskManager
 
 
 VALID_MESSAGE_TYPES = {

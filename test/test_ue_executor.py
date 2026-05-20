@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 import uuid
@@ -9,7 +9,7 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
-from uedev.tasks import TodoManager
+from uedev.state.tasks import TodoManager
 from uedev.ue import (
     UeRunResult,
     _discover_perforce,

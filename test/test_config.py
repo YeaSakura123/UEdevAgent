@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -21,8 +21,8 @@ def workspace_temp_dir():
 
 
 
-from uedev.background import BackgroundManager
-from uedev.config import (
+from uedev.tools.background import BackgroundManager
+from uedev.state.config import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_DIFF_OUTPUT_MAX_CHARS,
     ConfigError,
@@ -33,10 +33,10 @@ from uedev.config import (
     resolve_model_profile,
     system_config_template,
 )
-from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
-from uedev.loop import (
+from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
     AgentRuntime,
@@ -47,22 +47,22 @@ from uedev.loop import (
     render_chat_banner,
     render_slash_help,
 )
-from uedev.permissions import classify_shell_command
-from uedev.prompts import (
+from uedev.policy.permissions import classify_shell_command
+from uedev.runtime.prompts import (
     _join_sections,
     build_prompt_bundle,
     build_subagent_prompt,
     build_system_prompt as build_prompt_system_prompt,
     build_tool_confirmation_reminder,
 )
-from uedev.renderer import ConsoleRenderer, TuiRenderer
-from uedev.shell import ShellResult, run_shell
-from uedev.skills import SkillLoader
-from uedev.tasks import TaskManager
-from uedev.team import MessageBus, TeamManager
-from uedev.tool_specs import get_tool_names, get_tool_specs
-from uedev.workspace import edit_file, read_file, write_file
-from uedev.worktrees import WorktreeManager
+from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.tools.shell import ShellResult, run_shell
+from uedev.runtime.skills import SkillLoader
+from uedev.state.tasks import TaskManager
+from uedev.state.team import MessageBus, TeamManager
+from uedev.tools.specs import get_tool_names, get_tool_specs
+from uedev.tools.workspace import edit_file, read_file, write_file
+from uedev.tools.worktrees import WorktreeManager
 
 
 def write_system_config(
@@ -243,7 +243,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
 
     def test_project_permission_mode_defaults_and_persists(self) -> None:
-        from uedev.config import save_project_permission_mode
+        from uedev.state.config import save_project_permission_mode
 
         with workspace_temp_dir() as temp:
             root = Path(temp)

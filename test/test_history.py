@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 import uuid
@@ -6,7 +6,7 @@ from pathlib import Path
 
 from contextlib import contextmanager
 
-from uedev.history import (
+from uedev.runtime.history import (
     HistoryError,
     HistoryRecorder,
     create_session_history_path,
@@ -14,7 +14,7 @@ from uedev.history import (
     load_history_file,
     write_history_messages,
 )
-from uedev.llm import ChatMessage, ToolCall
+from uedev.llm.client import ChatMessage, ToolCall
 
 
 @contextmanager

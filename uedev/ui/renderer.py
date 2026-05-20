@@ -62,9 +62,9 @@ except ModuleNotFoundError:  # pragma: no cover - only used in minimal test envi
         def print(self, renderable: object) -> None:
             print(str(renderable), file=self.file)
 
-from .events import AgentEvent
-from ..context import SUMMARY_PREFIX, is_runtime_state_message
-from ..llm import ChatMessage
+from uedev.ui.events import AgentEvent
+from ..runtime.context import SUMMARY_PREFIX, is_runtime_state_message
+from ..llm.client import ChatMessage
 
 
 @dataclass

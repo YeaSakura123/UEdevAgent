@@ -10,15 +10,15 @@ from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.base import Output
 
-from ..config import ConfigError
-from ..history import HistoryEntry, HistoryError, HistoryRecorder, ensure_system_prompt, list_history_entries, load_history_file
-from .events import stopped_event
-from ..llm import ChatMessage
-from .renderer import TuiRenderer
-from ..shell import shell_name
+from ..state.config import ConfigError
+from ..runtime.history import HistoryEntry, HistoryError, HistoryRecorder, ensure_system_prompt, list_history_entries, load_history_file
+from uedev.ui.events import stopped_event
+from ..llm.client import ChatMessage
+from uedev.ui.renderer import TuiRenderer
+from ..tools.shell import shell_name
 
 if TYPE_CHECKING:
-    from ..loop import AgentOptions, AgentRuntime
+    from ..runtime.agent import AgentOptions, AgentRuntime
 
 
 class ChatTuiApplication:
@@ -43,7 +43,7 @@ class ChatTuiApplication:
         self.history = HistoryRecorder(self.runtime.agent_dir, self.messages)
 
     def run(self) -> None:
-        from ..loop import create_chat_prompt_options, create_chat_session
+        from ..runtime.agent import create_chat_prompt_options, create_chat_session
 
         session = create_chat_session(
             completer=self.completer,
@@ -125,7 +125,7 @@ class ChatTuiApplication:
         return self.status_fragments()
 
     def prompt_permission_mode(self, session: PromptSession) -> str | None:
-        from ..loop import create_chat_prompt_options
+        from ..runtime.agent import create_chat_prompt_options
 
         def start_completion() -> None:
             session.app.current_buffer.start_completion(select_first=True)
@@ -144,7 +144,7 @@ class ChatTuiApplication:
         return selected or None
 
     def prompt_history_selection(self, session: PromptSession) -> HistoryEntry | None:
-        from ..loop import create_chat_prompt_options
+        from ..runtime.agent import create_chat_prompt_options
 
         entries = list_history_entries(self.runtime.agent_dir)
         if not entries:

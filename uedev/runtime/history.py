@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .llm import ChatMessage, ToolCall
+from ..llm.client import ChatMessage, ToolCall
 
 
 HISTORY_DIR = "history"

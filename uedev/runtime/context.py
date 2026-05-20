@@ -5,7 +5,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from .llm import ChatMessage
+from ..llm.client import ChatMessage
 
 
 SUMMARY_PREFIX = "[Conversation summary]"

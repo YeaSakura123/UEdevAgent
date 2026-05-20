@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ..mcp.types import McpServerConfig
-from ..permissions import PermissionMode, normalize_permission_mode
+from ..policy.permissions import PermissionMode, normalize_permission_mode
 
 
 CONFIG_VERSION = 1

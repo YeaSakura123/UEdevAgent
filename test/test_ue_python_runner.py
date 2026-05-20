@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import unittest
 import uuid
@@ -9,7 +9,7 @@ import types
 from pathlib import Path
 from unittest.mock import patch
 
-from uedev.tasks import TodoManager
+from uedev.state.tasks import TodoManager
 from uedev.ue import (
     UeRunResult,
     _discover_perforce,
@@ -186,7 +186,7 @@ class UePythonRunnerTests(unittest.TestCase):
         config_path = root / "system-config.json"
         write_system_config(config_path, "5.4", engine_root)
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             prepared = prepare_ue_python(root, root / ".agent", "print('ok')", mode="full_editor")
 
         meta = json.loads((prepared.run_dir / "meta.json").read_text(encoding="utf-8"))
@@ -216,7 +216,7 @@ class UePythonRunnerTests(unittest.TestCase):
         write_system_config(config_path, "5.4", engine_root)
         source.write_text("_uedev_result = {'from': 'source'}\n", encoding="utf-8")
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             prepared = prepare_ue_python(
                 root,
                 root / ".agent",
@@ -262,7 +262,7 @@ class UePythonRunnerTests(unittest.TestCase):
         config_path = root / "system-config.json"
         write_system_config(config_path, "5.4", engine_root)
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             result = run_ue_python(root, root / ".agent", "print('ok')", execute=False)
 
         meta = json.loads((result.run_dir / "meta.json").read_text(encoding="utf-8"))
@@ -284,7 +284,7 @@ class UePythonRunnerTests(unittest.TestCase):
         config_path = root / "system-config.json"
         write_system_config(config_path, "5.4", engine_root)
 
-        with patch("uedev.config.default_system_config_path", return_value=config_path):
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
             prepared = prepare_ue_python(root, root / ".agent", "_uedev_result = {'ok': 1}", mode="commandlet")
 
         class Completed:

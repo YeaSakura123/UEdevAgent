@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -21,12 +21,12 @@ def workspace_temp_dir():
 
 
 
-from uedev.background import BackgroundManager
-from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
-from uedev.loop import (
+from uedev.tools.background import BackgroundManager
+from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
     AgentRuntime,
@@ -37,22 +37,22 @@ from uedev.loop import (
     render_chat_banner,
     render_slash_help,
 )
-from uedev.permissions import classify_shell_command, classify_tool_permission
-from uedev.prompts import (
+from uedev.policy.permissions import classify_shell_command, classify_tool_permission
+from uedev.runtime.prompts import (
     _join_sections,
     build_prompt_bundle,
     build_subagent_prompt,
     build_system_prompt as build_prompt_system_prompt,
     build_tool_confirmation_reminder,
 )
-from uedev.renderer import ConsoleRenderer, TuiRenderer
-from uedev.shell import ShellResult, run_shell
-from uedev.skills import SkillLoader
-from uedev.tasks import TaskManager
-from uedev.team import MessageBus, TeamManager
-from uedev.tool_specs import get_tool_names, get_tool_specs
-from uedev.workspace import edit_file, read_file, write_file
-from uedev.worktrees import WorktreeManager
+from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.tools.shell import ShellResult, run_shell
+from uedev.runtime.skills import SkillLoader
+from uedev.state.tasks import TaskManager
+from uedev.state.team import MessageBus, TeamManager
+from uedev.tools.specs import get_tool_names, get_tool_specs
+from uedev.tools.workspace import edit_file, read_file, write_file
+from uedev.tools.worktrees import WorktreeManager
 
 
 def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
@@ -99,7 +99,7 @@ class ShellAndApprovalTests(unittest.TestCase):
         stdout = StringIO()
         stderr = StringIO()
         with workspace_temp_dir() as temp:
-            with patch("uedev.shell.subprocess.Popen", return_value=FakeProcess()):
+            with patch("uedev.tools.shell.subprocess.Popen", return_value=FakeProcess()):
                 with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
                     result = run_shell("echo test", Path(temp), 1)
 
@@ -128,7 +128,7 @@ class ShellAndApprovalTests(unittest.TestCase):
                 approval_provider=approve,
             )
 
-            with patch("uedev.loop.run_shell", return_value=ShellResult("curl https://example.com", 0, "ok\n", "")):
+            with patch("uedev.runtime.agent.run_shell", return_value=ShellResult("curl https://example.com", 0, "ok\n", "")):
                 result = runtime.tools["shell"]({"command": "curl https://example.com", "reason": "test approval"})
 
         self.assertEqual(approvals, [("curl https://example.com", "test approval")])
@@ -169,7 +169,7 @@ class ShellAndApprovalTests(unittest.TestCase):
                 approval_provider=lambda command, reason: approvals.append((command, reason)) or False,
             )
 
-            with patch("uedev.loop.run_shell", return_value=ShellResult("echo ok", 0, "ok\n", "")):
+            with patch("uedev.runtime.agent.run_shell", return_value=ShellResult("echo ok", 0, "ok\n", "")):
                 result = runtime.tools["shell"]({"command": "echo ok", "reason": "local"})
 
         self.assertEqual(approvals, [])
@@ -234,7 +234,7 @@ class ShellAndApprovalTests(unittest.TestCase):
             )
             runtime.permission_mode = "full_access"
 
-            with patch("uedev.loop.run_shell", return_value=ShellResult("curl https://example.com", 0, "ok\n", "")):
+            with patch("uedev.runtime.agent.run_shell", return_value=ShellResult("curl https://example.com", 0, "ok\n", "")):
                 result = runtime.tools["shell"]({"command": "curl https://example.com", "reason": "network"})
 
         self.assertEqual(approvals, [])

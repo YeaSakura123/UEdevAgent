@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import unittest
@@ -7,13 +7,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
-from uedev.config import ConfigError, load_system_config
-from uedev.loop import AgentOptions, AgentRuntime
+from uedev.state.config import ConfigError, load_system_config
+from uedev.runtime.agent import AgentOptions, AgentRuntime
 from uedev.mcp.client import McpClient
 from uedev.mcp.registry import McpToolRegistry
 from uedev.mcp.transport import McpStdioTransport
 from uedev.mcp.types import McpServerConfig, McpServerStatus, McpTool
-from uedev.permissions import classify_tool_permission
+from uedev.policy.permissions import classify_tool_permission
 
 
 @contextmanager

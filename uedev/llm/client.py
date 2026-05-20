@@ -10,7 +10,7 @@ except ModuleNotFoundError:  # pragma: no cover - only used in minimal test envi
     OpenAI = None  # type: ignore[assignment]
     OpenAIError = Exception  # type: ignore[assignment]
 
-from .config import ModelProfile
+from ..state.config import ModelProfile
 
 
 @dataclass(frozen=True)

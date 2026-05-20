@@ -48,8 +48,8 @@ except ImportError:  # pragma: no cover - exercised only in minimal test environ
             return style
 
 from .. import __version__
-from ..background import BackgroundManager
-from ..config import (
+from ..tools.background import BackgroundManager
+from ..state.config import (
     ConfigError,
     active_model_name,
     agent_dir,
@@ -60,7 +60,7 @@ from ..config import (
     resolve_model_profile,
     save_project_active_model,
 )
-from ..context import (
+from .context import (
     build_compacted_history,
     build_compaction_request,
     estimate_tokens,
@@ -69,7 +69,7 @@ from ..context import (
     repair_tool_call_messages,
     save_transcript,
 )
-from ..events import (
+from ..ui.events import (
     AgentEvent,
     compact_event,
     final_event,
@@ -79,16 +79,16 @@ from ..events import (
     tool_result_event,
     tool_start_event,
 )
-from ..history import (
+from .history import (
     HistoryError,
     HistoryRecorder,
     ensure_system_prompt,
     list_history_entries,
     load_history_file,
 )
-from ..llm import ChatMessage, call_model
+from ..llm.client import ChatMessage, call_model
 from ..mcp.registry import McpToolRegistry, is_mcp_tool_name
-from ..permissions import (
+from ..policy.permissions import (
     CollaborationMode,
     PermissionMode,
     VALID_PERMISSION_MODES,
@@ -99,13 +99,13 @@ from ..permissions import (
     permission_mode_description,
     permission_mode_label,
 )
-from ..prompts import PromptBundle, build_prompt_bundle, build_system_prompt as render_system_prompt
-from ..renderer import ConsoleRenderer
-from ..shell import ApprovalProvider, confirm_command, run_shell, shell_name
-from ..skills import SkillLoader
-from ..tasks import TaskManager, TodoManager
-from ..team import MessageBus, TeamManager
-from ..tool_specs import get_tool_specs
+from .prompts import PromptBundle, build_prompt_bundle, build_system_prompt as render_system_prompt
+from ..ui.renderer import ConsoleRenderer
+from ..tools.shell import ApprovalProvider, confirm_command, run_shell, shell_name
+from .skills import SkillLoader
+from ..state.tasks import TaskManager, TodoManager
+from ..state.team import MessageBus, TeamManager
+from ..tools.specs import get_tool_specs
 from ..ue import (
     discover_ue,
     enqueue_editor_stop,
@@ -122,8 +122,8 @@ from ..ue import (
     render_doctor,
     render_run_result,
 )
-from ..workspace import edit_file, list_files, read_file, write_file
-from ..worktrees import WorktreeManager
+from ..tools.workspace import edit_file, list_files, read_file, write_file
+from ..tools.worktrees import WorktreeManager
 
 
 @dataclass(frozen=True)
@@ -150,6 +150,7 @@ class ToolAction:
 
 SLASH_COMMANDS = [
     ("/help", "Show available chat slash commands."),
+    ("/context", "Show current conversation context usage."),
     ("/diff", "Show Git and Perforce workspace changes."),
     ("/todos", "Show the current lightweight todo list."),
     ("/tasks", "Show the persistent task graph."),
@@ -173,6 +174,38 @@ def render_slash_help() -> str:
     lines = ["Chat commands:"]
     lines.extend(f"  {command.ljust(width)}  {description}" for command, description in SLASH_COMMANDS)
     return "\n".join(lines)
+
+
+def render_context_usage(messages: list[ChatMessage], model_profile: Any, compact_threshold: int) -> str:
+    estimated = estimate_tokens(messages)
+    context_window = int(getattr(model_profile, "context_window", 0) or 0)
+    model_name = str(getattr(model_profile, "model", "") or "(missing model)")
+    profile_name = str(getattr(model_profile, "name", "") or "(unknown)")
+
+    return "\n".join(
+        [
+            "Context:",
+            f"model: {model_name} (profile: {profile_name})",
+            f"estimated tokens: {_format_number(estimated)}",
+            f"context window: {_format_number(context_window)}",
+            f"context usage: {_format_percent(estimated, context_window)}",
+            "",
+            f"auto compact threshold: {_format_number(compact_threshold)}",
+            f"threshold usage: {_format_percent(estimated, compact_threshold)}",
+            f"remaining to threshold: {_format_number(max(0, compact_threshold - estimated))}",
+            f"remaining to window: {_format_number(max(0, context_window - estimated))}",
+        ]
+    )
+
+
+def _format_number(value: int) -> str:
+    return f"{value:,}"
+
+
+def _format_percent(value: int, total: int) -> str:
+    if total <= 0:
+        return "n/a"
+    return f"{(value / total) * 100:.1f}%"
 
 
 @dataclass(frozen=True)
@@ -628,7 +661,7 @@ def run_chat(options: AgentOptions) -> None:
         run_plain_chat(options)
         return
 
-    from ..tui import ChatTuiApplication
+    from ..ui.tui import ChatTuiApplication
 
     runtime = AgentRuntime(options)
     ChatTuiApplication(
@@ -908,6 +941,18 @@ class AgentRuntime:
         command = raw_command.lower()
         if command == "/help":
             emit(render_slash_help())
+            return True
+        if command == "/context":
+            if messages is None:
+                emit("Use /context inside chat to inspect the current conversation context.")
+                return True
+            try:
+                emit(render_context_usage(messages, self.current_model_profile(), self._context_threshold()))
+            except ConfigError as error:
+                emit(f"Config error: {error}")
+            return True
+        if raw_command.split(maxsplit=1)[0].lower() == "/context":
+            emit("Usage: /context")
             return True
         if command == "/diff":
             try:

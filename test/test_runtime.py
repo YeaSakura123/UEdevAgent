@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import subprocess
@@ -22,13 +22,13 @@ def workspace_temp_dir():
 
 
 
-from uedev.background import BackgroundManager
-from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.history import HistoryRecorder, load_history_file
-from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
-from uedev.loop import (
+from uedev.tools.background import BackgroundManager
+from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.runtime.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.runtime.history import HistoryRecorder, load_history_file
+from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
     AgentRuntime,
@@ -40,22 +40,22 @@ from uedev.loop import (
     render_workspace_diff,
     render_slash_help,
 )
-from uedev.permissions import classify_shell_command
-from uedev.prompts import (
+from uedev.policy.permissions import classify_shell_command
+from uedev.runtime.prompts import (
     _join_sections,
     build_prompt_bundle,
     build_subagent_prompt,
     build_system_prompt as build_prompt_system_prompt,
     build_tool_confirmation_reminder,
 )
-from uedev.renderer import ConsoleRenderer, TuiRenderer
-from uedev.shell import ShellResult, run_shell
-from uedev.skills import SkillLoader
-from uedev.tasks import TaskManager
-from uedev.team import MessageBus, TeamManager
-from uedev.tool_specs import get_tool_names, get_tool_specs
-from uedev.workspace import edit_file, read_file, write_file
-from uedev.worktrees import WorktreeManager
+from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.tools.shell import ShellResult, run_shell
+from uedev.runtime.skills import SkillLoader
+from uedev.state.tasks import TaskManager
+from uedev.state.team import MessageBus, TeamManager
+from uedev.tools.specs import get_tool_names, get_tool_specs
+from uedev.tools.workspace import edit_file, read_file, write_file
+from uedev.tools.worktrees import WorktreeManager
 
 
 def write_system_config(
@@ -142,8 +142,8 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("done"),
             ]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", side_effect=responses):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
                     events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test"))
 
             event_types = [event.type for event in events]
@@ -170,8 +170,8 @@ class AgentEventLoopTests(unittest.TestCase):
             messages = [ChatMessage(role="system", content=runtime.system_prompt)]
             history = HistoryRecorder(agent_dir(root), messages)
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", return_value=ModelResponse("done")):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("done")):
                     events = list(runtime.run_turn_events(messages, "remember this", turn_id="turn-test", history=history))
 
             self.assertEqual(events[-1].type, "final")
@@ -202,8 +202,8 @@ class AgentEventLoopTests(unittest.TestCase):
             ]
             responses = [ModelResponse("short summary"), ModelResponse("done")]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", side_effect=responses) as mock_call:
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses) as mock_call:
                     events = list(runtime.run_turn_events(messages, "new task", turn_id="turn-test"))
 
             self.assertEqual(events[0].type, "compact")
@@ -242,7 +242,7 @@ class AgentEventLoopTests(unittest.TestCase):
                 )
             )
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
                 self.assertEqual(runtime._context_threshold(), 900)
 
     def test_explicit_context_threshold_overrides_model_context_window(self) -> None:
@@ -261,6 +261,113 @@ class AgentEventLoopTests(unittest.TestCase):
             )
 
             self.assertEqual(runtime._context_threshold(), 123)
+
+    def test_context_slash_command_reports_current_context_usage(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "small": {
+                        "model": "small-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "context_window": 1000,
+                    }
+                },
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                    context_threshold=700,
+                )
+            )
+            messages = [
+                ChatMessage(role="system", content="system prompt"),
+                ChatMessage(role="user", content="hello"),
+            ]
+            original = list(messages)
+            output: list[str] = []
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                self.assertTrue(runtime.handle_slash_command("/context", emit=output.append, messages=messages))
+
+            rendered = output[-1]
+            self.assertIn("Context:", rendered)
+            self.assertIn("model: small-model (profile: small)", rendered)
+            self.assertIn("estimated tokens:", rendered)
+            self.assertIn("context window: 1,000", rendered)
+            self.assertIn("context usage:", rendered)
+            self.assertIn("auto compact threshold: 700", rendered)
+            self.assertIn("threshold usage:", rendered)
+            self.assertIn("remaining to threshold:", rendered)
+            self.assertIn("remaining to window:", rendered)
+            self.assertNotIn("approximate JSON length", rendered)
+            self.assertEqual(messages, original)
+
+    def test_context_slash_command_uses_model_window_default_threshold(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "small": {
+                        "model": "small-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "context_window": 1000,
+                    }
+                },
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                self.assertTrue(
+                    runtime.handle_slash_command(
+                        "/context",
+                        emit=output.append,
+                        messages=[ChatMessage(role="system", content="system prompt")],
+                    )
+                )
+
+            self.assertIn("auto compact threshold: 900", output[-1])
+
+    def test_context_slash_command_requires_chat_messages_and_rejects_arguments(self) -> None:
+        with workspace_temp_dir() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/context", emit=output.append))
+            self.assertIn("Use /context inside chat", output[-1])
+
+            self.assertTrue(runtime.handle_slash_command("/context now", emit=output.append, messages=[]))
+            self.assertEqual(output[-1], "Usage: /context")
 
     def test_diff_slash_command_renders_git_and_perforce_status(self) -> None:
         with workspace_temp_dir() as temp:
@@ -291,7 +398,7 @@ class AgentEventLoopTests(unittest.TestCase):
                 raise AssertionError(f"unexpected command: {args}")
 
             with (
-                patch("uedev.config.default_system_config_path", return_value=config_path),
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
                 patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
                 patch(
                     "uedev.runtime.agent.p4_status",
@@ -462,8 +569,8 @@ class AgentEventLoopTests(unittest.TestCase):
             ]
             output: list[str] = []
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", return_value=ModelResponse("manual summary")) as mock_call:
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("manual summary")) as mock_call:
                     self.assertTrue(runtime.handle_slash_command("/compact", emit=output.append, messages=messages))
 
             self.assertIn("Conversation compacted", output[-1])
@@ -489,12 +596,12 @@ class AgentEventLoopTests(unittest.TestCase):
             )
             messages = [ChatMessage(role="system", content=runtime.system_prompt)]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", return_value=ModelResponse("previous answer")):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("previous answer")):
                     events = list(runtime.run_turn_events(messages, "first task", turn_id="turn-test"))
                 self.assertEqual(events[-1].type, "final")
 
-                with patch("uedev.loop.call_model", return_value=ModelResponse("manual summary")):
+                with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("manual summary")):
                     self.assertTrue(runtime.handle_slash_command("/compact", emit=lambda _message: None, messages=messages))
 
             transcript = max((agent_dir(root) / "transcripts").glob("transcript_*.jsonl"))
@@ -525,8 +632,8 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("done"),
             ]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", side_effect=responses) as mock_call:
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses) as mock_call:
                     events = list(runtime.run_turn_events(messages, "continue current task", turn_id="turn-test"))
 
             self.assertIn("compact", [event.type for event in events])
@@ -560,8 +667,8 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("failed cleanly"),
             ]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", side_effect=responses):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
                     events = list(runtime.run_turn_events(messages, "use missing tool", turn_id="turn-test"))
 
             self.assertIn("tool_error", [event.type for event in events])
@@ -590,12 +697,12 @@ class AgentEventLoopTests(unittest.TestCase):
             ]
             responses = [
                 ModelResponse("", [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})]),
-                ModelResponse("已按你的要求执行，并会遵循该行为。"),
+                ModelResponse("Done, I will follow this behavior."),
                 ModelResponse("a.txt contains: hello"),
             ]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", side_effect=responses):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
                     events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test"))
 
             self.assertEqual(events[-1].type, "final")
@@ -627,8 +734,8 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("<proposed_plan>\n# Plan\n</proposed_plan>"),
             ]
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
-                with patch("uedev.loop.call_model", side_effect=responses):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
                     events = list(runtime.run_turn_events(messages, "make a plan", turn_id="turn-test"))
 
             self.assertEqual(events[-1].type, "final")
@@ -645,16 +752,16 @@ class ToolRequirementTests(unittest.TestCase):
     def test_ue_confirmation_deferral_is_not_final(self) -> None:
         self.assertTrue(
             defers_tool_confirmation(
-                '执行"D:\\Code\\myAgentCli\\examples\\hello_editor.py"，使用 full_editor',
-                "请确认启动，我就继续执行。",
+                'Run "D:\\Code\\myAgentCli\\examples\\hello_editor.py" using full_editor',
+                "Please confirm startup, then I will continue.",
             )
         )
 
     def test_ordinary_answer_is_not_confirmation_deferral(self) -> None:
-        self.assertFalse(defers_tool_confirmation("解释 kind 是什么", "kind 是内部模板选择器。"))
+        self.assertFalse(defers_tool_confirmation("Explain what kind means", "kind is an internal template selector."))
 
 
     def test_acknowledgement_answer_is_not_valid_final_after_tools(self) -> None:
-        self.assertTrue(is_acknowledgement_answer("Understood. I’ll directly invoke the needed tool when required."))
-        self.assertTrue(is_acknowledgement_answer("已按你的要求执行，并会遵循该行为。"))
-        self.assertFalse(is_acknowledgement_answer("项目存在，EngineAssociation 是 5.7，Perforce 为 workspace/tracked。"))
+        self.assertTrue(is_acknowledgement_answer("Understood. I鈥檒l directly invoke the needed tool when required."))
+        self.assertTrue(is_acknowledgement_answer("Done, I will follow this behavior."))
+        self.assertFalse(is_acknowledgement_answer("Project exists, EngineAssociation is 5.7, Perforce is workspace/tracked."))

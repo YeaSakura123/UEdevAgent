@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import (
+from .state.config import (
     ConfigError,
     active_model_name,
     agent_dir,
@@ -18,12 +18,12 @@ from .config import (
     system_config_template,
     write_json,
 )
-from .loop import AgentOptions, run_agent, run_chat
-from .shell import shell_name
-from .tasks import TaskManager, TodoManager
-from .team import MessageBus, TeamManager
+from .runtime.agent import AgentOptions, run_agent, run_chat
+from .tools.shell import shell_name
+from .state.tasks import TaskManager, TodoManager
+from .state.team import MessageBus, TeamManager
 from .ue import discover_ue, render_doctor, render_run_result, run_ue_python
-from .worktrees import WorktreeManager
+from .tools.worktrees import WorktreeManager
 
 
 def build_parser() -> argparse.ArgumentParser:

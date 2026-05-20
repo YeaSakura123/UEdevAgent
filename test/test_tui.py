@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import tempfile
@@ -27,12 +27,12 @@ try:
 except ModuleNotFoundError as error:
     raise unittest.SkipTest("prompt_toolkit is not installed") from error
 
-from uedev.background import BackgroundManager
-from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import compact_event, final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
-from uedev.loop import (
+from uedev.tools.background import BackgroundManager
+from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.ui.events import compact_event, final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
     AgentRuntime,
@@ -43,23 +43,23 @@ from uedev.loop import (
     render_chat_banner,
     render_slash_help,
 )
-from uedev.permissions import classify_shell_command
-from uedev.prompts import (
+from uedev.policy.permissions import classify_shell_command
+from uedev.runtime.prompts import (
     _join_sections,
     build_prompt_bundle,
     build_subagent_prompt,
     build_system_prompt as build_prompt_system_prompt,
     build_tool_confirmation_reminder,
 )
-from uedev.renderer import ConsoleRenderer, TuiRenderer
-from uedev.shell import ShellResult, run_shell
-from uedev.skills import SkillLoader
-from uedev.tasks import TaskManager
-from uedev.team import MessageBus, TeamManager
-from uedev.tool_specs import get_tool_names, get_tool_specs
-from uedev.tui import ChatTuiApplication
-from uedev.workspace import edit_file, read_file, write_file
-from uedev.worktrees import WorktreeManager
+from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.tools.shell import ShellResult, run_shell
+from uedev.runtime.skills import SkillLoader
+from uedev.state.tasks import TaskManager
+from uedev.state.team import MessageBus, TeamManager
+from uedev.tools.specs import get_tool_names, get_tool_specs
+from uedev.ui.tui import ChatTuiApplication
+from uedev.tools.workspace import edit_file, read_file, write_file
+from uedev.tools.worktrees import WorktreeManager
 
 
 def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:

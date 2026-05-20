@@ -141,9 +141,11 @@ omitting it produces a dry-run command preview.
   lists, links, code blocks, and tables.
 - `chat` shows per-turn thinking/tool events while running, then renders a
   collapsed process summary before the final answer.
-- `chat` supports slash commands such as `/help`, `/diff`, `/todos`, `/history`,
-  `/model`, `/plan`, `/permissions`, `/compact`, and `/ue doctor`;
+- `chat` supports slash commands such as `/help`, `/context`, `/diff`, `/todos`,
+  `/history`, `/model`, `/plan`, `/permissions`, `/compact`, and `/ue doctor`;
   type `/` to autocomplete commands with descriptions.
+- `/context` shows the current estimated model-context usage, configured context
+  window, auto compact threshold, and remaining capacity.
 - `/diff` shows a human-readable Git status/diff summary and Perforce workspace
   status plus opened files for the current workspace.
 - `/model` lists configured model profiles; `/model <profile>` stores the active

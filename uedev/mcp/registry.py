@@ -4,7 +4,7 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-from ..config import ConfigError, load_system_config
+from ..state.config import ConfigError, load_system_config
 from ..tools.specs import ToolSpec
 from .client import McpClient
 from .types import McpError, McpServerConfig, McpServerStatus, McpTool

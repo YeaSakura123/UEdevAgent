@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import subprocess
@@ -28,12 +28,12 @@ try:
 except ModuleNotFoundError as error:
     raise unittest.SkipTest("prompt_toolkit is not installed") from error
 
-from uedev.background import BackgroundManager
-from uedev.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.llm import ChatMessage, ModelResponse, ToolCall, _serialize_message
-from uedev.loop import (
+from uedev.tools.background import BackgroundManager
+from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
     AgentRuntime,
@@ -45,22 +45,22 @@ from uedev.loop import (
     render_workspace_diff,
     render_slash_help,
 )
-from uedev.permissions import classify_shell_command
-from uedev.prompts import (
+from uedev.policy.permissions import classify_shell_command
+from uedev.runtime.prompts import (
     _join_sections,
     build_prompt_bundle,
     build_subagent_prompt,
     build_system_prompt as build_prompt_system_prompt,
     build_tool_confirmation_reminder,
 )
-from uedev.renderer import ConsoleRenderer, TuiRenderer
-from uedev.shell import ShellResult, run_shell
-from uedev.skills import SkillLoader
-from uedev.tasks import TaskManager
-from uedev.team import MessageBus, TeamManager
-from uedev.tool_specs import get_tool_names, get_tool_specs
-from uedev.workspace import edit_file, read_file, write_file
-from uedev.worktrees import WorktreeManager
+from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.tools.shell import ShellResult, run_shell
+from uedev.runtime.skills import SkillLoader
+from uedev.state.tasks import TaskManager
+from uedev.state.team import MessageBus, TeamManager
+from uedev.tools.specs import get_tool_names, get_tool_specs
+from uedev.tools.workspace import edit_file, read_file, write_file
+from uedev.tools.worktrees import WorktreeManager
 
 
 def write_system_config(
@@ -106,6 +106,8 @@ class SlashCommandTests(unittest.TestCase):
 
         self.assertIn("/help", help_text)
         self.assertIn("Show available chat slash commands.", help_text)
+        self.assertIn("/context", help_text)
+        self.assertIn("Show current conversation context usage.", help_text)
         self.assertIn("/diff", help_text)
         self.assertIn("Show Git and Perforce workspace changes.", help_text)
         self.assertIn("/model", help_text)
@@ -153,6 +155,11 @@ class SlashCommandTests(unittest.TestCase):
         completions = list(SlashCommandCompleter().get_completions(Document("/dif"), None))
 
         self.assertEqual([completion.text for completion in completions], ["/diff"])
+
+    def test_slash_completer_filters_context_command(self) -> None:
+        completions = list(SlashCommandCompleter().get_completions(Document("/con"), None))
+
+        self.assertEqual([completion.text for completion in completions], ["/context"])
 
     def test_slash_completer_matches_fuzzy_ue_doctor(self) -> None:
         completions = list(SlashCommandCompleter().get_completions(Document("/ud"), None))
@@ -215,7 +222,7 @@ class SlashCommandTests(unittest.TestCase):
             )
             output: list[str] = []
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
                 self.assertTrue(runtime.handle_slash_command("/model", emit=output.append))
                 self.assertIn("fast", output[-1])
                 self.assertIn("default", output[-1])
@@ -347,7 +354,7 @@ class SlashCommandTests(unittest.TestCase):
                 raise AssertionError(f"unexpected command: {args}")
 
             with (
-                patch("uedev.config.default_system_config_path", return_value=config_path),
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
                 patch("uedev.runtime.agent.subprocess.run", side_effect=fake_run),
                 patch(
                     "uedev.runtime.agent.p4_status",
@@ -458,7 +465,7 @@ class SlashCommandTests(unittest.TestCase):
             runtime = AgentRuntime(options)
             app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
 
-            with patch("uedev.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
                 toolbar = "".join(fragment[1] for fragment in app.status_bottom_toolbar())
 
                 self.assertIn("fast-model", toolbar)

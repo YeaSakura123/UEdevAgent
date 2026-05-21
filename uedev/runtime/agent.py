@@ -58,6 +58,7 @@ from ..state.config import (
     load_system_config,
     reset_project_active_model,
     resolve_model_profile,
+    resolve_subagent_model_profile,
     save_project_active_model,
 )
 from .context import (
@@ -100,6 +101,7 @@ from ..policy.permissions import (
     permission_mode_label,
 )
 from .prompts import PromptBundle, build_prompt_bundle, build_system_prompt as render_system_prompt
+from .subagents import SubagentManager, parse_subagent_spec
 from ..ui.renderer import ConsoleRenderer
 from ..tools.shell import ApprovalProvider, confirm_command, run_shell, shell_name
 from .skills import SkillLoader
@@ -157,6 +159,7 @@ SLASH_COMMANDS = [
     ("/team", "Show the persistent teammate roster."),
     ("/inbox", "Show pending messages for the lead agent."),
     ("/history", "Load a previous conversation from this project."),
+    ("/subagents", "Choose a subagent conversation to view."),
     ("/model", "List or switch model profiles for this project."),
     ("/mcp", "Show configured MCP server status and tools."),
     ("/plan", "Enter, leave, or inspect Plan Mode."),
@@ -761,6 +764,12 @@ class AgentRuntime:
         self.bus = MessageBus(self.agent_dir / "team")
         self.team = TeamManager(self.agent_dir / "team", self.task_manager, self.bus)
         self.worktrees = WorktreeManager(options.cwd, self.agent_dir / "worktrees", self.task_manager)
+        self.subagents = SubagentManager(
+            self.agent_dir,
+            options.max_steps,
+            self._execute_subagent_tool,
+            self.current_subagent_model_profile,
+        )
         self.mcp = McpToolRegistry.from_system_config()
         self.prompt_bundle: PromptBundle = build_prompt_bundle(
             options.cwd,
@@ -835,11 +844,44 @@ class AgentRuntime:
                 messages.append(assistant_message)
                 if history is not None:
                     history.append(assistant_message)
+                subagent_specs = []
+                subagent_errors: dict[str, str] = {}
+                for tool_call in response.tool_calls:
+                    if tool_call.name != "subagent":
+                        continue
+                    try:
+                        spec = parse_subagent_spec(tool_call.arguments)
+                        self.subagents.validate_spec(spec)
+                        subagent_specs.append((tool_call.id, spec))
+                    except Exception as error:
+                        subagent_errors[tool_call.id] = str(error)
+
+                subagent_outputs: dict[str, tuple[str, bool]] = {}
+                if subagent_specs or subagent_errors:
+                    for tool_call in response.tool_calls:
+                        if tool_call.name == "subagent":
+                            action = ToolAction(name=tool_call.name, input=tool_call.arguments)
+                            tool_names_this_turn.append(action.name)
+                            yield tool_start_event(action.name, action.input, current_turn_id)
+                if subagent_specs:
+                    try:
+                        results = self.subagents.run_batch([spec for _, spec in subagent_specs], list(messages))
+                        for (tool_call_id, _), result in zip(subagent_specs, results):
+                            subagent_outputs[tool_call_id] = (result.output, result.record.status == "failed")
+                    except Exception as error:
+                        for tool_call_id, _ in subagent_specs:
+                            subagent_outputs[tool_call_id] = (f"Subagent batch failed: {error}", True)
+                for tool_call_id, error in subagent_errors.items():
+                    subagent_outputs[tool_call_id] = (error, True)
+
                 for tool_call in response.tool_calls:
                     action = ToolAction(name=tool_call.name, input=tool_call.arguments)
-                    tool_names_this_turn.append(action.name)
-                    yield tool_start_event(action.name, action.input, current_turn_id)
-                    output, is_error = self._execute_tool_with_status(action)
+                    if action.name == "subagent":
+                        output, is_error = subagent_outputs.get(tool_call.id, ("Subagent did not return a result.", True))
+                    else:
+                        tool_names_this_turn.append(action.name)
+                        yield tool_start_event(action.name, action.input, current_turn_id)
+                        output, is_error = self._execute_tool_with_status(action)
                     if action.name == "todo_update":
                         rounds_without_todo = 0
                     else:
@@ -977,6 +1019,12 @@ class AgentRuntime:
             return True
         if command == "/history":
             emit("Use /history inside chat to choose and load a previous conversation.")
+            return True
+        if command == "/subagents":
+            emit(self.subagents.render_list())
+            return True
+        if raw_command.split(maxsplit=1)[0].lower() == "/subagents":
+            emit("Usage: /subagents")
             return True
         if command == "/model":
             try:
@@ -1121,6 +1169,12 @@ class AgentRuntime:
         output, _ = self._execute_tool_with_status(action)
         return output
 
+    def _execute_subagent_tool(self, name: str, arguments: dict[str, Any]) -> str:
+        output, is_error = self._execute_tool_with_status(ToolAction(name=name, input=arguments))
+        if is_error:
+            return f"Tool {name} failed: {output}"
+        return output
+
     # 内部函数：执行工具并返回输出及错误标记，负责事件流中的 tool_result/tool_error 区分。
     def _execute_tool_with_status(self, action: ToolAction) -> tuple[str, bool]:
         handler = self.tools.get(action.name)
@@ -1149,6 +1203,9 @@ class AgentRuntime:
 
     def current_model_profile(self):
         return resolve_model_profile(self.options.cwd)
+
+    def current_subagent_model_profile(self):
+        return resolve_subagent_model_profile(self.options.cwd, self.current_model_profile())
 
     def render_models(self) -> str:
         return format_model_profiles(self.options.cwd)
@@ -1264,10 +1321,8 @@ class AgentRuntime:
 
         # 内部函数：处理 subagent 工具调用，启动受限子 agent 完成子任务。
         def subagent_tool(tool_input: dict[str, object]) -> str:
-            prompt = str(tool_input.get("prompt", "")).strip()
-            if not prompt:
-                raise ValueError("subagent requires prompt")
-            return self._run_subagent(prompt, str(tool_input.get("agent_type", "explore")))
+            spec = parse_subagent_spec(tool_input)
+            return self.subagents.run_batch([spec], [])[0].output
 
         handlers: dict[str, ToolHandler] = {
             "shell": shell_tool,
@@ -1388,7 +1443,7 @@ class AgentRuntime:
         handlers.update(self.mcp.handlers())
         return {name: self._guard_tool(name, handler) for name, handler in handlers.items()}
 
-    # 内部函数：处理 _run_subagent 辅助逻辑，支撑 agent 主循环、chat 界面、工具分发和运行时观察。
+    # Resolve an optional tool working directory relative to the agent cwd.
     def _resolve_tool_cwd(self, raw_cwd: object) -> Path:
         raw = str(raw_cwd or "").strip()
         if not raw:
@@ -1429,47 +1484,6 @@ class AgentRuntime:
         if path.suffix.lower() != ".py":
             raise ValueError(f"UE Python script_path must point to a .py file: {path}")
         return path.read_text(encoding="utf-8"), path
-
-    def _run_subagent(self, prompt: str, agent_type: str) -> str:
-        child_messages = [
-            ChatMessage(
-                role="system",
-                content=self.prompt_bundle.subagent_prompt,
-            ),
-            ChatMessage(role="user", content=prompt),
-        ]
-        allowed = {"read_file", "list_files", "shell"}
-        if agent_type not in {"explore", "Explore"}:
-            allowed.update({"write_file", "edit_file"})
-
-        subagent_tools = [
-            tool for tool in get_tool_specs() if str(tool["function"]["name"]) in allowed
-        ]
-        summaries: list[str] = []
-        for _ in range(min(6, self.options.max_steps)):
-            response = call_model(child_messages, self.current_model_profile(), tools=subagent_tools)
-            if response.tool_calls:
-                child_messages.append(ChatMessage(role="assistant", content=response.content, tool_calls=response.tool_calls))
-                for tool_call in response.tool_calls:
-                    action = ToolAction(name=tool_call.name, input=tool_call.arguments)
-                    if action.name not in allowed:
-                        output = f"Subagent tool not allowed: {action.name}"
-                    else:
-                        output = self._execute_tool(action)
-                    summaries.append(f"{action.name}: {truncate(output, 1000)}")
-                    child_messages.append(
-                        ChatMessage(
-                            role="tool",
-                            content=f"Tool result for: {action.name}\n{truncate(output)}",
-                            tool_call_id=tool_call.id,
-                            name=tool_call.name,
-                        )
-                    )
-                continue
-
-            return response.content
-        return "Subagent stopped after bounded steps.\n" + "\n".join(summaries[-5:])
-
 
 # 内部函数：截断过长工具输出，避免 observation 撑爆上下文。
 def _permission_prompt_label(name: str, tool_input: dict[str, object]) -> str:

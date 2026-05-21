@@ -52,6 +52,7 @@ class SystemConfig:
     models: dict[str, ModelProfile]
     ue_engines: dict[str, UeEngineProfile]
     mcp_servers: dict[str, McpServerConfig]
+    subagent_model_profile: str | None = None
     diff_output_max_chars: int = DEFAULT_DIFF_OUTPUT_MAX_CHARS
 
 
@@ -94,6 +95,9 @@ def system_config_template() -> dict[str, Any]:
         },
         "display": {
             "diff_output_max_chars": DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+        },
+        "subagents": {
+            "model_profile": None,
         },
         "mcp": {
             "servers": {},
@@ -179,6 +183,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
 
     mcp_servers = _parse_mcp_servers(data.get("mcp", {}), config_path)
     diff_output_max_chars = _parse_display_config(data.get("display", {}), config_path)
+    subagent_model_profile = _parse_subagent_config(data.get("subagents", {}), models, config_path)
 
     return SystemConfig(
         path=config_path,
@@ -186,6 +191,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
         models=models,
         ue_engines=engines,
         mcp_servers=mcp_servers,
+        subagent_model_profile=subagent_model_profile,
         diff_output_max_chars=diff_output_max_chars,
     )
 
@@ -245,6 +251,22 @@ def resolve_model_profile(cwd: Path, system_config: SystemConfig | None = None) 
             "Use /model to choose a configured profile."
         )
     return profile
+
+
+def resolve_subagent_model_profile(
+    cwd: Path,
+    main_profile: ModelProfile | None = None,
+    system_config: SystemConfig | None = None,
+) -> ModelProfile:
+    config = system_config or load_system_config()
+    if config.subagent_model_profile:
+        profile = config.models.get(config.subagent_model_profile)
+        if profile is None:
+            raise ConfigError(
+                f"subagents.model_profile {config.subagent_model_profile!r} is not defined in models: {config.path}"
+            )
+        return profile
+    return main_profile or resolve_model_profile(cwd, config)
 
 
 def active_model_name(cwd: Path, system_config: SystemConfig | None = None) -> str:
@@ -359,6 +381,22 @@ def _parse_display_config(raw_display: object, config_path: Path) -> int:
         config_path,
         "display.diff_output_max_chars",
     )
+
+
+def _parse_subagent_config(raw_subagents: object, models: dict[str, ModelProfile], config_path: Path) -> str | None:
+    if raw_subagents is None:
+        return None
+    if not isinstance(raw_subagents, dict):
+        raise ConfigError(f"System config subagents must be an object: {config_path}")
+    raw_profile = raw_subagents.get("model_profile")
+    if raw_profile is None:
+        return None
+    profile = str(raw_profile).strip()
+    if not profile:
+        return None
+    if profile not in models:
+        raise ConfigError(f"subagents.model_profile {profile!r} is not defined in models: {config_path}")
+    return profile
 
 
 def _is_safe_mcp_name(value: str) -> bool:

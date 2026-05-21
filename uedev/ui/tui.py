@@ -19,6 +19,7 @@ from ..tools.shell import shell_name
 
 if TYPE_CHECKING:
     from ..runtime.agent import AgentOptions, AgentRuntime
+    from ..runtime.subagents import SubagentRecord
 
 
 class ChatTuiApplication:
@@ -41,6 +42,7 @@ class ChatTuiApplication:
         self.runtime.approval_provider = self.confirm_command
         self.messages = self._initial_messages()
         self.history = HistoryRecorder(self.runtime.agent_dir, self.messages)
+        self.current_subagent: "SubagentRecord | None" = None
 
     def run(self) -> None:
         from ..runtime.agent import create_chat_prompt_options, create_chat_session
@@ -77,11 +79,26 @@ class ChatTuiApplication:
                     self.load_history(selected)
                 continue
 
+            if query.lower() == "/subagents":
+                selected = self.prompt_subagent_selection(session)
+                if selected == "main":
+                    self.load_main_conversation()
+                elif selected is not None:
+                    self.load_subagent(selected)
+                continue
+
             if query.lower() == "/permissions":
                 selected = self.prompt_permission_mode(session)
                 if selected is None:
                     continue
                 query = selected
+
+            if self.current_subagent is not None and not query.startswith("/"):
+                self.renderer.print_system(
+                    f"Subagent {self.current_subagent.id} is {self.current_subagent.status} and closed. "
+                    "Use /subagents to switch back to the main conversation."
+                )
+                continue
 
             if self.runtime.handle_slash_command(query, emit=self.renderer.print_system, messages=self.messages):
                 continue
@@ -107,7 +124,11 @@ class ChatTuiApplication:
     def status_fragments(self):
         model = self._status_model_name()
         directory = str(self.options.cwd)
-        right = "Plan mode " if self.runtime.collaboration_mode == "plan" else ""
+        right = ""
+        if self.current_subagent is not None:
+            right = f"Viewing {self.current_subagent.id} "
+        elif self.runtime.collaboration_mode == "plan":
+            right = "Plan mode "
         left_length = len(model) + 3 + len(directory)
         right_length = len(right)
         width = self._terminal_width()
@@ -176,6 +197,36 @@ class ChatTuiApplication:
             self.renderer.print_system(f"Unknown history selection: {selected}")
         return entry
 
+    def prompt_subagent_selection(self, session: PromptSession):
+        from ..runtime.agent import create_chat_prompt_options
+
+        records = self.runtime.subagents.list_records()
+        labels = ["Main conversation", *[f"{index}. {record.label}" for index, record in enumerate(records, start=1)]]
+        by_label = {"Main conversation": "main"}
+        by_label.update({label: record for label, record in zip(labels[1:], records)})
+
+        def start_completion() -> None:
+            session.app.current_buffer.start_completion(select_first=True)
+
+        try:
+            prompt_options = create_chat_prompt_options()
+            prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+            selected = session.prompt(
+                [("class:prompt", "\nSubagents> ")],
+                completer=WordCompleter(labels, ignore_case=True, sentence=True),
+                pre_run=start_completion,
+                **prompt_options,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if not selected:
+            return None
+        choice = by_label.get(selected)
+        if choice is None:
+            self.renderer.print_system(f"Unknown subagent selection: {selected}")
+        return choice
+
     def load_history(self, entry: HistoryEntry) -> None:
         try:
             messages = ensure_system_prompt(load_history_file(entry.path), self.runtime.system_prompt)
@@ -184,7 +235,29 @@ class ChatTuiApplication:
             return
         self.messages = messages
         self.history.reset(self.messages)
+        self.current_subagent = None
         self.renderer.render_history(self.messages, str(entry.path))
+
+    def load_subagent(self, record: "SubagentRecord") -> None:
+        try:
+            messages = self.runtime.subagents.load_messages(record)
+        except HistoryError as error:
+            self.renderer.print_system(f"Failed to load subagent history: {error}")
+            return
+        self.current_subagent = record
+        self.renderer.render_history(messages, f"subagent {record.id}: {record.history_path}")
+
+    def load_main_conversation(self) -> None:
+        self.current_subagent = None
+        messages = self.messages
+        source = "main conversation"
+        if self.history.path is not None:
+            try:
+                messages = ensure_system_prompt(load_history_file(self.history.path), self.runtime.system_prompt)
+                source = str(self.history.path)
+            except HistoryError as error:
+                self.renderer.print_system(f"Failed to load main conversation history: {error}")
+        self.renderer.render_history(messages, source)
 
     def _status_model_name(self) -> str:
         try:

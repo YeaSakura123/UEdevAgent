@@ -31,6 +31,7 @@ from uedev.state.config import (
     load_project_config,
     load_system_config,
     resolve_model_profile,
+    resolve_subagent_model_profile,
     system_config_template,
 )
 from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
@@ -71,6 +72,7 @@ def write_system_config(
     models: dict[str, dict[str, object]] | None = None,
     ue_engines: dict[str, dict[str, object]] | None = None,
     display: dict[str, object] | None = None,
+    subagents: dict[str, object] | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "version": 1,
@@ -86,6 +88,8 @@ def write_system_config(
     }
     if display is not None:
         payload["display"] = display
+    if subagents is not None:
+        payload["subagents"] = subagents
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
         json.dumps(payload),
@@ -241,6 +245,78 @@ class ConfigTests(unittest.TestCase):
         template = system_config_template()
 
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
+
+    def test_subagent_model_profile_defaults_to_main_profile(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "child": {
+                        "model": "child-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                },
+            )
+            config = load_system_config(config_path)
+
+            profile = resolve_subagent_model_profile(root, config.models["child"], config)
+
+            self.assertEqual(profile.name, "child")
+            self.assertIsNone(config.subagent_model_profile)
+
+            write_system_config(config_path, subagents={"model_profile": ""})
+            config = load_system_config(config_path)
+
+            self.assertIsNone(config.subagent_model_profile)
+
+    def test_subagent_model_profile_can_reference_existing_profile(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "child": {
+                        "model": "child-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                },
+                subagents={"model_profile": "child"},
+            )
+            config = load_system_config(config_path)
+
+            profile = resolve_subagent_model_profile(root, config.models["main"], config)
+
+            self.assertEqual(config.subagent_model_profile, "child")
+            self.assertEqual(profile.name, "child")
+            self.assertEqual(profile.model, "child-model")
+
+    def test_invalid_subagent_model_profile_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(config_path, subagents={"model_profile": "missing"})
+
+            with self.assertRaisesRegex(ConfigError, "subagents.model_profile"):
+                load_system_config(config_path)
+
+    def test_system_config_template_includes_subagent_profile(self) -> None:
+        template = system_config_template()
+
+        self.assertIsNone(template["subagents"]["model_profile"])
 
     def test_project_permission_mode_defaults_and_persists(self) -> None:
         from uedev.state.config import save_project_permission_mode

@@ -43,7 +43,8 @@ def build_system_prompt(cwd: Path, shell: str, available_skills: str) -> str:
 def build_subagent_prompt() -> str:
     return (
         "You are a focused subagent with clean context. "
-        "Use native tool calls. Use only read_file, list_files, or shell unless asked to write."
+        "Use native tool calls. Stay within the assigned task, responsibility, and paths. "
+        "Return results for the main agent to integrate; do not answer the user directly."
     )
 
 
@@ -92,7 +93,7 @@ def _core_tools_section() -> str:
 - Shell execution: shell for foreground commands, background_run/background_check for longer commands.
 - Planning and progress: todo_update and todo_list for meaningful multi-step task tracking only; never use todo_update for acknowledgements or single-step status checks.
 - Skills and context: load_skill for on-demand local instructions, compact for conversation compaction.
-- Delegation: subagent for bounded child-agent work with fresh context.
+- Delegation: subagent for bounded child-agent work. Use agent_type, task, responsibility, paths, and inherit_context. Multiple subagent calls in one response run in parallel while the main agent waits; only use subagents for independent work. Worker subagents require responsibility and paths.
 - Persistent task graph: task_create, task_get, task_update, task_list, claim_task.
 - Team coordination: spawn_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, shutdown_response, plan_submit, plan_review, idle.
 - Worktree isolation: worktree_create, worktree_list, worktree_run, worktree_keep, worktree_remove.

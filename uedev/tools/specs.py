@@ -64,7 +64,19 @@ def get_tool_specs(extra_tools: list[ToolSpec] | None = None) -> list[ToolSpec]:
             ["items"],
         ),
         function_tool("todo_list", "Show the current lightweight todo list.", {}),
-        function_tool("subagent", "Run a bounded child agent with fresh context.", {"prompt": string, "agent_type": string}, ["prompt"]),
+        function_tool(
+            "subagent",
+            "Run a bounded child agent. Multiple subagent calls in one assistant response may run in parallel; the main agent waits for them before continuing.",
+            {
+                "agent_type": string,
+                "task": string,
+                "prompt": string,
+                "responsibility": string,
+                "paths": string_list,
+                "inherit_context": boolean,
+            },
+            ["task"],
+        ),
         function_tool("load_skill", "Load an on-demand local skill by name.", {"name": string}, ["name"]),
         function_tool("compact", "Compact the current conversation context.", {}),
         function_tool(

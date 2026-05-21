@@ -57,6 +57,7 @@ from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
 from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
+from uedev.runtime.subagents import SubagentRecord
 from uedev.ui.tui import ChatTuiApplication
 from uedev.tools.workspace import edit_file, read_file, write_file
 from uedev.tools.worktrees import WorktreeManager
@@ -218,6 +219,46 @@ class RendererTests(unittest.TestCase):
         self.assertIn("compact:\nConversation compacted.", transcript)
         self.assertIn("assistant:\ndone", transcript)
 
+
+class TuiSubagentSelectionTests(unittest.TestCase):
+    def test_prompt_subagent_selection_supports_main_and_subagent_choices(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+                record = SubagentRecord(
+                    id="sa_1_1",
+                    agent_type="explorer",
+                    task="inspect files",
+                    responsibility="",
+                    paths=[],
+                    inherit_context=False,
+                    status="complete",
+                    created_at=1.0,
+                    completed_at=2.0,
+                    history_path=str(root / ".agent" / "subagents" / "sa_1_1" / "history.jsonl"),
+                    model_profile="main",
+                    model="gpt-test",
+                    result="done",
+                )
+
+                with patch.object(runtime.subagents, "list_records", return_value=[record]):
+                    self.assertEqual(app.prompt_subagent_selection(_FakePromptSession("Main conversation")), "main")
+                    self.assertIs(app.prompt_subagent_selection(_FakePromptSession(f"1. {record.label}")), record)
+
+
 class TaskAndTeamTests(unittest.TestCase):
     def test_task_dependencies_clear_on_completion(self) -> None:
         with workspace_temp_dir() as temp:
@@ -265,3 +306,28 @@ class TaskAndTeamTests(unittest.TestCase):
         except Exception as error:
             return str(error)
         self.fail("expected callback to raise")
+
+
+class _FakePromptBuffer:
+    def __init__(self) -> None:
+        self.started_completion = False
+
+    def start_completion(self, select_first: bool = False) -> None:
+        self.started_completion = select_first
+
+
+class _FakePromptApp:
+    def __init__(self) -> None:
+        self.current_buffer = _FakePromptBuffer()
+
+
+class _FakePromptSession:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.app = _FakePromptApp()
+
+    def prompt(self, *_args, **kwargs) -> str:
+        pre_run = kwargs.get("pre_run")
+        if pre_run is not None:
+            pre_run()
+        return self.answer

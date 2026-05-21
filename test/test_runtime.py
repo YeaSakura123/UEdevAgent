@@ -3,6 +3,7 @@
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 import uuid
 from io import StringIO
@@ -64,6 +65,7 @@ def write_system_config(
     models: dict[str, dict[str, object]] | None = None,
     ue_engines: dict[str, dict[str, object]] | None = None,
     display: dict[str, object] | None = None,
+    subagents: dict[str, object] | None = None,
 ) -> None:
     payload: dict[str, object] = {
         "version": 1,
@@ -79,6 +81,8 @@ def write_system_config(
     }
     if display is not None:
         payload["display"] = display
+    if subagents is not None:
+        payload["subagents"] = subagents
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
         json.dumps(payload),
@@ -368,6 +372,26 @@ class AgentEventLoopTests(unittest.TestCase):
 
             self.assertTrue(runtime.handle_slash_command("/context now", emit=output.append, messages=[]))
             self.assertEqual(output[-1], "Usage: /context")
+
+    def test_subagents_slash_command_lists_only_from_bare_command(self) -> None:
+        with workspace_temp_dir() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/subagents", emit=output.append, messages=[]))
+            self.assertIn("Main conversation", output[-1])
+
+            self.assertTrue(runtime.handle_slash_command("/subagents main", emit=output.append, messages=[]))
+            self.assertEqual(output[-1], "Usage: /subagents")
 
     def test_diff_slash_command_renders_git_and_perforce_status(self) -> None:
         with workspace_temp_dir() as temp:
@@ -674,6 +698,250 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertIn("tool_error", [event.type for event in events])
             self.assertEqual(events[-1].type, "final")
             self.assertTrue(any(message.role == "tool" for message in messages))
+
+    def test_subagent_uses_configured_model_profile_and_records_history(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "child": {
+                        "model": "child-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                },
+                subagents={"model_profile": "child"},
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse(
+                    "",
+                    [
+                        ToolCall(
+                            id="call_1",
+                            name="subagent",
+                            arguments={"agent_type": "explorer", "task": "inspect files", "inherit_context": False},
+                        )
+                    ],
+                ),
+                ModelResponse("done"),
+            ]
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")) as child_call,
+            ):
+                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+
+            self.assertEqual(events[-1].type, "final")
+            child_profile = child_call.call_args.args[1]
+            self.assertEqual(child_profile.name, "child")
+            self.assertEqual(child_profile.model, "child-model")
+            records = runtime.subagents.list_records()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].status, "complete")
+            self.assertEqual(records[0].model_profile, "child")
+            self.assertEqual(records[0].model, "child-model")
+            metadata = json.loads(Path(records[0].metadata_path).read_text(encoding="utf-8"))
+            self.assertEqual(metadata["model_profile"], "child")
+            self.assertEqual(metadata["status"], "complete")
+            history_text = Path(records[0].history_path).read_text(encoding="utf-8")
+            self.assertIn("inspect files", history_text)
+            self.assertIn("child result", history_text)
+            self.assertIn("subagent_id:", "\n".join(message.content for message in messages if message.role == "tool"))
+
+    def test_subagent_defaults_to_main_active_profile(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    }
+                },
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=2,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="subagent", arguments={"task": "inspect"})]),
+                ModelResponse("done"),
+            ]
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")) as child_call,
+            ):
+                list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+
+            self.assertEqual(child_call.call_args.args[1].name, "main")
+            self.assertEqual(runtime.subagents.list_records()[0].model_profile, "main")
+
+    def test_multiple_subagent_tool_calls_run_as_one_parallel_batch(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse(
+                    "",
+                    [
+                        ToolCall(id="call_1", name="subagent", arguments={"agent_type": "explorer", "task": "inspect A"}),
+                        ToolCall(id="call_2", name="subagent", arguments={"agent_type": "explorer", "task": "inspect B"}),
+                    ],
+                ),
+                ModelResponse("done"),
+            ]
+            barrier = threading.Barrier(2)
+
+            def child_call(_messages, _profile, tools=None):
+                barrier.wait(timeout=2)
+                return ModelResponse("child complete")
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model", side_effect=child_call) as child_model,
+            ):
+                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+
+            self.assertEqual(events[-1].type, "final")
+            self.assertEqual(child_model.call_count, 2)
+            records = runtime.subagents.list_records()
+            self.assertEqual(len(records), 2)
+            self.assertEqual({record.status for record in records}, {"complete"})
+            tool_messages = [message for message in messages if message.role == "tool" and message.name == "subagent"]
+            self.assertEqual(len(tool_messages), 2)
+
+    def test_worker_subagent_requires_responsibility_and_paths(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="subagent", arguments={"agent_type": "worker", "task": "edit"})]),
+                ModelResponse("done"),
+            ]
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model") as child_model,
+            ):
+                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+
+            self.assertIn("tool_error", [event.type for event in events])
+            self.assertFalse(child_model.called)
+            self.assertIn("worker subagent requires responsibility", "\n".join(message.content for message in messages))
+
+    def test_subagent_inherit_context_passes_main_context_to_child(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "main": {
+                        "model": "main-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "child": {
+                        "model": "child-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "context_window": 100,
+                    },
+                },
+                subagents={"model_profile": "child"},
+            )
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [
+                ChatMessage(role="system", content=runtime.system_prompt),
+                ChatMessage(role="user", content="important prior context"),
+            ]
+            responses = [
+                ModelResponse(
+                    "",
+                    [ToolCall(id="call_1", name="subagent", arguments={"task": "inspect", "inherit_context": True})],
+                ),
+                ModelResponse("done"),
+            ]
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")) as child_call,
+            ):
+                list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+
+            child_messages = child_call.call_args.args[0]
+            rendered = "\n".join(message.content for message in child_messages)
+            self.assertIn("Main conversation context:", rendered)
+            self.assertIn("important prior context", rendered)
+            self.assertEqual(child_call.call_args.args[1].context_window, 100)
 
     def test_run_turn_events_rejects_acknowledgement_final_after_tool_result(self) -> None:
         with workspace_temp_dir() as temp:

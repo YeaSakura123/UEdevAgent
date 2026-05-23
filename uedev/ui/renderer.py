@@ -185,6 +185,12 @@ class TuiRenderer:
         self._record("user", message)
         self._print(_block("user", Text(message), style="bold cyan"))
 
+    def print_user_prompt(self, message: str) -> None:
+        self._record("user", message)
+        rendered = Text("> ", style="bold cyan")
+        rendered.append(message)
+        self._print(rendered)
+
     def print_system(self, message: str) -> None:
         self.add_system_message(message)
         self._record("system", message)
@@ -199,9 +205,12 @@ class TuiRenderer:
         self._record("approval", f"Reason: {reason}\nCommand: {command}")
         self._print(_block("approval required", body, style="bold yellow"))
 
-    def start_turn(self, turn_id: str, user_message: str) -> None:
+    def start_turn(self, turn_id: str, user_message: str, *, echo_user: bool = False) -> None:
         self.turns.append(TurnViewState(turn_id=turn_id, user_message=user_message))
-        self._record("user", user_message)
+        if echo_user:
+            self.print_user_prompt(user_message)
+        else:
+            self._record("user", user_message)
         self.running = True
 
     def add_system_message(self, message: str) -> None:
@@ -263,7 +272,7 @@ class TuiRenderer:
                     self._record("compact", content)
                     self._print(_block("system", Text(content), style="bold blue"))
                     continue
-                self.print_user(message.content)
+                self.print_user_prompt(message.content)
                 continue
             if message.role == "assistant":
                 if message.content.strip():
@@ -280,6 +289,19 @@ class TuiRenderer:
                 name = message.name or "tool"
                 self._record("tool_result", rendered)
                 self._print(self._tool_block(name, rendered, "green"))
+
+    def render_display_history(self, records: list[dict[str, object]], source: str) -> None:
+        self.clear()
+        self.print_system(f"Loaded history: {source}")
+        for record in records:
+            record_type = record.get("type")
+            if record_type == "turn_start":
+                self.start_turn(str(record.get("turn_id") or ""), str(record.get("message") or ""), echo_user=True)
+                continue
+            if record_type == "event":
+                raw_event = record.get("event")
+                if isinstance(raw_event, dict):
+                    self.render(_event_from_dict(raw_event))
 
     def status_text(self) -> str:
         return "uedev chat | running" if self.running else "uedev chat | ready"
@@ -392,3 +414,27 @@ def _compact_lines(value: str, max_chars: int) -> str:
 
 def _block(label: str, renderable: RenderableType, *, style: str) -> RenderableType:
     return Group(Text(label, style=style), renderable)
+
+
+def _event_from_dict(raw: dict[str, object]) -> AgentEvent:
+    return AgentEvent(
+        type=str(raw.get("type") or "stopped"),  # type: ignore[arg-type]
+        message=str(raw.get("message") or ""),
+        name=str(raw.get("name") or ""),
+        input=raw.get("input") if isinstance(raw.get("input"), dict) else {},
+        output=str(raw.get("output") or ""),
+        step=_int_value(raw.get("step")),
+        total=_int_value(raw.get("total")),
+        turn_id=str(raw.get("turn_id") or ""),
+        status=str(raw.get("status") or ""),
+        summary=str(raw.get("summary") or ""),
+        duration_ms=_int_value(raw.get("duration_ms")),
+        is_error=bool(raw.get("is_error", False)),
+    )
+
+
+def _int_value(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0

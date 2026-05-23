@@ -27,7 +27,8 @@ from uedev.tools.background import BackgroundManager
 from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
 from uedev.runtime.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.runtime.history import HistoryRecorder, load_history_file
+from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file
+from uedev.runtime.subagents import SubagentSpec
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
@@ -389,6 +390,8 @@ class AgentEventLoopTests(unittest.TestCase):
 
             self.assertTrue(runtime.handle_slash_command("/subagents", emit=output.append, messages=[]))
             self.assertIn("Main conversation", output[-1])
+            self.assertFalse((Path(temp) / ".agent" / "sessions").exists())
+            self.assertFalse((Path(temp) / ".agent" / "subagents").exists())
 
             self.assertTrue(runtime.handle_slash_command("/subagents main", emit=output.append, messages=[]))
             self.assertEqual(output[-1], "Usage: /subagents")
@@ -591,15 +594,18 @@ class AgentEventLoopTests(unittest.TestCase):
                 ChatMessage(role="system", content=runtime.system_prompt),
                 ChatMessage(role="user", content="old request"),
             ]
+            history = HistoryRecorder(agent_dir(root), messages)
             output: list[str] = []
 
             with patch("uedev.state.config.default_system_config_path", return_value=config_path):
                 with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("manual summary")) as mock_call:
-                    self.assertTrue(runtime.handle_slash_command("/compact", emit=output.append, messages=messages))
+                    self.assertTrue(runtime.handle_slash_command("/compact", emit=output.append, messages=messages, history=history))
 
             self.assertIn("Conversation compacted", output[-1])
             self.assertIn(SUMMARY_PREFIX, "\n".join(message.content for message in messages))
-            self.assertTrue(list((agent_dir(root) / "transcripts").glob("transcript_*.jsonl")))
+            self.assertEqual((history.transcript_path or Path()).name, "transcript.jsonl")
+            self.assertTrue((history.transcript_path or Path()).exists())
+            self.assertFalse((agent_dir(root) / "transcripts").exists())
             self.assertEqual(mock_call.call_count, 1)
             self.assertNotIn("tools", mock_call.call_args.kwargs)
 
@@ -619,20 +625,59 @@ class AgentEventLoopTests(unittest.TestCase):
                 )
             )
             messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
 
             with patch("uedev.state.config.default_system_config_path", return_value=config_path):
                 with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("previous answer")):
-                    events = list(runtime.run_turn_events(messages, "first task", turn_id="turn-test"))
+                    events = list(runtime.run_turn_events(messages, "first task", turn_id="turn-test", history=history))
                 self.assertEqual(events[-1].type, "final")
 
                 with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("manual summary")):
-                    self.assertTrue(runtime.handle_slash_command("/compact", emit=lambda _message: None, messages=messages))
+                    self.assertTrue(
+                        runtime.handle_slash_command(
+                            "/compact",
+                            emit=lambda _message: None,
+                            messages=messages,
+                            history=history,
+                        )
+                    )
 
-            transcript = max((agent_dir(root) / "transcripts").glob("transcript_*.jsonl"))
+            transcript = history.transcript_path or Path()
             transcript_text = transcript.read_text(encoding="utf-8")
 
             self.assertIn('"role": "assistant"', transcript_text)
             self.assertIn("previous answer", transcript_text)
+
+    def test_session_compact_overwrites_transcript(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt), ChatMessage(role="user", content="first")]
+            history = HistoryRecorder(agent_dir(root), messages)
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=[ModelResponse("summary one"), ModelResponse("summary two")]):
+                    self.assertTrue(runtime.handle_slash_command("/compact", emit=lambda _message: None, messages=messages, history=history))
+                    messages.append(ChatMessage(role="user", content="second"))
+                    self.assertTrue(runtime.handle_slash_command("/compact", emit=lambda _message: None, messages=messages, history=history))
+
+            transcript = history.transcript_path or Path()
+            transcript_text = transcript.read_text(encoding="utf-8")
+
+            self.assertEqual(transcript.name, "transcript.jsonl")
+            self.assertEqual(len(list((history.session_dir or Path()).glob("transcript*.jsonl"))), 1)
+            self.assertIn("second", transcript_text)
 
     def test_compact_tool_uses_model_summary_and_preserves_current_goal(self) -> None:
         with workspace_temp_dir() as temp:
@@ -730,6 +775,7 @@ class AgentEventLoopTests(unittest.TestCase):
                 )
             )
             messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
             responses = [
                 ModelResponse(
                     "",
@@ -749,13 +795,14 @@ class AgentEventLoopTests(unittest.TestCase):
                 patch("uedev.runtime.agent.call_model", side_effect=responses),
                 patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")) as child_call,
             ):
-                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test", history=history))
 
             self.assertEqual(events[-1].type, "final")
             child_profile = child_call.call_args.args[1]
             self.assertEqual(child_profile.name, "child")
             self.assertEqual(child_profile.model, "child-model")
-            records = runtime.subagents.list_records()
+            subagents_dir = (history.session_dir or Path()) / "subagents"
+            records = runtime.subagents.list_records(subagents_dir)
             self.assertEqual(len(records), 1)
             self.assertEqual(records[0].status, "complete")
             self.assertEqual(records[0].model_profile, "child")
@@ -763,9 +810,17 @@ class AgentEventLoopTests(unittest.TestCase):
             metadata = json.loads(Path(records[0].metadata_path).read_text(encoding="utf-8"))
             self.assertEqual(metadata["model_profile"], "child")
             self.assertEqual(metadata["status"], "complete")
+            self.assertIn("display_history_path", metadata)
+            self.assertEqual(metadata["parent_session_id"], (history.session_dir or Path()).name)
+            self.assertEqual(Path(records[0].history_path).name, "messages.jsonl")
+            self.assertTrue(Path(records[0].history_path).is_relative_to(subagents_dir))
+            self.assertFalse((agent_dir(root) / "subagents").exists())
             history_text = Path(records[0].history_path).read_text(encoding="utf-8")
             self.assertIn("inspect files", history_text)
             self.assertIn("child result", history_text)
+            display_records = load_display_history(Path(records[0].display_history_path))
+            self.assertEqual(display_records[0]["type"], "turn_start")
+            self.assertEqual([record["event"]["type"] for record in display_records if record["type"] == "event"], ["thinking", "final"])
             self.assertIn("subagent_id:", "\n".join(message.content for message in messages if message.role == "tool"))
 
     def test_subagent_defaults_to_main_active_profile(self) -> None:
@@ -793,6 +848,7 @@ class AgentEventLoopTests(unittest.TestCase):
                 )
             )
             messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
             responses = [
                 ModelResponse("", [ToolCall(id="call_1", name="subagent", arguments={"task": "inspect"})]),
                 ModelResponse("done"),
@@ -803,10 +859,51 @@ class AgentEventLoopTests(unittest.TestCase):
                 patch("uedev.runtime.agent.call_model", side_effect=responses),
                 patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")) as child_call,
             ):
-                list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+                list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test", history=history))
 
             self.assertEqual(child_call.call_args.args[1].name, "main")
-            self.assertEqual(runtime.subagents.list_records()[0].model_profile, "main")
+            self.assertEqual(runtime.subagents.list_records((history.session_dir or Path()) / "subagents")[0].model_profile, "main")
+
+    def test_subagent_display_history_records_tool_errors(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="subagent", arguments={"agent_type": "explorer", "task": "inspect"})]),
+                ModelResponse("done"),
+            ]
+            child_responses = [
+                ModelResponse("", [ToolCall(id="child_call_1", name="write_file", arguments={"path": "x.txt", "content": "x"})]),
+                ModelResponse("child done"),
+            ]
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model", side_effect=child_responses),
+            ):
+                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test", history=history))
+
+            self.assertEqual(events[-1].type, "final")
+            record = runtime.subagents.list_records((history.session_dir or Path()) / "subagents")[0]
+            display_records = load_display_history(Path(record.display_history_path))
+            event_types = [item["event"]["type"] for item in display_records if item["type"] == "event"]
+
+            self.assertIn("tool_start", event_types)
+            self.assertIn("tool_error", event_types)
 
     def test_multiple_subagent_tool_calls_run_as_one_parallel_batch(self) -> None:
         with workspace_temp_dir() as temp:
@@ -824,6 +921,7 @@ class AgentEventLoopTests(unittest.TestCase):
                 )
             )
             messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
             responses = [
                 ModelResponse(
                     "",
@@ -845,15 +943,95 @@ class AgentEventLoopTests(unittest.TestCase):
                 patch("uedev.runtime.agent.call_model", side_effect=responses),
                 patch("uedev.runtime.subagents.call_model", side_effect=child_call) as child_model,
             ):
-                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test"))
+                events = list(runtime.run_turn_events(messages, "delegate", turn_id="turn-test", history=history))
 
             self.assertEqual(events[-1].type, "final")
             self.assertEqual(child_model.call_count, 2)
-            records = runtime.subagents.list_records()
+            records = runtime.subagents.list_records((history.session_dir or Path()) / "subagents")
             self.assertEqual(len(records), 2)
             self.assertEqual({record.status for record in records}, {"complete"})
             tool_messages = [message for message in messages if message.role == "tool" and message.name == "subagent"]
             self.assertEqual(len(tool_messages), 2)
+
+    def test_subagents_are_scoped_to_parent_session(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=2,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            first_messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            second_messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            first_history = HistoryRecorder(agent_dir(root), first_messages)
+            second_history = HistoryRecorder(agent_dir(root), second_messages)
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="subagent", arguments={"task": "inspect first"})]),
+                ModelResponse("first done"),
+                ModelResponse("", [ToolCall(id="call_2", name="subagent", arguments={"task": "inspect second"})]),
+                ModelResponse("second done"),
+            ]
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.agent.call_model", side_effect=responses),
+                patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")),
+            ):
+                list(runtime.run_turn_events(first_messages, "delegate first", turn_id="turn-first", history=first_history))
+                list(runtime.run_turn_events(second_messages, "delegate second", turn_id="turn-second", history=second_history))
+
+            first_records = runtime.subagents.list_records((first_history.session_dir or Path()) / "subagents")
+            second_records = runtime.subagents.list_records((second_history.session_dir or Path()) / "subagents")
+
+            self.assertEqual(len(first_records), 1)
+            self.assertEqual(len(second_records), 1)
+            self.assertIn("inspect first", first_records[0].task)
+            self.assertIn("inspect second", second_records[0].task)
+
+    def test_subagent_id_collision_retries_with_next_counter(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=2,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            history = HistoryRecorder(agent_dir(root), [ChatMessage(role="system", content=runtime.system_prompt)])
+            subagents_dir = history.ensure_session() / "subagents"
+            (subagents_dir / "sa_123_1_deadbeef").mkdir(parents=True)
+
+            class FixedUuid:
+                hex = "deadbeefcafebabe"
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.runtime.subagents.time.time_ns", return_value=123),
+                patch("uedev.runtime.subagents.uuid4", return_value=FixedUuid()),
+                patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")),
+            ):
+                results = runtime.subagents.run_batch(
+                    [SubagentSpec(agent_type="explorer", task="inspect collision")],
+                    [],
+                    subagents_dir,
+                )
+
+            self.assertEqual(results[0].record.id, "sa_123_2_deadbeef")
+            self.assertTrue((subagents_dir / "sa_123_2_deadbeef").exists())
+            self.assertEqual(runtime.subagents.list_records(subagents_dir)[0].id, "sa_123_2_deadbeef")
 
     def test_worker_subagent_requires_responsibility_and_paths(self) -> None:
         with workspace_temp_dir() as temp:

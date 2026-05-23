@@ -83,6 +83,7 @@ from ..ui.events import (
 from .history import (
     HistoryError,
     HistoryRecorder,
+    create_standalone_session_transcript_path,
     ensure_system_prompt,
     list_history_entries,
     load_history_file,
@@ -708,7 +709,7 @@ def run_plain_chat(options: AgentOptions) -> None:
                 history.reset(messages)
             continue
 
-        if runtime.handle_slash_command(query, messages=messages):
+        if runtime.handle_slash_command(query, messages=messages, history=history):
             continue
 
         for event in runtime.run_turn_events(messages, goal=query, history=history):
@@ -801,6 +802,7 @@ class AgentRuntime:
         rounds_without_todo = 0
         current_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
         started_at = time.perf_counter()
+        standalone_subagents_dir: Path | None = None
         tool_names_this_turn: list[str] = []
         goal_message = ChatMessage(role="user", content=goal)
         goal_already_appended = bool(messages and messages[-1].role == "user" and messages[-1].content == goal)
@@ -809,7 +811,11 @@ class AgentRuntime:
         context_threshold = self._context_threshold()
         if estimate_tokens([*messages, goal_message]) > context_threshold:
             try:
-                transcript = self._compact_messages(messages, "automatic threshold before user turn")
+                transcript = self._compact_messages(
+                    messages,
+                    "automatic threshold before user turn",
+                    transcript_path=history.ensure_transcript_path() if history is not None else None,
+                )
             except Exception as error:
                 yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
                 return
@@ -826,7 +832,12 @@ class AgentRuntime:
             self._inject_runtime_observations(messages)
             if estimate_tokens(messages) > context_threshold:
                 try:
-                    transcript = self._compact_messages(messages, "automatic threshold during turn", preserve_last_user=True)
+                    transcript = self._compact_messages(
+                        messages,
+                        "automatic threshold during turn",
+                        preserve_last_user=True,
+                        transcript_path=history.ensure_transcript_path() if history is not None else None,
+                    )
                 except Exception as error:
                     yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
                     return
@@ -865,7 +876,14 @@ class AgentRuntime:
                             yield tool_start_event(action.name, action.input, current_turn_id)
                 if subagent_specs:
                     try:
-                        results = self.subagents.run_batch([spec for _, spec in subagent_specs], list(messages))
+                        if history is not None:
+                            subagents_dir = history.ensure_session() / "subagents"
+                        else:
+                            if standalone_subagents_dir is None:
+                                standalone_history = HistoryRecorder(self.agent_dir, list(messages))
+                                standalone_subagents_dir = standalone_history.ensure_session() / "subagents"
+                            subagents_dir = standalone_subagents_dir
+                        results = self.subagents.run_batch([spec for _, spec in subagent_specs], list(messages), subagents_dir)
                         for (tool_call_id, _), result in zip(subagent_specs, results):
                             subagent_outputs[tool_call_id] = (result.output, result.record.status == "failed")
                     except Exception as error:
@@ -909,7 +927,12 @@ class AgentRuntime:
 
                     if action.name == "compact":
                         try:
-                            transcript = self._compact_messages(messages, "manual compact tool", preserve_last_user=True)
+                            transcript = self._compact_messages(
+                                messages,
+                                "manual compact tool",
+                                preserve_last_user=True,
+                                transcript_path=history.ensure_transcript_path() if history is not None else None,
+                            )
                         except Exception as error:
                             yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
                             return
@@ -975,6 +998,7 @@ class AgentRuntime:
         query: str,
         emit: Callable[[str], None] = print,
         messages: list[ChatMessage] | None = None,
+        history: HistoryRecorder | None = None,
     ) -> bool:
         if not query.startswith("/"):
             return False
@@ -1021,7 +1045,8 @@ class AgentRuntime:
             emit("Use /history inside chat to choose and load a previous conversation.")
             return True
         if command == "/subagents":
-            emit(self.subagents.render_list())
+            subagents_dir = history.session_dir / "subagents" if history is not None and history.session_dir is not None else None
+            emit(self.subagents.render_list(subagents_dir))
             return True
         if raw_command.split(maxsplit=1)[0].lower() == "/subagents":
             emit("Usage: /subagents")
@@ -1061,7 +1086,11 @@ class AgentRuntime:
                 emit("Use /compact inside chat to compact the current conversation context.")
                 return True
             try:
-                transcript = self._compact_messages(messages, "manual slash command")
+                transcript = self._compact_messages(
+                    messages,
+                    "manual slash command",
+                    transcript_path=history.ensure_transcript_path() if history is not None else None,
+                )
             except Exception as error:
                 emit(f"Conversation compact failed: {error}")
                 return True
@@ -1097,9 +1126,18 @@ class AgentRuntime:
         self.permission_mode = mode
         return f"Permission mode set to {permission_mode_label(mode)} for this chat session."
 
-    def _compact_messages(self, messages: list[ChatMessage], reason: str, preserve_last_user: bool = False) -> Path:
+    def _compact_messages(
+        self,
+        messages: list[ChatMessage],
+        reason: str,
+        preserve_last_user: bool = False,
+        transcript_path: Path | None = None,
+    ) -> Path:
         original_messages = list(messages)
-        transcript = save_transcript(original_messages, self.agent_dir / "transcripts")
+        transcript = save_transcript(
+            original_messages,
+            transcript_path or create_standalone_session_transcript_path(self.agent_dir, original_messages),
+        )
         working_messages = list(original_messages)
         micro_compact(working_messages)
         repair_tool_call_messages(working_messages)
@@ -1322,7 +1360,8 @@ class AgentRuntime:
         # 内部函数：处理 subagent 工具调用，启动受限子 agent 完成子任务。
         def subagent_tool(tool_input: dict[str, object]) -> str:
             spec = parse_subagent_spec(tool_input)
-            return self.subagents.run_batch([spec], [])[0].output
+            standalone_history = HistoryRecorder(self.agent_dir, [ChatMessage(role="system", content=self.system_prompt)])
+            return self.subagents.run_batch([spec], [], standalone_history.ensure_session() / "subagents")[0].output
 
         handlers: dict[str, ToolHandler] = {
             "shell": shell_tool,

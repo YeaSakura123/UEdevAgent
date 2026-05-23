@@ -7,12 +7,27 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
+from uuid import uuid4
 
 from ..llm.client import ChatMessage, ToolCall, call_model
 from ..state.config import ModelProfile
 from ..tools.specs import get_tool_specs
+from ..ui.events import (
+    final_event,
+    stopped_event,
+    thinking_event,
+    tool_error_event,
+    tool_result_event,
+    tool_start_event,
+)
 from .context import estimate_tokens, is_runtime_state_message, repair_tool_call_messages
-from .history import append_history_message, load_history_file, write_history_messages
+from .history import (
+    append_display_event,
+    append_display_turn_start,
+    append_history_message,
+    load_history_file,
+    write_history_messages,
+)
 
 
 SubagentType = Literal["explorer", "worker", "default"]
@@ -43,7 +58,9 @@ class SubagentRecord:
     history_path: str
     model_profile: str
     model: str
+    display_history_path: str = ""
     metadata_path: str = ""
+    parent_session_id: str = ""
     result: str = ""
     error: str = ""
 
@@ -85,8 +102,6 @@ class SubagentManager:
         model_profile_provider: Callable[[], ModelProfile],
     ):
         self.agent_dir = agent_dir
-        self.subagents_dir = agent_dir / "subagents"
-        self.index_path = self.subagents_dir / "index.jsonl"
         self.max_steps = max_steps
         self.execute_tool = execute_tool
         self.model_profile_provider = model_profile_provider
@@ -104,35 +119,51 @@ class SubagentManager:
             if not spec.paths:
                 raise ValueError("worker subagent requires paths")
 
-    def run_batch(self, specs: list[SubagentSpec], main_messages: list[ChatMessage]) -> list[SubagentResult]:
+    def run_batch(
+        self,
+        specs: list[SubagentSpec],
+        main_messages: list[ChatMessage],
+        subagents_dir: Path,
+    ) -> list[SubagentResult]:
         if not specs:
             return []
         for spec in specs:
             self.validate_spec(spec)
         with ThreadPoolExecutor(max_workers=len(specs), thread_name_prefix="uedev-subagent") as executor:
-            futures = [executor.submit(self.run_one, spec, main_messages) for spec in specs]
+            futures = [executor.submit(self.run_one, spec, main_messages, subagents_dir) for spec in specs]
             return [future.result() for future in futures]
 
-    def run_one(self, spec: SubagentSpec, main_messages: list[ChatMessage]) -> SubagentResult:
+    def run_one(self, spec: SubagentSpec, main_messages: list[ChatMessage], subagents_dir: Path) -> SubagentResult:
         self.validate_spec(spec)
         profile = self.model_profile_provider()
-        record = self._new_record(spec, profile)
-        self._append_index(record)
+        record = self._new_record(spec, profile, subagents_dir)
+        self._append_index(record, subagents_dir)
 
         child_messages = self._build_initial_messages(spec, main_messages, profile)
         write_history_messages(Path(record.history_path), child_messages)
+        display_path = Path(record.display_history_path)
+        turn_id = record.id
+        append_display_turn_start(display_path, turn_id, _subagent_task_message(spec))
         allowed_tools = _allowed_tools(spec.agent_type)
         subagent_tools = [tool for tool in get_tool_specs() if str(tool["function"]["name"]) in allowed_tools]
 
+        started_at = time.perf_counter()
+        total_steps = min(6, self.max_steps)
         try:
-            for _ in range(min(6, self.max_steps)):
+            for step in range(1, total_steps + 1):
+                append_display_event(display_path, thinking_event(step, total_steps, turn_id))
                 response = call_model(child_messages, profile, tools=subagent_tools)
                 if response.tool_calls:
                     assistant = ChatMessage(role="assistant", content=response.content, tool_calls=response.tool_calls)
                     child_messages.append(assistant)
                     append_history_message(Path(record.history_path), assistant)
                     for tool_call in response.tool_calls:
-                        output = self._execute_subagent_tool(tool_call, allowed_tools)
+                        append_display_event(display_path, tool_start_event(tool_call.name, tool_call.arguments, turn_id))
+                        output, is_error = self._execute_subagent_tool(tool_call, allowed_tools)
+                        if is_error:
+                            append_display_event(display_path, tool_error_event(tool_call.name, output, turn_id))
+                        else:
+                            append_display_event(display_path, tool_result_event(tool_call.name, output, turn_id))
                         tool_message = ChatMessage(
                             role="tool",
                             content=f"Tool result for: {tool_call.name}\n{_truncate(output)}",
@@ -149,26 +180,32 @@ class SubagentManager:
                 record.status = "complete"
                 record.result = response.content.strip()
                 record.completed_at = time.time()
-                self._append_index(record)
+                self._append_index(record, subagents_dir)
+                append_display_event(display_path, final_event(response.content.strip(), turn_id, _duration_ms(started_at)))
                 return SubagentResult(record)
 
             record.status = "failed"
             record.error = "Subagent stopped after bounded steps."
             record.completed_at = time.time()
-            self._append_index(record)
+            self._append_index(record, subagents_dir)
+            append_display_event(display_path, stopped_event(record.error, turn_id, _duration_ms(started_at)))
             return SubagentResult(record)
         except Exception as error:
             record.status = "failed"
             record.error = str(error)
             record.completed_at = time.time()
-            self._append_index(record)
+            self._append_index(record, subagents_dir)
+            append_display_event(display_path, stopped_event(record.error, turn_id, _duration_ms(started_at)))
             return SubagentResult(record)
 
-    def list_records(self) -> list[SubagentRecord]:
-        if not self.index_path.exists():
+    def list_records(self, subagents_dir: Path | None) -> list[SubagentRecord]:
+        if subagents_dir is None:
+            return []
+        index_path = subagents_dir / "index.jsonl"
+        if not index_path.exists():
             return []
         records: dict[str, SubagentRecord] = {}
-        for line in self.index_path.read_text(encoding="utf-8").splitlines():
+        for line in index_path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             try:
@@ -183,19 +220,27 @@ class SubagentManager:
     def load_messages(self, record: SubagentRecord) -> list[ChatMessage]:
         return load_history_file(Path(record.history_path))
 
-    def render_list(self) -> str:
-        records = self.list_records()
+    def render_list(self, subagents_dir: Path | None) -> str:
+        records = self.list_records(subagents_dir)
         if not records:
             return "Main conversation\nNo subagents."
         return "\n".join(["Main conversation", *[record.label for record in records]])
 
-    def _new_record(self, spec: SubagentSpec, profile: ModelProfile) -> SubagentRecord:
-        with self._lock:
-            self._counter += 1
-            subagent_id = f"sa_{time.time_ns()}_{self._counter}"
-        subagent_dir = self.subagents_dir / subagent_id
+    def _new_record(self, spec: SubagentSpec, profile: ModelProfile, subagents_dir: Path) -> SubagentRecord:
+        subagents_dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            with self._lock:
+                self._counter += 1
+                subagent_id = f"sa_{time.time_ns()}_{self._counter}_{uuid4().hex[:8]}"
+            subagent_dir = subagents_dir / subagent_id
+            try:
+                subagent_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            break
         metadata_path = subagent_dir / "metadata.json"
-        history_path = subagent_dir / "history.jsonl"
+        history_path = subagent_dir / "messages.jsonl"
+        display_history_path = subagent_dir / "display.jsonl"
         return SubagentRecord(
             id=subagent_id,
             agent_type=spec.agent_type,
@@ -208,6 +253,8 @@ class SubagentManager:
             completed_at=None,
             metadata_path=str(metadata_path),
             history_path=str(history_path),
+            display_history_path=str(display_history_path),
+            parent_session_id=subagents_dir.parent.name,
             model_profile=profile.name,
             model=profile.model,
         )
@@ -227,19 +274,21 @@ class SubagentManager:
         repair_tool_call_messages(messages)
         return messages
 
-    def _execute_subagent_tool(self, tool_call: ToolCall, allowed_tools: set[str]) -> str:
+    def _execute_subagent_tool(self, tool_call: ToolCall, allowed_tools: set[str]) -> tuple[str, bool]:
         if tool_call.name not in allowed_tools:
-            return f"Subagent tool not allowed: {tool_call.name}"
-        return self.execute_tool(tool_call.name, tool_call.arguments)
+            return f"Subagent tool not allowed: {tool_call.name}", True
+        output = self.execute_tool(tool_call.name, tool_call.arguments)
+        return output, output.startswith(f"Tool {tool_call.name} failed:")
 
-    def _append_index(self, record: SubagentRecord) -> None:
-        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+    def _append_index(self, record: SubagentRecord, subagents_dir: Path) -> None:
+        index_path = subagents_dir / "index.jsonl"
+        index_path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             if record.metadata_path:
                 metadata_path = Path(record.metadata_path)
                 metadata_path.parent.mkdir(parents=True, exist_ok=True)
                 metadata_path.write_text(json.dumps(asdict(record), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            with self.index_path.open("a", encoding="utf-8") as handle:
+            with index_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(asdict(record), ensure_ascii=False) + "\n")
 
 
@@ -346,6 +395,8 @@ def _record_from_dict(raw: Any) -> SubagentRecord | None:
             completed_at=float(raw["completed_at"]) if raw.get("completed_at") is not None else None,
             metadata_path=str(raw.get("metadata_path") or ""),
             history_path=str(raw.get("history_path") or ""),
+            display_history_path=str(raw.get("display_history_path") or ""),
+            parent_session_id=str(raw.get("parent_session_id") or ""),
             model_profile=str(raw.get("model_profile") or ""),
             model=str(raw.get("model") or ""),
             result=str(raw.get("result") or ""),
@@ -365,3 +416,7 @@ def _truncate(value: str, max_length: int = 12000) -> str:
     if len(value) <= max_length:
         return value
     return f"{value[:max_length]}\n...[truncated {len(value) - max_length} chars]"
+
+
+def _duration_ms(started_at: float) -> int:
+    return max(0, int((time.perf_counter() - started_at) * 1000))

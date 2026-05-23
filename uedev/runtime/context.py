@@ -80,9 +80,13 @@ def repair_tool_call_messages(messages: list[ChatMessage]) -> None:
         index += 1
 
 
-def save_transcript(messages: list[ChatMessage], transcript_dir: Path) -> Path:
-    transcript_dir.mkdir(parents=True, exist_ok=True)
-    path = transcript_dir / f"transcript_{time.time_ns()}.jsonl"
+def save_transcript(messages: list[ChatMessage], transcript_target: Path) -> Path:
+    if transcript_target.suffix == ".jsonl":
+        path = transcript_target
+        path.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        transcript_target.mkdir(parents=True, exist_ok=True)
+        path = transcript_target / f"transcript_{time.time_ns()}.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         for message in messages:
             handle.write(json.dumps(asdict(message), ensure_ascii=False) + "\n")

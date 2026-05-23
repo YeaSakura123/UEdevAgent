@@ -52,6 +52,7 @@ from uedev.runtime.prompts import (
     build_tool_confirmation_reminder,
 )
 from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.runtime.history import load_display_history
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
@@ -219,6 +220,31 @@ class RendererTests(unittest.TestCase):
         self.assertIn("compact:\nConversation compacted.", transcript)
         self.assertIn("assistant:\ndone", transcript)
 
+    def test_tui_renderer_replays_display_history(self) -> None:
+        stream = StringIO()
+        renderer = TuiRenderer("banner", verbose=True, stream=stream)
+        records = [
+            {"type": "turn_start", "turn_id": "turn-1", "message": "run shell"},
+            {"type": "event", "event": thinking_event(1, 3, "turn-1").__dict__},
+            {"type": "event", "event": tool_start_event("shell", {"command": "Write-Output hi"}, "turn-1").__dict__},
+            {"type": "event", "event": tool_result_event("shell", "command: Write-Output hi\nexitCode: 0", "turn-1").__dict__},
+            {"type": "event", "event": final_event("done", "turn-1", duration_ms=2000).__dict__},
+        ]
+
+        renderer.render_display_history(records, "display")
+
+        transcript = renderer.render_text()
+        rendered = stream.getvalue()
+
+        self.assertIn("user:\nrun shell", transcript)
+        self.assertIn("thinking:\nThinking... (1/3)", transcript)
+        self.assertIn("tool_start:\nRunning shell", transcript)
+        self.assertIn("tool_result:\nOK shell", transcript)
+        self.assertIn("summary:\nWorked for 2s | 1 tool used", transcript)
+        self.assertIn("assistant:\ndone", transcript)
+        self.assertIn("> run shell", rendered)
+        self.assertIn("tool: shell", rendered)
+
 
 class TuiSubagentSelectionTests(unittest.TestCase):
     def test_prompt_subagent_selection_supports_main_and_subagent_choices(self) -> None:
@@ -248,7 +274,18 @@ class TuiSubagentSelectionTests(unittest.TestCase):
                     status="complete",
                     created_at=1.0,
                     completed_at=2.0,
-                    history_path=str(root / ".agent" / "subagents" / "sa_1_1" / "history.jsonl"),
+                    history_path=str(
+                        root
+                        / ".agent"
+                        / "sessions"
+                        / "2026"
+                        / "05"
+                        / "24"
+                        / "session_test"
+                        / "subagents"
+                        / "sa_1_1"
+                        / "messages.jsonl"
+                    ),
                     model_profile="main",
                     model="gpt-test",
                     result="done",
@@ -257,6 +294,80 @@ class TuiSubagentSelectionTests(unittest.TestCase):
                 with patch.object(runtime.subagents, "list_records", return_value=[record]):
                     self.assertEqual(app.prompt_subagent_selection(_FakePromptSession("Main conversation")), "main")
                     self.assertIs(app.prompt_subagent_selection(_FakePromptSession(f"1. {record.label}")), record)
+
+    def test_prompt_subagent_selection_without_session_does_not_create_history(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                self.assertIsNone(app.prompt_subagent_selection(_FakePromptSession("unused")))
+
+            self.assertIn("No subagents.", app.renderer.render_text())
+            self.assertFalse((root / ".agent" / "sessions").exists())
+
+
+class TuiHistoryRecordingTests(unittest.TestCase):
+    def test_run_turn_records_display_history(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=True,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=True, stream=StringIO())
+
+                with patch("uedev.runtime.agent.call_model", return_value=ModelResponse("done")):
+                    app._run_turn("remember this")
+
+            records = load_display_history(app.history.display_path or Path())
+
+            self.assertEqual(records[0]["type"], "turn_start")
+            self.assertEqual(records[0]["message"], "remember this")
+            self.assertEqual([record["event"]["type"] for record in records if record["type"] == "event"], ["thinking", "final"])
+
+    def test_slash_command_output_does_not_create_display_history(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                self.assertTrue(runtime.handle_slash_command("/context", emit=app.renderer.print_system, messages=app.messages))
+
+            self.assertIsNone(app.history.display_path)
 
 
 class TaskAndTeamTests(unittest.TestCase):

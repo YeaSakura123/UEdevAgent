@@ -142,8 +142,9 @@ omitting it produces a dry-run command preview.
 - `chat` shows per-turn thinking/tool events while running, then renders a
   collapsed process summary before the final answer.
 - `chat` supports slash commands such as `/help`, `/context`, `/diff`, `/todos`,
-  `/history`, `/model`, `/plan`, `/permissions`, `/compact`, and `/ue doctor`;
-  type `/` to autocomplete commands with descriptions.
+  `/tasks`, `/team`, `/inbox`, `/history`, `/subagents`, `/model`, `/mcp`,
+  `/plan`, `/permissions`, `/compact`, `/clear`, and `/ue doctor`; type `/` to
+  autocomplete commands with descriptions.
 - `/context` shows the current estimated model-context usage, configured context
   window, auto compact threshold, and remaining capacity.
 - `/diff` shows a human-readable Git status/diff summary and Perforce workspace
@@ -158,11 +159,15 @@ omitting it produces a dry-run command preview.
   `/permissions <mode>` switches the current chat session between `read-only`,
   `default`, `auto-review`, and `full-access`.
 - `/compact` summarizes and rewrites the model context while keeping the visible
-  chat transcript intact.
+  chat transcript intact. The full pre-compact transcript is written to the
+  current session's `transcript.jsonl`; later compactions in the same session
+  overwrite that file.
 - `/history` lists previous conversations for the current project and lets an
   interactive TUI user choose one with the arrow keys; plain chat falls back to
-  a numbered list. It loads `.agent/history/session_*.jsonl`; compact snapshots
-  in `.agent/transcripts/` are not shown as conversation history.
+  a numbered list. History is loaded from `.agent/sessions/YYYY/MM/DD/<session>/`.
+- `/subagents` lists child-agent conversations created by the current main
+  session. Subagents are scoped to that session and are not shared across other
+  restored conversations.
 - `chat` keeps an in-session input history that can be browsed with the arrow keys.
 - `chat --plain` keeps the script-friendly text renderer for pipes, non-TTY
   sessions, and automation.
@@ -175,6 +180,14 @@ omitting it produces a dry-run command preview.
 - Internal iteration and tool diagnostics are hidden unless `--verbose` is enabled.
 - If a filesystem task is answered without using a tool call, the CLI asks
   the model to call the appropriate tool instead.
+- Conversations are stored in `.agent/sessions/YYYY/MM/DD/<session_id>/`.
+  `messages.jsonl` is the model context, `display.jsonl` is the full replayable
+  UI transcript, `metadata.json` stores session metadata, and `transcript.jsonl`
+  stores the latest compact source transcript.
+- Session subagents are stored below
+  `.agent/sessions/YYYY/MM/DD/<session_id>/subagents/`, with one `index.jsonl`
+  plus one directory per subagent containing `messages.jsonl`, `display.jsonl`,
+  and `metadata.json`.
 - Todos are stored in `.agent/todos.json`.
 - Persistent tasks are stored in `.agent/tasks/`.
 - Team state is stored in `.agent/team/`.

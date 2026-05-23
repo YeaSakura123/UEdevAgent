@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from prompt_toolkit import PromptSession
@@ -11,7 +12,15 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.base import Output
 
 from ..state.config import ConfigError
-from ..runtime.history import HistoryEntry, HistoryError, HistoryRecorder, ensure_system_prompt, list_history_entries, load_history_file
+from ..runtime.history import (
+    HistoryEntry,
+    HistoryError,
+    HistoryRecorder,
+    ensure_system_prompt,
+    list_history_entries,
+    load_display_history,
+    load_history_file,
+)
 from uedev.ui.events import stopped_event
 from ..llm.client import ChatMessage
 from uedev.ui.renderer import TuiRenderer
@@ -100,7 +109,7 @@ class ChatTuiApplication:
                 )
                 continue
 
-            if self.runtime.handle_slash_command(query, emit=self.renderer.print_system, messages=self.messages):
+            if self.runtime.handle_slash_command(query, emit=self.renderer.print_system, messages=self.messages, history=self.history):
                 continue
 
             self._run_turn(query)
@@ -200,7 +209,11 @@ class ChatTuiApplication:
     def prompt_subagent_selection(self, session: PromptSession):
         from ..runtime.agent import create_chat_prompt_options
 
-        records = self.runtime.subagents.list_records()
+        subagents_dir = self.history.session_dir / "subagents" if self.history.session_dir is not None else None
+        records = self.runtime.subagents.list_records(subagents_dir)
+        if not records:
+            self.renderer.print_system(self.runtime.subagents.render_list(subagents_dir))
+            return None
         labels = ["Main conversation", *[f"{index}. {record.label}" for index, record in enumerate(records, start=1)]]
         by_label = {"Main conversation": "main"}
         by_label.update({label: record for label, record in zip(labels[1:], records)})
@@ -233,10 +246,14 @@ class ChatTuiApplication:
         except HistoryError as error:
             self.renderer.print_system(f"Failed to load history: {error}")
             return
+        display_records = self._load_display_records(entry.display_path)
         self.messages = messages
-        self.history.reset(self.messages)
+        self.history.resume(entry, self.messages)
         self.current_subagent = None
-        self.renderer.render_history(self.messages, str(entry.path))
+        if display_records:
+            self.renderer.render_display_history(display_records, str(entry.path))
+        else:
+            self.renderer.render_history(self.messages, str(entry.path))
 
     def load_subagent(self, record: "SubagentRecord") -> None:
         try:
@@ -244,20 +261,40 @@ class ChatTuiApplication:
         except HistoryError as error:
             self.renderer.print_system(f"Failed to load subagent history: {error}")
             return
+        display_path = getattr(record, "display_history_path", "") or ""
+        display_records = self._load_display_records(Path(display_path) if display_path else None)
         self.current_subagent = record
-        self.renderer.render_history(messages, f"subagent {record.id}: {record.history_path}")
+        source = f"subagent {record.id}: {record.history_path}"
+        if display_records:
+            self.renderer.render_display_history(display_records, source)
+        else:
+            self.renderer.render_history(messages, source)
 
     def load_main_conversation(self) -> None:
         self.current_subagent = None
         messages = self.messages
         source = "main conversation"
+        display_records = self.history.initial_display_records
         if self.history.path is not None:
             try:
                 messages = ensure_system_prompt(load_history_file(self.history.path), self.runtime.system_prompt)
                 source = str(self.history.path)
+                display_records = self._load_display_records(self.history.display_path)
             except HistoryError as error:
                 self.renderer.print_system(f"Failed to load main conversation history: {error}")
-        self.renderer.render_history(messages, source)
+        if display_records:
+            self.renderer.render_display_history(display_records, source)
+        else:
+            self.renderer.render_history(messages, source)
+
+    def _load_display_records(self, path: Path | None) -> list[dict[str, object]]:
+        if path is None or not path.exists():
+            return []
+        try:
+            return load_display_history(path)
+        except HistoryError as error:
+            self.renderer.print_system(f"Failed to load display history: {error}")
+            return []
 
     def _status_model_name(self) -> str:
         try:
@@ -299,8 +336,12 @@ class ChatTuiApplication:
     def _run_turn(self, goal: str) -> None:
         turn_id = f"turn-{uuid.uuid4().hex[:8]}"
         self.renderer.start_turn(turn_id, goal)
+        self.history.record_turn_start(turn_id, goal)
         try:
             for event in self.runtime.run_turn_events(self.messages, goal=goal, turn_id=turn_id, history=self.history):
                 self.renderer.render(event)
+                self.history.record_event(event)
         except Exception as error:
-            self.renderer.render(stopped_event(f"Error: {error}", turn_id=turn_id))
+            event = stopped_event(f"Error: {error}", turn_id=turn_id)
+            self.renderer.render(event)
+            self.history.record_event(event)

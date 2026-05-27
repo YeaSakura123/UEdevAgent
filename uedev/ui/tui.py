@@ -11,7 +11,7 @@ from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.base import Output
 
-from ..state.config import ConfigError
+from ..state.config import ConfigError, load_system_config
 from ..runtime.history import (
     HistoryEntry,
     HistoryError,
@@ -94,6 +94,12 @@ class ChatTuiApplication:
                     self.load_main_conversation()
                 elif selected is not None:
                     self.load_subagent(selected)
+                continue
+
+            if query.lower() == "/worktree":
+                name = self.prompt_worktree_name(session)
+                if name is not None:
+                    self.create_ue_linked_worktree(name)
                 continue
 
             if query.lower() == "/permissions":
@@ -239,6 +245,27 @@ class ChatTuiApplication:
         if choice is None:
             self.renderer.print_system(f"Unknown subagent selection: {selected}")
         return choice
+
+    def prompt_worktree_name(self, session: PromptSession) -> str | None:
+        from ..runtime.agent import create_chat_prompt_options
+
+        try:
+            prompt_options = create_chat_prompt_options()
+            prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+            selected = session.prompt([("class:prompt", "\nWorktree name> ")], **prompt_options).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        return selected or None
+
+    def create_ue_linked_worktree(self, name: str) -> None:
+        try:
+            default_root = load_system_config().worktree_default_root
+            session_dir = self.history.ensure_session()
+            result = self.runtime.worktrees.create_ue_git_linked(name, default_root=default_root, session_dir=session_dir)
+        except Exception as error:
+            self.renderer.print_system(f"Failed to create UE linked worktree: {error}")
+            return
+        self.renderer.print_system(result)
 
     def load_history(self, entry: HistoryEntry) -> None:
         try:

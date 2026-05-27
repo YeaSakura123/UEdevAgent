@@ -142,7 +142,7 @@ omitting it produces a dry-run command preview.
 - `chat` shows per-turn thinking/tool events while running, then renders a
   collapsed process summary before the final answer.
 - `chat` supports slash commands such as `/help`, `/context`, `/diff`, `/todos`,
-  `/tasks`, `/team`, `/inbox`, `/history`, `/subagents`, `/model`, `/mcp`,
+  `/tasks`, `/team`, `/inbox`, `/history`, `/subagents`, `/worktree`, `/model`, `/mcp`,
   `/plan`, `/permissions`, `/compact`, `/clear`, and `/ue doctor`; type `/` to
   autocomplete commands with descriptions.
 - `/context` shows the current estimated model-context usage, configured context
@@ -168,6 +168,14 @@ omitting it produces a dry-run command preview.
 - `/subagents` lists child-agent conversations created by the current main
   session. Subagents are scoped to that session and are not shared across other
   restored conversations.
+- `/worktree` prompts for a name, creates a Git branch with the same name using
+  `git worktree add`, links `Content/` back to the source UE project, and copies
+  only the current `.agent` chat session plus project config into the new project.
+  By default it writes to
+  `<project-parent>/.uedev-worktrees/<project-name>/<worktree-name>`; set
+  `worktrees.default_root` in `~/.uedev/config.json` to override the root. The
+  linked `Content/` is shared, so asset edits in the worktree modify the original
+  project assets.
 - `chat` keeps an in-session input history that can be browsed with the arrow keys.
 - `chat --plain` keeps the script-friendly text renderer for pipes, non-TTY
   sessions, and automation.

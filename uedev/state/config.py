@@ -15,6 +15,7 @@ SYSTEM_CONFIG_DIR = ".uedev"
 CONFIG_FILE = "config.json"
 DEFAULT_CONTEXT_WINDOW = 256 * 1024
 DEFAULT_DIFF_OUTPUT_MAX_CHARS = 20000
+DEFAULT_WORKTREE_ROOT = ""
 
 
 class ConfigError(RuntimeError):
@@ -54,6 +55,7 @@ class SystemConfig:
     mcp_servers: dict[str, McpServerConfig]
     subagent_model_profile: str | None = None
     diff_output_max_chars: int = DEFAULT_DIFF_OUTPUT_MAX_CHARS
+    worktree_default_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +97,9 @@ def system_config_template() -> dict[str, Any]:
         },
         "display": {
             "diff_output_max_chars": DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+        },
+        "worktrees": {
+            "default_root": DEFAULT_WORKTREE_ROOT,
         },
         "subagents": {
             "model_profile": None,
@@ -183,6 +188,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
 
     mcp_servers = _parse_mcp_servers(data.get("mcp", {}), config_path)
     diff_output_max_chars = _parse_display_config(data.get("display", {}), config_path)
+    worktree_default_root = _parse_worktree_config(data.get("worktrees", {}), config_path)
     subagent_model_profile = _parse_subagent_config(data.get("subagents", {}), models, config_path)
 
     return SystemConfig(
@@ -193,6 +199,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
         mcp_servers=mcp_servers,
         subagent_model_profile=subagent_model_profile,
         diff_output_max_chars=diff_output_max_chars,
+        worktree_default_root=worktree_default_root,
     )
 
 
@@ -381,6 +388,22 @@ def _parse_display_config(raw_display: object, config_path: Path) -> int:
         config_path,
         "display.diff_output_max_chars",
     )
+
+
+def _parse_worktree_config(raw_worktrees: object, config_path: Path) -> Path | None:
+    if raw_worktrees is None:
+        return None
+    if not isinstance(raw_worktrees, dict):
+        raise ConfigError(f"System config worktrees must be an object: {config_path}")
+    raw_default = raw_worktrees.get("default_root", DEFAULT_WORKTREE_ROOT)
+    if raw_default is None:
+        return None
+    if not isinstance(raw_default, str):
+        raise ConfigError(f"worktrees.default_root must be a string: {config_path}")
+    value = raw_default.strip()
+    if not value:
+        return None
+    return Path(value).expanduser().resolve()
 
 
 def _parse_subagent_config(raw_subagents: object, models: dict[str, ModelProfile], config_path: Path) -> str | None:

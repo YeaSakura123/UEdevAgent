@@ -25,6 +25,7 @@ from uedev.tools.background import BackgroundManager
 from uedev.state.config import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+    DEFAULT_WORKTREE_ROOT,
     ConfigError,
     agent_dir,
     format_model_profiles,
@@ -72,6 +73,7 @@ def write_system_config(
     models: dict[str, dict[str, object]] | None = None,
     ue_engines: dict[str, dict[str, object]] | None = None,
     display: dict[str, object] | None = None,
+    worktrees: dict[str, object] | None = None,
     subagents: dict[str, object] | None = None,
 ) -> None:
     payload: dict[str, object] = {
@@ -88,6 +90,8 @@ def write_system_config(
     }
     if display is not None:
         payload["display"] = display
+    if worktrees is not None:
+        payload["worktrees"] = worktrees
     if subagents is not None:
         payload["subagents"] = subagents
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +249,32 @@ class ConfigTests(unittest.TestCase):
         template = system_config_template()
 
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
+
+    def test_worktree_default_root_defaults_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+
+            self.assertIsNone(load_system_config(config_path).worktree_default_root)
+
+            configured = root / "worktrees"
+            write_system_config(config_path, worktrees={"default_root": str(configured)})
+
+            self.assertEqual(load_system_config(config_path).worktree_default_root, configured.resolve())
+
+    def test_invalid_worktree_default_root_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(config_path, worktrees={"default_root": 123})
+
+            with self.assertRaisesRegex(ConfigError, "worktrees.default_root"):
+                load_system_config(config_path)
+
+    def test_system_config_template_includes_worktree_default_root(self) -> None:
+        template = system_config_template()
+
+        self.assertEqual(template["worktrees"]["default_root"], DEFAULT_WORKTREE_ROOT)
 
     def test_subagent_model_profile_defaults_to_main_profile(self) -> None:
         with workspace_temp_dir() as temp:

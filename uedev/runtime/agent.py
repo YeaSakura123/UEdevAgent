@@ -161,6 +161,7 @@ SLASH_COMMANDS = [
     ("/inbox", "Show pending messages for the lead agent."),
     ("/history", "Load a previous conversation from this project."),
     ("/subagents", "Choose a subagent conversation to view."),
+    ("/worktree", "Create a UE Git linked worktree from the current project."),
     ("/model", "List or switch model profiles for this project."),
     ("/mcp", "Show configured MCP server status and tools."),
     ("/plan", "Enter, leave, or inspect Plan Mode."),
@@ -1050,6 +1051,12 @@ class AgentRuntime:
             return True
         if raw_command.split(maxsplit=1)[0].lower() == "/subagents":
             emit("Usage: /subagents")
+            return True
+        if command == "/worktree":
+            emit("Use /worktree in interactive chat to create a UE Git linked worktree.")
+            return True
+        if raw_command.split(maxsplit=1)[0].lower() == "/worktree":
+            emit("Usage: /worktree")
             return True
         if command == "/model":
             try:

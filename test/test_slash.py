@@ -33,6 +33,7 @@ from uedev.state.config import ConfigError, agent_dir, load_project_config, load
 from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.runtime.history import HistoryRecorder, load_history_file
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
@@ -110,6 +111,7 @@ class SlashCommandTests(unittest.TestCase):
         self.assertIn("Show current conversation context usage.", help_text)
         self.assertIn("/diff", help_text)
         self.assertIn("Show Git and Perforce workspace changes.", help_text)
+        self.assertIn("/worktree", help_text)
         self.assertIn("/model", help_text)
         self.assertIn("/plan", help_text)
         self.assertIn("/permissions", help_text)
@@ -279,6 +281,26 @@ class SlashCommandTests(unittest.TestCase):
 
             self.assertEqual(runtime.collaboration_mode, "default")
             self.assertIn("Unknown slash command", output[-1])
+
+    def test_worktree_slash_command_requires_interactive_chat(self) -> None:
+        with workspace_temp_dir() as temp:
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=Path(temp),
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            output: list[str] = []
+
+            self.assertTrue(runtime.handle_slash_command("/worktree", emit=output.append))
+            self.assertEqual(output[-1], "Use /worktree in interactive chat to create a UE Git linked worktree.")
+
+            self.assertTrue(runtime.handle_slash_command("/worktree name", emit=output.append))
+            self.assertEqual(output[-1], "Usage: /worktree")
 
     def test_permissions_slash_command_switches_session_mode(self) -> None:
         with workspace_temp_dir() as temp:
@@ -563,6 +585,204 @@ class WorktreeTests(unittest.TestCase):
             manager = WorktreeManager(root, state_dir / "worktrees", tasks)
 
             self.assertIn("No managed", manager.list_all())
+
+    def test_create_ue_git_linked_worktree_branches_links_content_and_copies_current_agent_session(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            project = root / "UEAgentDemo"
+            (project / "Source").mkdir(parents=True)
+            (project / "Config").mkdir()
+            (project / "Content").mkdir()
+            (project / "UEAgentDemo.uproject").write_text("{}", encoding="utf-8")
+            (project / "Source" / "Game.cpp").write_text("// code", encoding="utf-8")
+            (project / "Config" / "DefaultEngine.ini").write_text("[Engine]", encoding="utf-8")
+            (project / "Content" / "Map.umap").write_text("asset", encoding="utf-8")
+
+            state_dir = agent_dir(project)
+            state_dir.mkdir(parents=True)
+            (state_dir / "config.json").write_text('{"active_model": "main"}', encoding="utf-8")
+            (state_dir / "worktrees").mkdir()
+            (state_dir / "tasks").mkdir()
+            (state_dir / "team").mkdir()
+            (state_dir / "sessions" / "2000" / "01" / "01" / "session_old").mkdir(parents=True)
+            history = HistoryRecorder(
+                state_dir,
+                [
+                    ChatMessage(role="system", content="old system"),
+                    ChatMessage(role="user", content=f"Working directory: {project}\nShell: PowerShell"),
+                    ChatMessage(role="user", content="continue this session"),
+                ],
+            )
+            session_dir = history.ensure_session()
+            manager = WorktreeManager(project, state_dir / "worktrees", TaskManager(state_dir / "tasks"))
+            default_root = root / ".uedev-worktrees"
+
+            def fake_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+                if args == ["rev-parse", "--show-toplevel"]:
+                    return subprocess.CompletedProcess(["git", *args], 0, str(project), "")
+                if args[:2] == ["check-ref-format", "--branch"]:
+                    return subprocess.CompletedProcess(["git", *args], 0, args[-1], "")
+                if args[:3] == ["show-ref", "--verify", "--quiet"]:
+                    return subprocess.CompletedProcess(["git", *args], 1, "", "")
+                if args[:2] == ["status", "--porcelain"]:
+                    return subprocess.CompletedProcess(["git", *args], 0, "", "")
+                if args[:2] == ["ls-files", "--"]:
+                    return subprocess.CompletedProcess(["git", *args], 0, "", "")
+                if args[:4] == ["worktree", "add", "-b", "login-test"]:
+                    target = Path(args[4])
+                    target.mkdir(parents=True)
+                    (target / "Source").mkdir()
+                    (target / "Config").mkdir()
+                    (target / "UEAgentDemo.uproject").write_text("{}", encoding="utf-8")
+                    (target / "Source" / "Game.cpp").write_text("// code", encoding="utf-8")
+                    (target / "Config" / "DefaultEngine.ini").write_text("[Engine]", encoding="utf-8")
+                    return subprocess.CompletedProcess(["git", *args], 0, "", "")
+                if args == ["rev-parse", "--git-path", "info/exclude"]:
+                    return subprocess.CompletedProcess(["git", *args], 0, str(Path(cwd) / ".git" / "info" / "exclude"), "")
+                raise AssertionError(f"unexpected git command: {args}")
+
+            with (
+                patch("uedev.tools.worktrees.os.name", "nt"),
+                patch("uedev.tools.worktrees._run_git", side_effect=fake_git),
+                patch("uedev.tools.worktrees._create_junction") as create_junction,
+            ):
+                output = manager.create_ue_git_linked("login-test", default_root=default_root, session_dir=session_dir)
+
+            target = default_root / "UEAgentDemo" / "login-test"
+            self.assertIn("Created UE linked worktree: login-test", output)
+            self.assertIn("Branch: login-test", output)
+            self.assertTrue((target / "UEAgentDemo.uproject").is_file())
+            self.assertTrue((target / "Source" / "Game.cpp").is_file())
+            self.assertTrue((target / "Config" / "DefaultEngine.ini").is_file())
+            create_junction.assert_called_once_with(target.resolve() / "Content", (project / "Content").resolve())
+            self.assertIn(".agent/", (target / ".git" / "info" / "exclude").read_text(encoding="utf-8"))
+            self.assertIn("Content/", (target / ".git" / "info" / "exclude").read_text(encoding="utf-8"))
+
+            target_agent = target / ".agent"
+            target_session = target_agent / session_dir.relative_to(state_dir)
+            self.assertTrue((target_agent / "config.json").is_file())
+            self.assertTrue(target_session.is_dir())
+            self.assertFalse((target_agent / "sessions" / "2000").exists())
+            self.assertFalse((target_agent / "worktrees").exists())
+            self.assertFalse((target_agent / "tasks").exists())
+            self.assertFalse((target_agent / "team").exists())
+            loaded = load_history_file(target_session / "messages.jsonl")
+            self.assertIn(str(target.resolve()), loaded[0].content)
+            self.assertEqual(loaded[1].content, f"Working directory: {target.resolve()}\nShell: PowerShell")
+
+            index = json.loads((state_dir / "worktrees" / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["login-test"]["kind"], "ue-linked-worktree")
+            self.assertEqual(index["login-test"]["mode"], "git-worktree-p4-content")
+            self.assertEqual(index["login-test"]["branch"], "login-test")
+            self.assertEqual(index["login-test"]["content_source"], str((project / "Content").resolve()))
+            self.assertEqual(index["login-test"]["agent_session_source"], str(session_dir))
+            self.assertEqual(index["login-test"]["agent_session_target"], str(target_session))
+            self.assertIn("Content is shared", index["login-test"]["warnings"][0])
+            listing = manager.list_all()
+            self.assertIn("kind=ue-linked-worktree", listing)
+            self.assertIn("mode=git-worktree-p4-content", listing)
+            self.assertIn("branch=login-test", listing)
+
+    def test_create_ue_linked_worktree_requires_content_and_windows(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            project = root / "UEAgentDemo"
+            (project / "Source").mkdir(parents=True)
+            (project / "Config").mkdir()
+            (project / "UEAgentDemo.uproject").write_text("{}", encoding="utf-8")
+            state_dir = agent_dir(project)
+            manager = WorktreeManager(project, state_dir / "worktrees", TaskManager(state_dir / "tasks"))
+
+            with patch("uedev.tools.worktrees.os.name", "nt"):
+                with self.assertRaisesRegex(RuntimeError, "Content directory"):
+                    manager.create_ue_git_linked("missing-content", default_root=root / ".uedev-worktrees")
+
+            self.assertFalse((state_dir / "worktrees" / "index.json").exists())
+
+            (project / "Content").mkdir()
+            with patch("uedev.tools.worktrees.os.name", "posix"):
+                with self.assertRaisesRegex(RuntimeError, "Windows junctions only"):
+                    manager.create_ue_git_linked("not-windows", default_root=root / ".uedev-worktrees")
+
+            with self.assertRaisesRegex(RuntimeError, "not implemented"):
+                manager.create_ue_git_linked("p4-full", default_root=root / ".uedev-worktrees", mode="p4-full")
+
+    def test_create_ue_git_linked_worktree_requires_clean_text_and_untracked_content(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            project = root / "UEAgentDemo"
+            (project / "Source").mkdir(parents=True)
+            (project / "Config").mkdir()
+            (project / "Content").mkdir()
+            (project / "UEAgentDemo.uproject").write_text("{}", encoding="utf-8")
+            state_dir = agent_dir(project)
+            manager = WorktreeManager(project, state_dir / "worktrees", TaskManager(state_dir / "tasks"))
+
+            def run_case(status_stdout: str, ls_stdout: str, expected: str) -> None:
+                def fake_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+                    if args == ["rev-parse", "--show-toplevel"]:
+                        return subprocess.CompletedProcess(["git", *args], 0, str(project), "")
+                    if args[:2] == ["check-ref-format", "--branch"]:
+                        return subprocess.CompletedProcess(["git", *args], 0, args[-1], "")
+                    if args[:3] == ["show-ref", "--verify", "--quiet"]:
+                        return subprocess.CompletedProcess(["git", *args], 1, "", "")
+                    if args[:2] == ["status", "--porcelain"]:
+                        return subprocess.CompletedProcess(["git", *args], 0, status_stdout, "")
+                    if args[:2] == ["ls-files", "--"]:
+                        return subprocess.CompletedProcess(["git", *args], 0, ls_stdout, "")
+                    raise AssertionError(f"unexpected git command: {args}")
+
+                with patch("uedev.tools.worktrees._run_git", side_effect=fake_git):
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        manager.create_ue_git_linked("login-test", default_root=root / ".uedev-worktrees")
+
+            with patch("uedev.tools.worktrees.os.name", "nt"):
+                run_case(" M Source/Game.cpp\n", "", "uncommitted changes")
+                run_case("", "Content/Map.umap\n", "tracked by Git")
+
+            self.assertFalse((state_dir / "worktrees" / "index.json").exists())
+
+    def test_remove_ue_git_linked_worktree_removes_worktree_but_keeps_branch(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            source = root / "UEAgentDemo"
+            target = root / ".uedev-worktrees" / "UEAgentDemo" / "login-test"
+            target.mkdir(parents=True)
+            (target / ".agent").mkdir()
+            (target / ".agent" / "config.json").write_text("{}", encoding="utf-8")
+            state_dir = agent_dir(source)
+            manager = WorktreeManager(source, state_dir / "worktrees", TaskManager(state_dir / "tasks"))
+            manager._save_index(
+                {
+                    "login-test": {
+                        "kind": "ue-linked-worktree",
+                        "mode": "git-worktree-p4-content",
+                        "name": "login-test",
+                        "branch": "login-test",
+                        "path": str(target),
+                        "source_repo_path": str(source),
+                        "worktree_repo_path": str(target),
+                        "worktree_project_path": str(target),
+                        "content_link": str(target / "Content"),
+                        "status": "active",
+                    }
+                }
+            )
+
+            def fake_git(cwd: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+                self.assertEqual(args, ["worktree", "remove", str(target)])
+                return subprocess.CompletedProcess(["git", *args], 0, "", "")
+
+            with (
+                patch("uedev.tools.worktrees._run_git", side_effect=fake_git),
+                patch("uedev.tools.worktrees._remove_junction") as remove_junction,
+            ):
+                output = manager.remove("login-test")
+
+            remove_junction.assert_called_once_with(target / "Content", missing_ok=True)
+            self.assertFalse((target / ".agent").exists())
+            self.assertIn("Branch login-test was not deleted", output)
+            self.assertEqual(manager.list_all(), "No managed worktrees.")
 
 
 if __name__ == "__main__":

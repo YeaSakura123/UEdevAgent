@@ -319,6 +319,51 @@ class TuiSubagentSelectionTests(unittest.TestCase):
             self.assertFalse((root / ".agent" / "sessions").exists())
 
 
+class TuiWorktreeTests(unittest.TestCase):
+    def test_prompt_worktree_name_returns_typed_name(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+
+                self.assertEqual(app.prompt_worktree_name(_FakePromptSession("ai-refactor")), "ai-refactor")
+
+    def test_create_ue_linked_worktree_prints_result(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                with patch.object(runtime.worktrees, "create_ue_git_linked", return_value="created") as create:
+                    app.create_ue_linked_worktree("ai-refactor")
+
+                create.assert_called_once_with("ai-refactor", default_root=None, session_dir=app.history.session_dir)
+                self.assertIn("created", app.renderer.render_text())
+
+
 class TuiHistoryRecordingTests(unittest.TestCase):
     def test_run_turn_records_display_history(self) -> None:
         with workspace_temp_dir() as temp:

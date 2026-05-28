@@ -29,6 +29,7 @@ class ModelProfile:
     base_url: str
     api_key: str
     context_window: int = DEFAULT_CONTEXT_WINDOW
+    requires_reasoning_content: bool = False
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,7 @@ def system_config_template() -> dict[str, Any]:
                 "base_url": "https://your.api.com/v1",
                 "api_key": "",
                 "context_window": DEFAULT_CONTEXT_WINDOW,
+                "requires_reasoning_content": False,
             }
         },
         "ue": {
@@ -156,6 +158,12 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
             base_url=str(raw.get("base_url") or "https://your.api.com/v1"),
             api_key=str(raw.get("api_key") or "").strip(),
             context_window=_optional_positive_int(raw.get("context_window"), DEFAULT_CONTEXT_WINDOW, config_path, f"models.{name}.context_window"),
+            requires_reasoning_content=_optional_bool(
+                raw.get("requires_reasoning_content"),
+                False,
+                config_path,
+                f"models.{name}.requires_reasoning_content",
+            ),
         )
         models[name] = profile
 
@@ -296,7 +304,9 @@ def format_model_profiles(cwd: Path, system_config: SystemConfig | None = None) 
         key_state = "set" if profile.api_key else "missing"
         lines.append(
             f"- {name}{suffix}: {profile.model or '(missing model)'} "
-            f"context_window={profile.context_window} api_key={key_state} base_url={profile.base_url}"
+            f"context_window={profile.context_window} "
+            f"requires_reasoning_content={profile.requires_reasoning_content} "
+            f"api_key={key_state} base_url={profile.base_url}"
         )
     return "\n".join(lines)
 
@@ -329,6 +339,14 @@ def _optional_positive_int(value: object, default: int, path: Path, label: str) 
     if parsed <= 0:
         raise ConfigError(f"{label} must be a positive integer: {path}")
     return parsed
+
+
+def _optional_bool(value: object, default: bool, path: Path, label: str) -> bool:
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise ConfigError(f"{label} must be a boolean: {path}")
+    return value
 
 
 def _parse_mcp_servers(raw_mcp: object, config_path: Path) -> dict[str, McpServerConfig]:

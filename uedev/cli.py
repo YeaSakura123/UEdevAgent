@@ -22,7 +22,7 @@ from .runtime.agent import AgentOptions, run_agent, run_chat
 from .tools.shell import shell_name
 from .state.tasks import TaskManager, TodoManager
 from .state.team import MessageBus, TeamManager
-from .ue import discover_ue, render_doctor, render_run_result, run_ue_python
+from .ue import discover_ue, render_build_result, render_doctor, render_run_result, run_ue_build, run_ue_python
 from .tools.worktrees import WorktreeManager
 
 
@@ -83,6 +83,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ue_doctor = ue_subparsers.add_parser("doctor", help="find .uproject and Unreal Editor executables")
     ue_doctor.add_argument("--cwd", default=str(Path.cwd()), help="UE project or workspace directory")
+
+    ue_build = ue_subparsers.add_parser("build", help="compile the UE Editor target with Build.bat")
+    ue_build.add_argument("--cwd", default=str(Path.cwd()), help="UE project or workspace directory")
+    ue_build.add_argument("--timeout", type=int, default=1800, help="UE build timeout in seconds")
 
     ue_run = ue_subparsers.add_parser("run-python", help="prepare or execute a UE Python script")
     ue_run.add_argument("script", help="path to a Python script to run inside UE")
@@ -221,6 +225,10 @@ def handle_ue(args: argparse.Namespace) -> None:
     state_dir = agent_dir(cwd)
     if args.ue_command == "doctor":
         print(render_doctor(discover_ue(cwd)))
+        return
+
+    if args.ue_command == "build":
+        print(render_build_result(run_ue_build(cwd, state_dir, timeout_seconds=args.timeout)))
         return
 
     if args.ue_command == "run-python":

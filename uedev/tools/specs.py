@@ -134,6 +134,11 @@ def get_tool_specs(extra_tools: list[ToolSpec] | None = None) -> list[ToolSpec]:
             {"script": string, "script_path": string, "mode": string, "cwd": string},
         ),
         function_tool(
+            "ue_build",
+            "Compile the current Unreal Engine project's Editor target with the configured engine Build.bat. This fixed v1 build runs <ProjectName>Editor Win64 Development, captures UBT/UHT/MSVC output, and returns diagnostics for fixing compile errors. Optional cwd points at a UE project or workspace directory.",
+            {"cwd": string, "timeout_seconds": integer},
+        ),
+        function_tool(
             "ue_stop_executor",
             "Queue a stop request for the full_editor UE executor in the given cwd. Use only when the user wants the editor-side executor to stop polling.",
             {"cwd": string},

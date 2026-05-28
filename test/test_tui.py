@@ -64,7 +64,7 @@ from uedev.tools.workspace import edit_file, read_file, write_file
 from uedev.tools.worktrees import WorktreeManager
 
 
-def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+def write_system_config(config_path: Path, *, models: dict[str, dict[str, object]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
         json.dumps(
@@ -364,6 +364,91 @@ class TuiWorktreeTests(unittest.TestCase):
                 self.assertIn("created", app.renderer.render_text())
 
 
+class TuiModelSelectionTests(unittest.TestCase):
+    def test_prompt_model_selection_returns_profile_or_reset(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "main-key",
+                    },
+                    "gpt-alt": {
+                        "model": "gpt-alt-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "alt-key",
+                        "requires_reasoning_content": True,
+                    },
+                },
+            )
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                selected = app.prompt_model_selection(_FakePromptSession("gpt-alt - gpt-alt-model (reasoning)"))
+                self.assertEqual(selected, "gpt-alt")
+                if selected is not None:
+                    runtime.switch_model(selected)
+                self.assertEqual(load_project_config(root).active_model, "gpt-alt")
+
+                selected = app.prompt_model_selection(_FakePromptSession("Reset to default (fast)"))
+                self.assertEqual(selected, "reset")
+                if selected is not None:
+                    runtime.switch_model(selected)
+                self.assertIsNone(load_project_config(root).active_model)
+
+    def test_model_slash_with_argument_in_tui_does_not_switch_directly(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "main-key",
+                    },
+                    "gpt-alt": {
+                        "model": "gpt-alt-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "alt-key",
+                    },
+                },
+            )
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                with patch("uedev.runtime.agent.create_chat_session", return_value=_SequencePromptSession(["/model gpt-alt", "exit"])):
+                    app.run()
+
+            self.assertIsNone(load_project_config(root).active_model)
+            self.assertIn("Use /model and choose a profile with the arrow keys.", app.renderer.render_text())
+
+
 class TuiHistoryRecordingTests(unittest.TestCase):
     def test_run_turn_records_display_history(self) -> None:
         with workspace_temp_dir() as temp:
@@ -487,3 +572,14 @@ class _FakePromptSession:
         if pre_run is not None:
             pre_run()
         return self.answer
+
+
+class _SequencePromptSession:
+    def __init__(self, answers: list[str]) -> None:
+        self.answers = list(answers)
+        self.app = _FakePromptApp()
+
+    def prompt(self, *_args, **kwargs) -> str:
+        if not self.answers:
+            return "exit"
+        return self.answers.pop(0)

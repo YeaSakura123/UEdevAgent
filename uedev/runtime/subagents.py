@@ -152,9 +152,15 @@ class SubagentManager:
         try:
             for step in range(1, total_steps + 1):
                 append_display_event(display_path, thinking_event(step, total_steps, turn_id))
+                repair_tool_call_messages(child_messages, require_reasoning_content=profile.requires_reasoning_content)
                 response = call_model(child_messages, profile, tools=subagent_tools)
                 if response.tool_calls:
-                    assistant = ChatMessage(role="assistant", content=response.content, tool_calls=response.tool_calls)
+                    assistant = ChatMessage(
+                        role="assistant",
+                        content=response.content,
+                        tool_calls=response.tool_calls,
+                        reasoning_content=response.reasoning_content,
+                    )
                     child_messages.append(assistant)
                     append_history_message(Path(record.history_path), assistant)
                     for tool_call in response.tool_calls:
@@ -174,7 +180,7 @@ class SubagentManager:
                         append_history_message(Path(record.history_path), tool_message)
                     continue
 
-                final = ChatMessage(role="assistant", content=response.content)
+                final = ChatMessage(role="assistant", content=response.content, reasoning_content=response.reasoning_content)
                 child_messages.append(final)
                 append_history_message(Path(record.history_path), final)
                 record.status = "complete"
@@ -271,7 +277,7 @@ class SubagentManager:
             if inherited:
                 messages.append(ChatMessage(role="user", content=f"Main conversation context:\n{inherited}"))
         messages.append(ChatMessage(role="user", content=_subagent_task_message(spec)))
-        repair_tool_call_messages(messages)
+        repair_tool_call_messages(messages, require_reasoning_content=profile.requires_reasoning_content)
         return messages
 
     def _execute_subagent_tool(self, tool_call: ToolCall, allowed_tools: set[str]) -> tuple[str, bool]:

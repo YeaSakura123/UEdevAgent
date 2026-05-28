@@ -306,8 +306,31 @@ def ensure_system_prompt(messages: list[ChatMessage], system_prompt: str) -> lis
     return [ChatMessage(role="system", content=system_prompt), *messages]
 
 
+def message_to_dict(message: ChatMessage) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "role": message.role,
+        "content": message.content,
+    }
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": tool_call.id,
+                "name": tool_call.name,
+                "arguments": tool_call.arguments,
+            }
+            for tool_call in message.tool_calls
+        ]
+    if message.tool_call_id is not None:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.name is not None:
+        payload["name"] = message.name
+    if message.reasoning_content:
+        payload["reasoning_content"] = message.reasoning_content
+    return payload
+
+
 def _message_to_json(message: ChatMessage) -> str:
-    return json.dumps(asdict(message), ensure_ascii=False)
+    return json.dumps(message_to_dict(message), ensure_ascii=False)
 
 
 def _message_from_dict(raw: Any, path: Path, line_number: int) -> ChatMessage:
@@ -324,6 +347,7 @@ def _message_from_dict(raw: Any, path: Path, line_number: int) -> ChatMessage:
         tool_calls=tool_calls,
         tool_call_id=_optional_str(raw.get("tool_call_id")),
         name=_optional_str(raw.get("name")),
+        reasoning_content=_optional_str(raw.get("reasoning_content")),
     )
 
 

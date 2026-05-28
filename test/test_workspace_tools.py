@@ -59,7 +59,7 @@ from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
 from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
-from uedev.tools.workspace import edit_file, read_file, write_file
+from uedev.tools.workspace import edit_file, list_files, read_file, safe_path, write_file
 from uedev.tools.worktrees import WorktreeManager
 
 
@@ -103,6 +103,25 @@ class WorkspaceToolTests(unittest.TestCase):
             self.assertEqual(read_file(root, "a.txt"), "world")
             with self.assertRaises(ValueError):
                 read_file(root, "../outside.txt")
+
+    def test_safe_path_does_not_resolve_workspace_links(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            source = root / "SourceContent"
+            source.mkdir()
+            (source / "Map.umap").write_text("asset", encoding="utf-8")
+            worktree = root / "Worktree"
+            worktree.mkdir()
+            link = worktree / "Content"
+            try:
+                link.symlink_to(source, target_is_directory=True)
+            except (OSError, NotImplementedError):
+                self.skipTest("directory symlinks are not available in this environment")
+
+            path = safe_path(worktree, "Content")
+
+            self.assertEqual(path, worktree / "Content")
+            self.assertIn("Content", list_files(worktree, "Content"))
 
     def test_edit_file_tool_accepts_edits_list(self) -> None:
         with workspace_temp_dir() as temp:
@@ -201,6 +220,25 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(messages[0].role, "assistant")
         self.assertFalse(messages[0].tool_calls)
         self.assertIn("tool calls omitted", messages[0].content)
+
+    def test_repair_tool_call_messages_downgrades_missing_reasoning_for_thinking_models(self) -> None:
+        messages = [
+            ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})],
+            ),
+            ChatMessage(role="tool", content="ok", tool_call_id="call_1", name="read_file"),
+            ChatMessage(role="user", content="next"),
+        ]
+
+        repair_tool_call_messages(messages, require_reasoning_content=True)
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0].role, "assistant")
+        self.assertFalse(messages[0].tool_calls)
+        self.assertIn("tool calls omitted", messages[0].content)
+        self.assertEqual(messages[1].content, "next")
 
     def test_compact_locally_saves_transcript(self) -> None:
         with workspace_temp_dir() as temp:

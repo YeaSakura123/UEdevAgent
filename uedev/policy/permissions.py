@@ -63,7 +63,7 @@ _MUTATING_TOOLS = {
     "p4_reconcile",
 }
 
-_EXECUTION_TOOLS = {"shell", "background_run", "worktree_run", "ue_run_python", "subagent"}
+_EXECUTION_TOOLS = {"shell", "background_run", "worktree_run", "ue_run_python", "ue_build", "subagent"}
 
 _PLAN_ALLOWED_TOOLS = {
     *_READ_TOOLS,
@@ -245,7 +245,7 @@ def classify_tool_permission(
         command = str(tool_input.get("command", "")).strip()
         return _classify_command_permission(command, permission_mode)
 
-    if tool_name == "ue_run_python":
+    if tool_name in {"ue_run_python", "ue_build"}:
         if permission_mode == "read_only":
             return PermissionDecision("ask", "read-only mode requires approval before launching Unreal Engine")
         return PermissionDecision("allow", "workspace-write mode allows local command execution")

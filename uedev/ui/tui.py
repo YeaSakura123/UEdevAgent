@@ -11,7 +11,7 @@ from prompt_toolkit.input.base import Input
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.output.base import Output
 
-from ..state.config import ConfigError, load_system_config
+from ..state.config import ConfigError, active_model_name, load_system_config
 from ..runtime.history import (
     HistoryEntry,
     HistoryError,
@@ -100,6 +100,19 @@ class ChatTuiApplication:
                 name = self.prompt_worktree_name(session)
                 if name is not None:
                     self.create_ue_linked_worktree(name)
+                continue
+
+            if query.lower() == "/model":
+                selected = self.prompt_model_selection(session)
+                if selected is not None:
+                    try:
+                        self.renderer.print_system(self.runtime.switch_model(selected))
+                    except ConfigError as error:
+                        self.renderer.print_system(f"Config error: {error}")
+                continue
+
+            if query.lower().startswith("/model "):
+                self.renderer.print_system("Use /model and choose a profile with the arrow keys.")
                 continue
 
             if query.lower() == "/permissions":
@@ -256,6 +269,57 @@ class ChatTuiApplication:
         except (EOFError, KeyboardInterrupt):
             return None
         return selected or None
+
+    def prompt_model_selection(self, session: PromptSession) -> str | None:
+        from ..runtime.agent import create_chat_prompt_options
+
+        try:
+            config = load_system_config()
+            active = active_model_name(self.options.cwd, config)
+        except ConfigError as error:
+            self.renderer.print_system(f"Config error: {error}")
+            return None
+
+        labels: list[str] = []
+        by_label: dict[str, str] = {}
+        for name, profile in sorted(config.models.items()):
+            markers: list[str] = []
+            if name == active:
+                markers.append("active")
+            if name == config.default_model:
+                markers.append("default")
+            if profile.requires_reasoning_content:
+                markers.append("reasoning")
+            suffix = f" ({', '.join(markers)})" if markers else ""
+            label = f"{name} - {profile.model or '(missing model)'}{suffix}"
+            labels.append(label)
+            by_label[label] = name
+
+        reset_label = f"Reset to default ({config.default_model})"
+        labels.append(reset_label)
+        by_label[reset_label] = "reset"
+
+        def start_completion() -> None:
+            session.app.current_buffer.start_completion(select_first=True)
+
+        try:
+            prompt_options = create_chat_prompt_options()
+            prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+            selected = session.prompt(
+                [("class:prompt", "\nModel> ")],
+                completer=WordCompleter(labels, ignore_case=True, sentence=True),
+                pre_run=start_completion,
+                **prompt_options,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+
+        if not selected:
+            return None
+        choice = by_label.get(selected)
+        if choice is None:
+            self.renderer.print_system(f"Unknown model selection: {selected}")
+        return choice
 
     def create_ue_linked_worktree(self, name: str) -> None:
         try:

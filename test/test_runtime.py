@@ -8,6 +8,7 @@ import unittest
 import uuid
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from contextlib import contextmanager
@@ -24,12 +25,12 @@ def workspace_temp_dir():
 
 
 from uedev.tools.background import BackgroundManager
-from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.state.config import ConfigError, ModelProfile, agent_dir, load_project_config, load_system_config, resolve_model_profile
 from uedev.runtime.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file
 from uedev.runtime.subagents import SubagentSpec
-from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
+from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message, call_model
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
@@ -113,6 +114,32 @@ class LlmMessageTests(unittest.TestCase):
         self.assertEqual(serialized["role"], "assistant")
         self.assertEqual(serialized["tool_calls"][0]["function"]["name"], "read_file")
 
+    def test_serialize_reasoning_content_only_when_profile_requires_it(self) -> None:
+        message = ChatMessage(role="assistant", content="done", reasoning_content="thinking")
+        plain = ModelProfile(
+            name="plain",
+            model="plain-model",
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+        )
+        reasoning = ModelProfile(
+            name="deepseek",
+            model="deepseek-reasoner",
+            base_url="https://api.deepseek.com/v1",
+            api_key="key",
+            requires_reasoning_content=True,
+        )
+
+        self.assertNotIn("reasoning_content", _serialize_message(message, plain))
+        self.assertEqual(_serialize_message(message, reasoning)["reasoning_content"], "thinking")
+        tool_call_message = ChatMessage(
+            role="assistant",
+            content="",
+            tool_calls=[ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})],
+            reasoning_content="thinking",
+        )
+        self.assertEqual(_serialize_message(tool_call_message, reasoning)["reasoning_content"], "thinking")
+
     def test_serialize_tool_result_message(self) -> None:
         message = ChatMessage(role="tool", content="ok", tool_call_id="call_1", name="read_file")
 
@@ -120,6 +147,50 @@ class LlmMessageTests(unittest.TestCase):
 
         self.assertEqual(serialized["role"], "tool")
         self.assertEqual(serialized["tool_call_id"], "call_1")
+
+    def test_call_model_reads_reasoning_content_from_direct_attribute(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                message = SimpleNamespace(content="done", tool_calls=[], reasoning_content="thinking")
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        profile = ModelProfile(
+            name="deepseek",
+            model="deepseek-reasoner",
+            base_url="https://api.deepseek.com/v1",
+            api_key="key",
+            requires_reasoning_content=True,
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile)
+
+        self.assertEqual(response.reasoning_content, "thinking")
+        self.assertNotIn("reasoning_content", captured["messages"][0])
+
+    def test_call_model_reads_reasoning_content_from_model_extra(self) -> None:
+        class FakeCompletions:
+            def create(self, **kwargs):
+                message = SimpleNamespace(content="done", tool_calls=[], model_extra={"reasoning_content": "extra thinking"})
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        profile = ModelProfile(
+            name="deepseek",
+            model="deepseek-reasoner",
+            base_url="https://api.deepseek.com/v1",
+            api_key="key",
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile)
+
+        self.assertEqual(response.reasoning_content, "extra thinking")
+
 
 class AgentEventLoopTests(unittest.TestCase):
     def test_run_turn_events_emits_tool_flow(self) -> None:
@@ -156,6 +227,41 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertEqual(event_types[-1], "final")
             self.assertEqual(events[1].name, "read_file")
             self.assertEqual(events[-1].message, "done")
+
+    def test_run_turn_events_records_reasoning_content_on_tool_call_messages(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            write_file(root, "a.txt", "hello")
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
+            responses = [
+                ModelResponse(
+                    "",
+                    [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})],
+                    reasoning_content="thinking",
+                ),
+                ModelResponse("done"),
+            ]
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
+                    list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test", history=history))
+
+            loaded = load_history_file(history.path or Path())
+            assistant_tool = next(message for message in loaded if message.tool_calls)
+            self.assertEqual(assistant_tool.reasoning_content, "thinking")
 
     def test_run_turn_events_records_session_history(self) -> None:
         with workspace_temp_dir() as temp:
@@ -886,7 +992,11 @@ class AgentEventLoopTests(unittest.TestCase):
                 ModelResponse("done"),
             ]
             child_responses = [
-                ModelResponse("", [ToolCall(id="child_call_1", name="write_file", arguments={"path": "x.txt", "content": "x"})]),
+                ModelResponse(
+                    "",
+                    [ToolCall(id="child_call_1", name="write_file", arguments={"path": "x.txt", "content": "x"})],
+                    reasoning_content="child thinking",
+                ),
                 ModelResponse("child done"),
             ]
 
@@ -899,6 +1009,9 @@ class AgentEventLoopTests(unittest.TestCase):
 
             self.assertEqual(events[-1].type, "final")
             record = runtime.subagents.list_records((history.session_dir or Path()) / "subagents")[0]
+            child_messages = load_history_file(Path(record.history_path))
+            child_tool_call = next(message for message in child_messages if message.tool_calls)
+            self.assertEqual(child_tool_call.reasoning_content, "child thinking")
             display_records = load_display_history(Path(record.display_history_path))
             event_types = [item["event"]["type"] for item in display_records if item["type"] == "event"]
 

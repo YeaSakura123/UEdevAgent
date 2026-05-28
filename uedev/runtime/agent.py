@@ -122,8 +122,10 @@ from ..ue import (
     p4_reconcile,
     p4_status,
     prepare_ue_python,
+    render_build_result,
     render_doctor,
     render_run_result,
+    run_ue_build,
 )
 from ..tools.workspace import edit_file, list_files, read_file, write_file
 from ..tools.worktrees import WorktreeManager
@@ -162,7 +164,7 @@ SLASH_COMMANDS = [
     ("/history", "Load a previous conversation from this project."),
     ("/subagents", "Choose a subagent conversation to view."),
     ("/worktree", "Create a UE Git linked worktree from the current project."),
-    ("/model", "List or switch model profiles for this project."),
+    ("/model", "Choose or list model profiles for this project."),
     ("/mcp", "Show configured MCP server status and tools."),
     ("/plan", "Enter, leave, or inspect Plan Mode."),
     ("/permissions", "Show or switch the current permission mode."),
@@ -852,7 +854,12 @@ class AgentRuntime:
 
             response = call_model(messages, self.current_model_profile(), tools=self.tool_specs)
             if response.tool_calls:
-                assistant_message = ChatMessage(role="assistant", content=response.content, tool_calls=response.tool_calls)
+                assistant_message = ChatMessage(
+                    role="assistant",
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                    reasoning_content=response.reasoning_content,
+                )
                 messages.append(assistant_message)
                 if history is not None:
                     history.append(assistant_message)
@@ -947,7 +954,7 @@ class AgentRuntime:
 
             final_answer = response.content.strip()
             if self.collaboration_mode == "plan" and not is_proposed_plan(final_answer):
-                assistant_message = ChatMessage(role="assistant", content=final_answer)
+                assistant_message = ChatMessage(role="assistant", content=final_answer, reasoning_content=response.reasoning_content)
                 retry_message = ChatMessage(
                     role="system",
                     content=(
@@ -961,7 +968,7 @@ class AgentRuntime:
                     history.append(assistant_message)
                 continue
             if tool_names_this_turn and is_acknowledgement_answer(final_answer):
-                assistant_message = ChatMessage(role="assistant", content=final_answer)
+                assistant_message = ChatMessage(role="assistant", content=final_answer, reasoning_content=response.reasoning_content)
                 retry_message = ChatMessage(
                     role="system",
                     content=(
@@ -975,11 +982,17 @@ class AgentRuntime:
                 if history is not None:
                     history.append(assistant_message)
                 continue
-            if self._defer_final_if_tool_needed(messages, goal, final_answer, record_assistant=True):
+            if self._defer_final_if_tool_needed(
+                messages,
+                goal,
+                final_answer,
+                record_assistant=True,
+                reasoning_content=response.reasoning_content,
+            ):
                 if history is not None:
-                    history.append(ChatMessage(role="assistant", content=final_answer))
+                    history.append(ChatMessage(role="assistant", content=final_answer, reasoning_content=response.reasoning_content))
                 continue
-            assistant_message = ChatMessage(role="assistant", content=final_answer)
+            assistant_message = ChatMessage(role="assistant", content=final_answer, reasoning_content=response.reasoning_content)
             messages.append(assistant_message)
             if history is not None:
                 history.append(assistant_message)
@@ -1147,10 +1160,11 @@ class AgentRuntime:
         )
         working_messages = list(original_messages)
         micro_compact(working_messages)
-        repair_tool_call_messages(working_messages)
+        profile = self.current_model_profile()
+        repair_tool_call_messages(working_messages, require_reasoning_content=profile.requires_reasoning_content)
 
         request = build_compaction_request(working_messages, reason)
-        response = call_model(request, self.current_model_profile())
+        response = call_model(request, profile)
         summary = response.content.strip()
         if not summary:
             raise RuntimeError("Compaction model returned an empty summary.")
@@ -1167,13 +1181,16 @@ class AgentRuntime:
             compacted.append(preserved_user)
 
         messages[:] = compacted
-        repair_tool_call_messages(messages)
+        repair_tool_call_messages(messages, require_reasoning_content=profile.requires_reasoning_content)
         return transcript
 
     # 内部函数：处理 _inject_runtime_observations 辅助逻辑，支撑 agent 主循环、chat 界面、工具分发和运行时观察。
     def _inject_runtime_observations(self, messages: list[ChatMessage]) -> None:
         micro_compact(messages)
-        repair_tool_call_messages(messages)
+        repair_tool_call_messages(
+            messages,
+            require_reasoning_content=self.current_model_profile().requires_reasoning_content,
+        )
         self._inject_runtime_state(messages)
 
         notifications = self.background.drain()
@@ -1238,10 +1255,11 @@ class AgentRuntime:
         answer: str,
         *,
         record_assistant: bool = False,
+        reasoning_content: str | None = None,
     ) -> bool:
         if defers_tool_confirmation(goal, answer):
             if record_assistant:
-                messages.append(ChatMessage(role="assistant", content=answer))
+                messages.append(ChatMessage(role="assistant", content=answer, reasoning_content=reasoning_content))
             messages.append(ChatMessage(role="system", content=self.prompt_bundle.tool_confirmation_reminder))
             return True
         return False
@@ -1451,6 +1469,13 @@ class AgentRuntime:
             ),
             "ue_doctor": lambda data: render_doctor(discover_ue(self._resolve_tool_cwd(data.get("cwd")))),
             "ue_run_python": ue_run_python_tool,
+            "ue_build": lambda data: render_build_result(
+                run_ue_build(
+                    self._resolve_tool_cwd(data.get("cwd")),
+                    agent_dir(self._resolve_tool_cwd(data.get("cwd"))),
+                    timeout_seconds=_optional_int(data.get("timeout_seconds")) or 1800,
+                )
+            ),
             "ue_stop_executor": lambda data: f"queued_stop_task: {enqueue_editor_stop(agent_dir(self._resolve_tool_cwd(data.get('cwd'))))}",
             "p4_status": lambda data: p4_status(self._resolve_tool_cwd(data.get("cwd"))),
             "p4_file_state": lambda data: p4_file_state(
@@ -1538,6 +1563,9 @@ def _permission_prompt_label(name: str, tool_input: dict[str, object]) -> str:
     if name in {"write_file", "edit_file", "read_file", "list_files"}:
         path = str(tool_input.get("path") or "").strip()
         return f"{name} {path}".strip()
+    if name == "ue_build":
+        cwd = str(tool_input.get("cwd") or "").strip()
+        return f"ue_build {cwd}".strip()
     if name == "worktree_remove":
         worktree = str(tool_input.get("name") or "").strip()
         return f"worktree_remove {worktree}".strip()
@@ -1571,11 +1599,28 @@ def defers_tool_confirmation(goal: str, answer: str) -> bool:
     answer_text = answer.lower()
     if not any(
         token in goal_text
-        for token in ["ue", "unreal", "editor", "script", "execute", "launch", "run", "脚本", "执行", "启动", "运行", ".py"]
+        for token in [
+            "ue",
+            "unreal",
+            "editor",
+            "script",
+            "execute",
+            "launch",
+            "run",
+            "build",
+            "compile",
+            "uht",
+            "脚本",
+            "执行",
+            "启动",
+            "运行",
+            "编译",
+            ".py",
+        ]
     ):
         return False
     confirmation_tokens = ["confirm", "confirmation", "确认", "是否", "y/n", "[y/n]"]
-    action_tokens = ["run", "execute", "launch", "start", "continue", "执行", "启动", "运行", "继续"]
+    action_tokens = ["run", "execute", "launch", "start", "continue", "build", "compile", "执行", "启动", "运行", "继续", "编译"]
     return any(token in answer_text for token in confirmation_tokens) and any(
         token in answer_text for token in action_tokens
     )

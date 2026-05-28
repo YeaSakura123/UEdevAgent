@@ -535,6 +535,21 @@ class ToolSpecTests(unittest.TestCase):
         self.assertNotIn("kind", properties)
         self.assertNotIn("execute", properties)
 
+    def test_ue_build_schema_declares_fixed_editor_build(self) -> None:
+        specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
+
+        properties = specs["ue_build"]["function"]["parameters"]["properties"]
+        description = specs["ue_build"]["function"]["description"]
+
+        self.assertIn("cwd", properties)
+        self.assertIn("timeout_seconds", properties)
+        self.assertIn("Editor target", description)
+        self.assertIn("Win64 Development", description)
+        self.assertIn("diagnostics", description)
+        self.assertNotIn("target", properties)
+        self.assertNotIn("platform", properties)
+        self.assertNotIn("configuration", properties)
+
     def test_ue_doctor_schema_declares_perforce_status_scope(self) -> None:
         specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
 

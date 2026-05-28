@@ -21,9 +21,12 @@ from uedev.ue import (
     enqueue_editor_stop,
     execute_prepared_ue_python,
     generate_run_id,
+    parse_build_diagnostics,
     prepare_ue_python,
+    render_build_result,
     render_doctor,
     render_run_result,
+    run_ue_build,
     run_ue_python,
 )
 
@@ -75,6 +78,13 @@ def create_engine_root(root: Path, *, commandlet: bool = True, gui: bool = True)
     return cmd, editor
 
 
+def create_build_bat(root: Path) -> Path:
+    build_bat = root / "Engine" / "Build" / "BatchFiles" / "Build.bat"
+    build_bat.parent.mkdir(parents=True, exist_ok=True)
+    build_bat.write_text("", encoding="utf-8")
+    return build_bat
+
+
 class UePythonRunnerTests(unittest.TestCase):
     def test_generate_run_id_is_sortable_and_file_safe(self) -> None:
         first = generate_run_id()
@@ -84,6 +94,134 @@ class UePythonRunnerTests(unittest.TestCase):
         self.assertLess(first, second)
         self.assertNotIn(":", first)
         self.assertNotIn("\\", first)
+
+    def test_run_ue_build_uses_editor_target_and_writes_logs(self) -> None:
+        root = workspace_temp_path()
+        project = root / "UEAgentDemo.uproject"
+        project.write_text(json.dumps({"EngineAssociation": "5.4"}), encoding="utf-8")
+        engine_root = root / "UE_5.4"
+        create_engine_root(engine_root)
+        build_bat = create_build_bat(engine_root)
+        config_path = root / "system-config.json"
+        write_system_config(config_path, "5.4", engine_root)
+        calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def fake_run(args, **kwargs):
+            if args[0] == "p4":
+                raise FileNotFoundError("p4")
+            calls.append((list(args), kwargs))
+            return subprocess.CompletedProcess(args, 0, stdout="build ok\n", stderr="")
+
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.ue.core.os.name", "nt"):
+                with patch("uedev.ue.subprocess.run", side_effect=fake_run):
+                    result = run_ue_build(root, root / ".agent", timeout_seconds=99)
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.target, "UEAgentDemoEditor")
+        self.assertEqual(result.platform, "Win64")
+        self.assertEqual(result.configuration, "Development")
+        self.assertEqual(calls[0][0], [str(build_bat), "UEAgentDemoEditor", "Win64", "Development", f"-Project={project.resolve()}", "-WaitMutex", "-FromMsBuild"])
+        self.assertEqual(calls[0][1]["cwd"], str(root.resolve()))
+        self.assertEqual(calls[0][1]["timeout"], 99)
+        self.assertEqual(result.stdout_path.read_text(encoding="utf-8"), "build ok\n")
+        meta = json.loads((result.run_dir / "meta.json").read_text(encoding="utf-8"))
+        payload = json.loads(result.result_path.read_text(encoding="utf-8"))
+        self.assertEqual(meta["target"], "UEAgentDemoEditor")
+        self.assertEqual(payload["status"], "completed")
+        rendered = render_build_result(result)
+        self.assertIn("status: completed", rendered)
+        self.assertIn("UEAgentDemoEditor", rendered)
+
+    def test_run_ue_build_returns_failed_diagnostics(self) -> None:
+        root = workspace_temp_path()
+        project = root / "Demo.uproject"
+        source = root / "Source" / "DemoActor.cpp"
+        source.parent.mkdir()
+        project.write_text(json.dumps({"EngineAssociation": "5.4"}), encoding="utf-8")
+        engine_root = root / "UE_5.4"
+        create_engine_root(engine_root)
+        create_build_bat(engine_root)
+        config_path = root / "system-config.json"
+        write_system_config(config_path, "5.4", engine_root)
+
+        def fake_run(args, **kwargs):
+            if args[0] == "p4":
+                raise FileNotFoundError("p4")
+            stdout = f"{source}(12): error C2143: syntax error\nERROR: UnrealHeaderTool failed\n"
+            return subprocess.CompletedProcess(args, 6, stdout=stdout, stderr="")
+
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.ue.core.os.name", "nt"):
+                with patch("uedev.ue.subprocess.run", side_effect=fake_run):
+                    result = run_ue_build(root, root / ".agent")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.exit_code, 6)
+        self.assertEqual(result.diagnostics[0].severity, "error")
+        self.assertEqual(result.diagnostics[0].file, str(source))
+        self.assertEqual(result.diagnostics[0].line, 12)
+        self.assertEqual(result.diagnostics[0].code, "C2143")
+        self.assertTrue(any("UnrealHeaderTool failed" in item.message for item in result.diagnostics))
+        payload = json.loads(result.result_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["diagnostics"][0]["code"], "C2143")
+
+    def test_run_ue_build_timeout_preserves_output(self) -> None:
+        root = workspace_temp_path()
+        project = root / "Demo.uproject"
+        project.write_text(json.dumps({"EngineAssociation": "5.4"}), encoding="utf-8")
+        engine_root = root / "UE_5.4"
+        create_engine_root(engine_root)
+        create_build_bat(engine_root)
+        config_path = root / "system-config.json"
+        write_system_config(config_path, "5.4", engine_root)
+
+        def fake_run(args, **kwargs):
+            if args[0] == "p4":
+                raise FileNotFoundError("p4")
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"], output="partial stdout", stderr="partial stderr")
+
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.ue.core.os.name", "nt"):
+                with patch("uedev.ue.subprocess.run", side_effect=fake_run):
+                    result = run_ue_build(root, root / ".agent", timeout_seconds=1)
+
+        self.assertEqual(result.status, "timeout")
+        self.assertIsNone(result.exit_code)
+        self.assertEqual(result.stdout_path.read_text(encoding="utf-8"), "partial stdout")
+        self.assertEqual(result.stderr_path.read_text(encoding="utf-8"), "partial stderr")
+
+    def test_run_ue_build_requires_build_bat(self) -> None:
+        root = workspace_temp_path()
+        project = root / "Demo.uproject"
+        project.write_text(json.dumps({"EngineAssociation": "5.4"}), encoding="utf-8")
+        engine_root = root / "UE_5.4"
+        create_engine_root(engine_root)
+        config_path = root / "system-config.json"
+        write_system_config(config_path, "5.4", engine_root)
+
+        with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+            with patch("uedev.ue.core.os.name", "nt"):
+                with self.assertRaisesRegex(RuntimeError, "Build.bat"):
+                    run_ue_build(root, root / ".agent")
+
+    def test_parse_build_diagnostics_handles_msvc_ubt_and_uht(self) -> None:
+        diagnostics = parse_build_diagnostics(
+            "\n".join(
+                [
+                    "C:/Project/Source/Demo.h(8): warning C4996: deprecated",
+                    "ERROR: Missing module dependency",
+                    "UnrealHeaderTool failed for target DemoEditor",
+                ]
+            ),
+            "",
+        )
+
+        self.assertEqual(diagnostics[0].severity, "warning")
+        self.assertEqual(diagnostics[0].code, "C4996")
+        self.assertEqual(diagnostics[1].message, "Missing module dependency")
+        self.assertIn("UnrealHeaderTool failed", diagnostics[2].message)
 
     def test_build_script_keeps_user_body(self) -> None:
         body = build_python_script("custom", "print('ok')")

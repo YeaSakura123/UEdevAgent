@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -90,6 +91,36 @@ class UePreparedRun:
     executor_heartbeat_path: Path | None
     source_script_path: Path | None
     script_origin: str
+
+
+@dataclass(frozen=True)
+class UeBuildDiagnostic:
+    severity: str
+    message: str
+    file: str | None = None
+    line: int | None = None
+    code: str | None = None
+
+
+@dataclass(frozen=True)
+class UeBuildResult:
+    run_id: str
+    status: str
+    command: str
+    command_parts: list[str]
+    run_dir: Path
+    project_path: Path
+    build_bat_path: Path
+    target: str
+    platform: str
+    configuration: str
+    stdout_path: Path
+    stderr_path: Path
+    result_path: Path
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    diagnostics: list[UeBuildDiagnostic] = field(default_factory=list)
 
 
 def quote_command(parts: list[str]) -> str:
@@ -632,6 +663,160 @@ def enqueue_editor_stop(agent_dir: Path) -> Path:
     return stop_path
 
 
+def run_ue_build(cwd: Path, agent_dir: Path, *, timeout_seconds: int = 1800) -> UeBuildResult:
+    if os.name != "nt":
+        raise RuntimeError("UE build currently supports Windows Build.bat only.")
+
+    discovery = discover_ue(cwd)
+    if discovery.project_path is None:
+        raise RuntimeError("Cannot find .uproject. Run from a UE project directory or pass cwd.")
+    if discovery.engine_association is None:
+        raise RuntimeError("Cannot choose UE engine because the .uproject is missing EngineAssociation.")
+    if discovery.engine_root is None:
+        raise RuntimeError(f"Cannot choose UE engine for EngineAssociation {discovery.engine_association!r}. Run uedev ue doctor.")
+
+    build_bat_path = discovery.engine_root / "Engine" / "Build" / "BatchFiles" / "Build.bat"
+    if not build_bat_path.is_file():
+        raise RuntimeError(f"Cannot find Build.bat under configured UE engine root: {build_bat_path}")
+
+    run_id = generate_run_id()
+    run_dir = agent_dir / "ue_builds" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = run_dir / "stdout.log"
+    stderr_path = run_dir / "stderr.log"
+    result_path = run_dir / "result.json"
+    target = f"{discovery.project_path.stem}Editor"
+    platform = "Win64"
+    configuration = "Development"
+    parts = [
+        str(build_bat_path),
+        target,
+        platform,
+        configuration,
+        f"-Project={discovery.project_path}",
+        "-WaitMutex",
+        "-FromMsBuild",
+    ]
+    command = quote_command(parts)
+    _write_json(
+        run_dir / "meta.json",
+        {
+            "run_id": run_id,
+            "project_path": str(discovery.project_path),
+            "engine_association": discovery.engine_association,
+            "engine_name": discovery.engine_name,
+            "engine_root": str(discovery.engine_root),
+            "build_bat_path": str(build_bat_path),
+            "target": target,
+            "platform": platform,
+            "configuration": configuration,
+            "command": command,
+            "created_at": _iso_now(),
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "result_path": str(result_path),
+        },
+    )
+
+    try:
+        process = subprocess.run(
+            parts,
+            cwd=str(discovery.project_path.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+        )
+        stdout = process.stdout
+        stderr = process.stderr
+        exit_code: int | None = process.returncode
+        status = "completed" if process.returncode == 0 else "failed"
+    except subprocess.TimeoutExpired as error:
+        stdout = _coerce_output(error.stdout)
+        stderr = _coerce_output(error.stderr)
+        exit_code = None
+        status = "timeout"
+
+    stdout_path.write_text(stdout, encoding="utf-8")
+    stderr_path.write_text(stderr, encoding="utf-8")
+    diagnostics = parse_build_diagnostics(stdout, stderr)
+    result = UeBuildResult(
+        run_id=run_id,
+        status=status,
+        command=command,
+        command_parts=parts,
+        run_dir=run_dir,
+        project_path=discovery.project_path,
+        build_bat_path=build_bat_path,
+        target=target,
+        platform=platform,
+        configuration=configuration,
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+        result_path=result_path,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        diagnostics=diagnostics,
+    )
+    _write_json(
+        result_path,
+        {
+            "run_id": run_id,
+            "status": status,
+            "exit_code": exit_code,
+            "command": command,
+            "project_path": str(discovery.project_path),
+            "build_bat_path": str(build_bat_path),
+            "target": target,
+            "platform": platform,
+            "configuration": configuration,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "diagnostics": [_diagnostic_to_json(item) for item in diagnostics],
+        },
+    )
+    return result
+
+
+def render_build_result(result: UeBuildResult) -> str:
+    lines = [
+        f"run_id: {result.run_id}",
+        f"status: {result.status}",
+        f"project: {result.project_path}",
+        f"target: {result.target}",
+        f"platform: {result.platform}",
+        f"configuration: {result.configuration}",
+        f"command: {result.command}",
+        f"run_dir: {result.run_dir}",
+        f"stdout_path: {result.stdout_path}",
+        f"stderr_path: {result.stderr_path}",
+        f"result_path: {result.result_path}",
+    ]
+    if result.exit_code is not None:
+        lines.append(f"exit_code: {result.exit_code}")
+    lines.append(f"diagnostics_count: {len(result.diagnostics)}")
+    if result.diagnostics:
+        lines.append("diagnostics:")
+        for diagnostic in result.diagnostics[:50]:
+            location = ""
+            if diagnostic.file:
+                location = diagnostic.file
+                if diagnostic.line is not None:
+                    location += f":{diagnostic.line}"
+                location += ": "
+            code = f"{diagnostic.code}: " if diagnostic.code else ""
+            lines.append(f"- [{diagnostic.severity}] {location}{code}{diagnostic.message}")
+    if result.stdout:
+        lines.append("stdout_recent:")
+        lines.append(_tail_text(result.stdout))
+    if result.stderr:
+        lines.append("stderr_recent:")
+        lines.append(_tail_text(result.stderr))
+    return "\n".join(lines)
+
+
 def prepare_ue_python(
     cwd: Path,
     agent_dir: Path,
@@ -891,6 +1076,18 @@ def render_run_result(result: UeRunResult) -> str:
     return "\n".join(lines)
 
 
+def parse_build_diagnostics(stdout: str, stderr: str, *, limit: int = 50) -> list[UeBuildDiagnostic]:
+    diagnostics: list[UeBuildDiagnostic] = []
+    for line in "\n".join([stdout, stderr]).splitlines():
+        diagnostic = _parse_build_diagnostic_line(line)
+        if diagnostic is None:
+            continue
+        diagnostics.append(diagnostic)
+        if len(diagnostics) >= limit:
+            break
+    return diagnostics
+
+
 def _result_from_prepared(
     prepared: UePreparedRun,
     *,
@@ -927,6 +1124,65 @@ def _result_from_prepared(
         result_json=result_json,
         heartbeat_status=heartbeat_status,
     )
+
+
+def _parse_build_diagnostic_line(line: str) -> UeBuildDiagnostic | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    match = re.match(
+        r"^(?P<file>.+?\.(?:h|hpp|hh|cpp|cxx|cc|cs|uproject|uplugin))"
+        r"\((?P<line>\d+)(?:,\d+)?\):\s*"
+        r"(?P<severity>error|warning)\s*"
+        r"(?P<code>[A-Z]+\d+)?\s*:?\s*(?P<message>.*)$",
+        stripped,
+        re.IGNORECASE,
+    )
+    if match:
+        return UeBuildDiagnostic(
+            severity=match.group("severity").lower(),
+            file=match.group("file"),
+            line=int(match.group("line")),
+            code=match.group("code"),
+            message=match.group("message").strip(),
+        )
+
+    match = re.match(r"^(?P<severity>error|warning)\s+(?P<code>[A-Z]+\d+)\s*:\s*(?P<message>.+)$", stripped, re.IGNORECASE)
+    if match:
+        return UeBuildDiagnostic(
+            severity=match.group("severity").lower(),
+            code=match.group("code"),
+            message=match.group("message").strip(),
+        )
+
+    match = re.search(r"\b(?P<severity>ERROR|Error|WARNING|Warning):\s*(?P<message>.+)$", stripped)
+    if match:
+        return UeBuildDiagnostic(
+            severity="error" if match.group("severity").lower() == "error" else "warning",
+            message=match.group("message").strip(),
+        )
+
+    if "UnrealHeaderTool failed" in stripped:
+        return UeBuildDiagnostic(severity="error", message=stripped)
+
+    return None
+
+
+def _diagnostic_to_json(diagnostic: UeBuildDiagnostic) -> dict[str, object]:
+    return {
+        "severity": diagnostic.severity,
+        "message": diagnostic.message,
+        "file": diagnostic.file,
+        "line": diagnostic.line,
+        "code": diagnostic.code,
+    }
+
+
+def _tail_text(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return "...(truncated)\n" + text[-limit:]
 
 
 def _source_script_meta(path: Path | None) -> dict[str, object] | None:

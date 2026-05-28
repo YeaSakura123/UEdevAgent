@@ -6,6 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ..llm.client import ChatMessage
+from .history import message_to_dict
 
 
 SUMMARY_PREFIX = "[Conversation summary]"
@@ -48,12 +49,13 @@ def micro_compact(messages: list[ChatMessage], keep_recent: int = 8, max_content
             )
 
 
-def repair_tool_call_messages(messages: list[ChatMessage]) -> None:
+def repair_tool_call_messages(messages: list[ChatMessage], require_reasoning_content: bool = False) -> None:
     """Keep OpenAI tool-call history valid after compaction or older sessions.
 
     An assistant message with tool_calls must be followed immediately by one
     tool message for every tool_call_id. If older compaction damaged that shape,
-    downgrade the assistant tool-call record to plain context before sending.
+    or a thinking model needs missing reasoning_content, downgrade the tool-call
+    record to plain context before sending.
     """
 
     index = 0
@@ -71,11 +73,12 @@ def repair_tool_call_messages(messages: list[ChatMessage]) -> None:
                 observed.append(messages[cursor].tool_call_id)
             cursor += 1
 
-        if observed[: len(expected)] != expected:
+        missing_reasoning = require_reasoning_content and not message.reasoning_content
+        if observed[: len(expected)] != expected or missing_reasoning:
             tool_names = ", ".join(tool_call.name for tool_call in message.tool_calls)
             content = message.content.strip()
             summary = f"{content}\n[tool calls omitted from compacted history: {tool_names}]".strip()
-            messages[index] = ChatMessage(role="assistant", content=summary)
+            messages[index:cursor] = [ChatMessage(role="assistant", content=summary)]
 
         index += 1
 
@@ -89,7 +92,7 @@ def save_transcript(messages: list[ChatMessage], transcript_target: Path) -> Pat
         path = transcript_target / f"transcript_{time.time_ns()}.jsonl"
     with path.open("w", encoding="utf-8") as handle:
         for message in messages:
-            handle.write(json.dumps(asdict(message), ensure_ascii=False) + "\n")
+            handle.write(json.dumps(message_to_dict(message), ensure_ascii=False) + "\n")
     return path
 
 

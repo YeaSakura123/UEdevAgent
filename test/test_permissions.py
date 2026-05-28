@@ -298,6 +298,30 @@ class ShellAndApprovalTests(unittest.TestCase):
         self.assertEqual(delete_decision.action, "ask")
         self.assertEqual(plan_decision.action, "deny")
 
+    def test_ue_build_permission_matches_local_execution(self) -> None:
+        read_only_decision = classify_tool_permission(
+            "ue_build",
+            {},
+            collaboration_mode="default",
+            permission_mode="read_only",
+        )
+        default_decision = classify_tool_permission(
+            "ue_build",
+            {},
+            collaboration_mode="default",
+            permission_mode="default",
+        )
+        plan_decision = classify_tool_permission(
+            "ue_build",
+            {},
+            collaboration_mode="plan",
+            permission_mode="full_access",
+        )
+
+        self.assertEqual(read_only_decision.action, "ask")
+        self.assertEqual(default_decision.action, "allow")
+        self.assertEqual(plan_decision.action, "deny")
+
     def test_p4_tool_schemas_declare_structured_perforce_workflow(self) -> None:
         specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
 

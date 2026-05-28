@@ -49,6 +49,22 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(loaded[1].tool_calls[0].name, "read_file")
             self.assertEqual(loaded[2].tool_call_id, "call_1")
 
+    def test_history_round_trips_reasoning_content_when_present(self) -> None:
+        with workspace_temp_dir() as root:
+            path = root / "messages.jsonl"
+            messages = [
+                ChatMessage(role="assistant", content="done", reasoning_content="thinking"),
+                ChatMessage(role="assistant", content="plain"),
+            ]
+
+            write_history_messages(path, messages)
+            raw = path.read_text(encoding="utf-8")
+            loaded = load_history_file(path)
+
+            self.assertEqual(loaded[0].reasoning_content, "thinking")
+            self.assertIsNone(loaded[1].reasoning_content)
+            self.assertEqual(raw.count("reasoning_content"), 1)
+
     def test_history_entries_include_only_sessions(self) -> None:
         with workspace_temp_dir() as root:
             agent_dir = root / ".agent"

@@ -204,6 +204,51 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.models["small-window"].context_window, 4096)
             self.assertIn("context_window=4096", format_model_profiles(root, config))
 
+    def test_model_reasoning_content_replay_defaults_false_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "plain": {
+                        "model": "plain-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "deepseek": {
+                        "model": "deepseek-reasoner",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "api_key": "key",
+                        "requires_reasoning_content": True,
+                    },
+                },
+            )
+
+            config = load_system_config(config_path)
+
+            self.assertFalse(config.models["plain"].requires_reasoning_content)
+            self.assertTrue(config.models["deepseek"].requires_reasoning_content)
+            self.assertIn("requires_reasoning_content=True", format_model_profiles(root, config))
+
+    def test_invalid_model_reasoning_content_replay_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "bad": {
+                        "model": "bad-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "requires_reasoning_content": "yes",
+                    },
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "models.bad.requires_reasoning_content"):
+                load_system_config(config_path)
+
     def test_invalid_model_context_window_raises(self) -> None:
         with workspace_temp_dir() as temp:
             config_path = Path(temp) / "system-config.json"
@@ -249,6 +294,7 @@ class ConfigTests(unittest.TestCase):
         template = system_config_template()
 
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
+        self.assertFalse(template["models"]["my-model"]["requires_reasoning_content"])
 
     def test_worktree_default_root_defaults_and_can_be_configured(self) -> None:
         with workspace_temp_dir() as temp:

@@ -37,7 +37,8 @@ Edit the system JSON config at `~/.uedev/config.json`:
       "model": "your_model",
       "base_url": "https://api.openai.com/v1",
       "api_key": "your_api_key",
-      "context_window": 262144
+      "context_window": 262144,
+      "requires_reasoning_content": false
     }
   },
   "display": {
@@ -62,6 +63,9 @@ OpenAI-compatible Chat Completions endpoints.
 `context_window` is optional for each model profile and defaults to 262144
 estimated tokens. Auto compaction defaults to 90% of that window unless
 `--context-threshold` is supplied.
+`requires_reasoning_content` is optional and defaults to `false`. Enable it for
+models such as DeepSeek thinking mode that require assistant
+`reasoning_content` to be replayed with later requests.
 `display.diff_output_max_chars` controls per-section `/diff` output truncation
 and defaults to 20000 characters.
 
@@ -104,6 +108,12 @@ Inspect UE configuration without launching Unreal Engine:
 
 ```bash
 uedev ue doctor --cwd D:\Path\To\GameProject
+```
+
+Compile the UE Editor target through the configured engine Build.bat:
+
+```bash
+uedev ue build --cwd D:\Path\To\GameProject
 ```
 
 Prepare a UE Python command without launching UE:
@@ -149,9 +159,10 @@ omitting it produces a dry-run command preview.
   window, auto compact threshold, and remaining capacity.
 - `/diff` shows a human-readable Git status/diff summary and Perforce workspace
   status plus opened files for the current workspace.
-- `/model` lists configured model profiles; `/model <profile>` stores the active
-  model for the current project in `.agent/config.json`; `/model reset` returns
-  to the first configured model, unless `default_model` is explicitly set.
+- `/model` opens an interactive profile selector in TUI chat. In plain mode,
+  `/model <profile>` stores the active model for the current project in
+  `.agent/config.json`; `/model reset` returns to the first configured model,
+  unless `default_model` is explicitly set.
 - `/plan` enters Plan Mode; `/plan off` exits it. In the TUI, Plan Mode shows a
   right-aligned `Plan mode (Shift+Tab to exit)` hint on the status line directly
   under the current input while the same line shows the active model and directory.
@@ -200,7 +211,7 @@ omitting it produces a dry-run command preview.
 - Persistent tasks are stored in `.agent/tasks/`.
 - Team state is stored in `.agent/team/`.
 - Managed worktree indexes and directories are stored in `.agent/worktrees/`.
-- UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; the authoritative executed script snapshot is `user_script.py` in that run directory. `.agent/ue_scripts/` is a legacy location and is not the current execution entrypoint.
+- UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; UE build artifacts are stored in `.agent/ue_builds/<run_id>/`. The authoritative executed script snapshot is `user_script.py` in the UE run directory. `.agent/ue_scripts/` is a legacy location and is not the current execution entrypoint.
 - Manual validation steps are documented in `docs/VALIDATION.md`.
 
 ## Unreal Engine Direction
@@ -209,6 +220,7 @@ The project now includes first-class UE helper tools instead of relying on ad
 hoc shell commands:
 
 - `ue.doctor`: find `.uproject`, read its `EngineAssociation`, and match a configured UE engine
+- `ue.build`: compile `<ProjectName>Editor Win64 Development` through the configured engine `Build.bat`, capture UBT/UHT/MSVC diagnostics, and store logs under `.agent/ue_builds/`
 - `ue.run_python_commandlet`: call `UnrealEditor-Cmd.exe -run=pythonscript`
 - `ue.run_python_full_editor`: call `UnrealEditor-Cmd.exe -ExecutePythonScript`
 - `ue.list_assets`: wrap a UE Python script and return JSON

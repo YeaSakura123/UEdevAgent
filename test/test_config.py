@@ -25,7 +25,9 @@ from uedev.tools.background import BackgroundManager
 from uedev.state.config import (
     DEFAULT_CONTEXT_WINDOW,
     DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+    DEFAULT_MAX_STEPS,
     DEFAULT_WORKTREE_ROOT,
+    DEFAULT_WORKSPACE_EXCLUDED_DIRS,
     ConfigError,
     agent_dir,
     format_model_profiles,
@@ -35,6 +37,7 @@ from uedev.state.config import (
     resolve_subagent_model_profile,
     system_config_template,
 )
+from uedev.cli import _resolve_max_steps
 from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
@@ -73,6 +76,8 @@ def write_system_config(
     models: dict[str, dict[str, object]] | None = None,
     ue_engines: dict[str, dict[str, object]] | None = None,
     display: dict[str, object] | None = None,
+    runtime: dict[str, object] | None = None,
+    workspace: dict[str, object] | None = None,
     worktrees: dict[str, object] | None = None,
     subagents: dict[str, object] | None = None,
 ) -> None:
@@ -90,6 +95,10 @@ def write_system_config(
     }
     if display is not None:
         payload["display"] = display
+    if runtime is not None:
+        payload["runtime"] = runtime
+    if workspace is not None:
+        payload["workspace"] = workspace
     if worktrees is not None:
         payload["worktrees"] = worktrees
     if subagents is not None:
@@ -295,6 +304,78 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
         self.assertFalse(template["models"]["my-model"]["requires_reasoning_content"])
+
+    def test_runtime_default_max_steps_defaults_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(config_path)
+
+            self.assertEqual(load_system_config(config_path).runtime_default_max_steps, DEFAULT_MAX_STEPS)
+
+            write_system_config(config_path, runtime={"default_max_steps": 24})
+
+            self.assertEqual(load_system_config(config_path).runtime_default_max_steps, 24)
+
+    def test_invalid_runtime_default_max_steps_raises(self) -> None:
+        for value in (0, -1, "many", True):
+            with self.subTest(value=value):
+                with workspace_temp_dir() as temp:
+                    config_path = Path(temp) / "system-config.json"
+                    write_system_config(config_path, runtime={"default_max_steps": value})
+
+                    with self.assertRaisesRegex(ConfigError, "runtime.default_max_steps"):
+                        load_system_config(config_path)
+
+    def test_system_config_template_includes_runtime_default_max_steps(self) -> None:
+        template = system_config_template()
+
+        self.assertEqual(template["runtime"]["default_max_steps"], DEFAULT_MAX_STEPS)
+
+    def test_cli_max_steps_uses_system_config_when_omitted(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(config_path, runtime={"default_max_steps": 13})
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                self.assertEqual(_resolve_max_steps(None), 13)
+            self.assertEqual(_resolve_max_steps(5), 5)
+
+    def test_workspace_excluded_dirs_default_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(config_path)
+
+            self.assertEqual(load_system_config(config_path).workspace_excluded_dirs, DEFAULT_WORKSPACE_EXCLUDED_DIRS)
+
+            write_system_config(config_path, workspace={"excluded_dirs": [".cache", "Generated"]})
+
+            self.assertEqual(load_system_config(config_path).workspace_excluded_dirs, (".cache", "Generated"))
+
+    def test_invalid_workspace_excluded_dirs_raise(self) -> None:
+        values = (
+            "Generated",
+            [""],
+            [123],
+            ["Nested/Dir"],
+            ["Nested\\Dir"],
+            ["/absolute"],
+            ["C:/absolute"],
+            ["C:"],
+            [".."],
+        )
+        for value in values:
+            with self.subTest(value=value):
+                with workspace_temp_dir() as temp:
+                    config_path = Path(temp) / "system-config.json"
+                    write_system_config(config_path, workspace={"excluded_dirs": value})
+
+                    with self.assertRaisesRegex(ConfigError, "workspace.excluded_dirs"):
+                        load_system_config(config_path)
+
+    def test_system_config_template_includes_workspace_excluded_dirs(self) -> None:
+        template = system_config_template()
+
+        self.assertEqual(tuple(template["workspace"]["excluded_dirs"]), DEFAULT_WORKSPACE_EXCLUDED_DIRS)
 
     def test_worktree_default_root_defaults_and_can_be_configured(self) -> None:
         with workspace_temp_dir() as temp:

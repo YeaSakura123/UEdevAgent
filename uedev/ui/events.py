@@ -71,3 +71,14 @@ def stopped_event(message: str, turn_id: str = "", duration_ms: int = 0) -> Agen
         duration_ms=duration_ms,
         is_error=True,
     )
+
+
+def incomplete_event(message: str, turn_id: str = "", duration_ms: int = 0) -> AgentEvent:
+    return AgentEvent(
+        type="stopped",
+        message=message,
+        turn_id=turn_id,
+        status="incomplete",
+        duration_ms=duration_ms,
+        is_error=False,
+    )

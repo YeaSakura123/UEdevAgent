@@ -268,6 +268,24 @@ class ShellAndApprovalTests(unittest.TestCase):
         self.assertEqual(classify_shell_command("p4 delete Source/A.cpp"), "dangerous")
 
     def test_p4_tool_permissions_match_local_pending_workflow(self) -> None:
+        grep_read_only = classify_tool_permission(
+            "grep",
+            {"pattern": "needle"},
+            collaboration_mode="default",
+            permission_mode="read_only",
+        )
+        grep_default = classify_tool_permission(
+            "grep",
+            {"pattern": "needle"},
+            collaboration_mode="default",
+            permission_mode="default",
+        )
+        grep_plan = classify_tool_permission(
+            "grep",
+            {"pattern": "needle"},
+            collaboration_mode="plan",
+            permission_mode="full_access",
+        )
         read_decision = classify_tool_permission(
             "p4_file_state",
             {"paths": ["Source/A.cpp"]},
@@ -293,6 +311,9 @@ class ShellAndApprovalTests(unittest.TestCase):
             permission_mode="full_access",
         )
 
+        self.assertEqual(grep_read_only.action, "allow")
+        self.assertEqual(grep_default.action, "allow")
+        self.assertEqual(grep_plan.action, "allow")
         self.assertEqual(read_decision.action, "allow")
         self.assertEqual(checkout_decision.action, "ask")
         self.assertEqual(delete_decision.action, "ask")

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from ..mcp.types import McpServerConfig
@@ -16,6 +16,16 @@ CONFIG_FILE = "config.json"
 DEFAULT_CONTEXT_WINDOW = 256 * 1024
 DEFAULT_DIFF_OUTPUT_MAX_CHARS = 20000
 DEFAULT_WORKTREE_ROOT = ""
+DEFAULT_MAX_STEPS = 8
+DEFAULT_WORKSPACE_EXCLUDED_DIRS = (
+    ".agent",
+    ".git",
+    ".vs",
+    "Binaries",
+    "Intermediate",
+    "Saved",
+    "DerivedDataCache",
+)
 
 
 class ConfigError(RuntimeError):
@@ -57,6 +67,8 @@ class SystemConfig:
     subagent_model_profile: str | None = None
     diff_output_max_chars: int = DEFAULT_DIFF_OUTPUT_MAX_CHARS
     worktree_default_root: Path | None = None
+    runtime_default_max_steps: int = DEFAULT_MAX_STEPS
+    workspace_excluded_dirs: tuple[str, ...] = DEFAULT_WORKSPACE_EXCLUDED_DIRS
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,12 @@ def system_config_template() -> dict[str, Any]:
         },
         "display": {
             "diff_output_max_chars": DEFAULT_DIFF_OUTPUT_MAX_CHARS,
+        },
+        "runtime": {
+            "default_max_steps": DEFAULT_MAX_STEPS,
+        },
+        "workspace": {
+            "excluded_dirs": list(DEFAULT_WORKSPACE_EXCLUDED_DIRS),
         },
         "worktrees": {
             "default_root": DEFAULT_WORKTREE_ROOT,
@@ -196,6 +214,8 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
 
     mcp_servers = _parse_mcp_servers(data.get("mcp", {}), config_path)
     diff_output_max_chars = _parse_display_config(data.get("display", {}), config_path)
+    runtime_default_max_steps = _parse_runtime_config(data.get("runtime", {}), config_path)
+    workspace_excluded_dirs = _parse_workspace_config(data.get("workspace", {}), config_path)
     worktree_default_root = _parse_worktree_config(data.get("worktrees", {}), config_path)
     subagent_model_profile = _parse_subagent_config(data.get("subagents", {}), models, config_path)
 
@@ -208,6 +228,8 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
         subagent_model_profile=subagent_model_profile,
         diff_output_max_chars=diff_output_max_chars,
         worktree_default_root=worktree_default_root,
+        runtime_default_max_steps=runtime_default_max_steps,
+        workspace_excluded_dirs=workspace_excluded_dirs,
     )
 
 
@@ -406,6 +428,50 @@ def _parse_display_config(raw_display: object, config_path: Path) -> int:
         config_path,
         "display.diff_output_max_chars",
     )
+
+
+def _parse_runtime_config(raw_runtime: object, config_path: Path) -> int:
+    if raw_runtime is None:
+        return DEFAULT_MAX_STEPS
+    if not isinstance(raw_runtime, dict):
+        raise ConfigError(f"System config runtime must be an object: {config_path}")
+    return _optional_positive_int(
+        raw_runtime.get("default_max_steps"),
+        DEFAULT_MAX_STEPS,
+        config_path,
+        "runtime.default_max_steps",
+    )
+
+
+def _parse_workspace_config(raw_workspace: object, config_path: Path) -> tuple[str, ...]:
+    if raw_workspace is None:
+        return DEFAULT_WORKSPACE_EXCLUDED_DIRS
+    if not isinstance(raw_workspace, dict):
+        raise ConfigError(f"System config workspace must be an object: {config_path}")
+    raw_excluded = raw_workspace.get("excluded_dirs")
+    if raw_excluded is None:
+        return DEFAULT_WORKSPACE_EXCLUDED_DIRS
+    if not isinstance(raw_excluded, list):
+        raise ConfigError(f"workspace.excluded_dirs must be an array of directory names: {config_path}")
+    names: list[str] = []
+    for item in raw_excluded:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"workspace.excluded_dirs must be an array of directory names: {config_path}")
+        value = item.strip()
+        if _is_invalid_excluded_dir(value):
+            raise ConfigError(f"workspace.excluded_dirs entries must be single directory names: {config_path}")
+        names.append(value)
+    return tuple(names)
+
+
+def _is_invalid_excluded_dir(value: str) -> bool:
+    if value in {".", ".."}:
+        return True
+    if "/" in value or "\\" in value:
+        return True
+    if PurePosixPath(value).is_absolute() or PureWindowsPath(value).is_absolute():
+        return True
+    return bool(PureWindowsPath(value).drive)
 
 
 def _parse_worktree_config(raw_worktrees: object, config_path: Path) -> Path | None:

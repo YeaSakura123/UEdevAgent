@@ -59,27 +59,34 @@ from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
 from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
-from uedev.tools.workspace import edit_file, list_files, read_file, safe_path, write_file
+from uedev.tools.workspace import edit_file, grep, list_files, read_file, safe_path, write_file
 from uedev.tools.worktrees import WorktreeManager
 
 
-def write_system_config(config_path: Path, *, models: dict[str, dict[str, str]] | None = None, ue_engines: dict[str, dict[str, object]] | None = None) -> None:
+def write_system_config(
+    config_path: Path,
+    *,
+    models: dict[str, dict[str, str]] | None = None,
+    ue_engines: dict[str, dict[str, object]] | None = None,
+    workspace: dict[str, object] | None = None,
+) -> None:
+    payload: dict[str, object] = {
+        "version": 1,
+        "models": models
+        or {
+            "first-model": {
+                "model": "gpt-test",
+                "base_url": "https://api.openai.com/v1",
+                "api_key": "test-key",
+            }
+        },
+        "ue": {"engines": ue_engines or {}},
+    }
+    if workspace is not None:
+        payload["workspace"] = workspace
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "models": models
-                or {
-                    "first-model": {
-                        "model": "gpt-test",
-                        "base_url": "https://api.openai.com/v1",
-                        "api_key": "test-key",
-                    }
-                },
-                "ue": {"engines": ue_engines or {}},
-            }
-        ),
+        json.dumps(payload),
         encoding="utf-8",
     )
 
@@ -104,6 +111,41 @@ class WorkspaceToolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 read_file(root, "../outside.txt")
 
+    def test_workspace_tools_exclude_internal_and_generated_dirs(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            for directory in [".agent", ".git", ".vs", "Binaries", "Intermediate", "Saved", "DerivedDataCache"]:
+                hidden = root / directory
+                hidden.mkdir()
+                (hidden / "hidden.txt").write_text("hidden", encoding="utf-8")
+            source = root / "Source"
+            source.mkdir()
+            (source / "Game.cpp").write_text("code", encoding="utf-8")
+
+            listed = list_files(root).replace("\\", "/")
+
+            self.assertIn("Source/Game.cpp", listed)
+            for directory in [".agent", ".git", ".vs", "Binaries", "Intermediate", "Saved", "DerivedDataCache"]:
+                self.assertNotIn(f"{directory}/", listed)
+
+    def test_workspace_tools_reject_direct_access_to_excluded_dirs(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            (root / ".agent").mkdir()
+            (root / ".agent" / "messages.jsonl").write_text("secret", encoding="utf-8")
+            (root / ".vs").mkdir()
+            (root / ".vs" / "state.txt").write_text("state", encoding="utf-8")
+            (root / ".git").mkdir()
+
+            with self.assertRaisesRegex(ValueError, "Path is excluded"):
+                list_files(root, ".agent")
+            with self.assertRaisesRegex(ValueError, "Path is excluded"):
+                read_file(root, ".agent/messages.jsonl")
+            with self.assertRaisesRegex(ValueError, "Path is excluded"):
+                write_file(root, ".git/config", "config")
+            with self.assertRaisesRegex(ValueError, "Path is excluded"):
+                edit_file(root, ".vs/state.txt", "state", "updated")
+
     def test_safe_path_does_not_resolve_workspace_links(self) -> None:
         with workspace_temp_dir() as temp:
             root = Path(temp)
@@ -122,6 +164,35 @@ class WorkspaceToolTests(unittest.TestCase):
 
             self.assertEqual(path, worktree / "Content")
             self.assertIn("Content", list_files(worktree, "Content"))
+
+    def test_runtime_uses_configured_workspace_excludes(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path, workspace={"excluded_dirs": ["Hidden"]})
+            (root / "Hidden").mkdir()
+            (root / "Hidden" / "secret.txt").write_text("secret", encoding="utf-8")
+            (root / "Visible").mkdir()
+            (root / "Visible" / "ok.txt").write_text("ok", encoding="utf-8")
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                runtime = AgentRuntime(
+                    AgentOptions(
+                        task="",
+                        max_steps=1,
+                        auto_approve=True,
+                        cwd=root,
+                        timeout_seconds=120,
+                        verbose=False,
+                    )
+                )
+
+            listed = runtime.tools["list_files"]({"path": ".", "limit": 200}).replace("\\", "/")
+
+            self.assertIn("Visible/ok.txt", listed)
+            self.assertNotIn("Hidden/secret.txt", listed)
+            with self.assertRaisesRegex(ValueError, "Path is excluded"):
+                runtime.tools["read_file"]({"path": "Hidden/secret.txt"})
 
     def test_edit_file_tool_accepts_edits_list(self) -> None:
         with workspace_temp_dir() as temp:
@@ -146,6 +217,103 @@ class WorkspaceToolTests(unittest.TestCase):
 
             self.assertIn("Edited", result)
             self.assertEqual(read_file(root, "test/main.py"), "print('updated')")
+
+    def test_grep_python_fallback_searches_text_with_locations(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            source = root / "Source"
+            source.mkdir()
+            (source / "Game.cpp").write_text("alpha\nbeta target\n", encoding="utf-8")
+
+            with patch("uedev.tools.workspace.subprocess.run", side_effect=FileNotFoundError):
+                result = grep(root, "target", excluded_dirs=())
+
+            self.assertIn("Source", result)
+            self.assertIn("Game.cpp:2:6: beta target", result)
+
+    def test_grep_honors_glob_limit_case_and_output_modes(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            (root / "a.py").write_text("Target one\nTARGET two\n", encoding="utf-8")
+            (root / "b.txt").write_text("Target ignored\n", encoding="utf-8")
+
+            with patch("uedev.tools.workspace.subprocess.run", side_effect=FileNotFoundError):
+                content = grep(root, "target", glob="*.py", limit=1, case_sensitive=False, excluded_dirs=())
+                files = grep(root, "target", glob="*.py", output_mode="files", case_sensitive=False, excluded_dirs=())
+                counts = grep(root, "target", glob="*.py", output_mode="count", case_sensitive=False, excluded_dirs=())
+
+            self.assertIn("a.py:1:1: Target one", content)
+            self.assertIn("... (1 more matches)", content)
+            self.assertEqual(files, "a.py")
+            self.assertEqual(counts, "a.py: 2")
+            self.assertNotIn("b.txt", content)
+
+    def test_grep_rejects_escaped_or_excluded_paths_and_skips_excluded_dirs(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            (root / ".agent").mkdir()
+            (root / ".agent" / "secret.txt").write_text("needle", encoding="utf-8")
+            (root / "Source").mkdir()
+            (root / "Source" / "visible.txt").write_text("needle", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "Path escapes workspace"):
+                grep(root, "needle", "../outside")
+            with self.assertRaisesRegex(ValueError, "Path is excluded"):
+                grep(root, "needle", ".agent")
+
+            with patch("uedev.tools.workspace.subprocess.run", side_effect=FileNotFoundError):
+                result = grep(root, "needle")
+
+            self.assertIn("Source", result)
+            self.assertIn("visible.txt", result)
+            self.assertNotIn("secret.txt", result)
+
+    def test_grep_skips_binary_content_and_includes_ue_asset_path_matches(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            content = root / "Content"
+            content.mkdir()
+            (content / "Vehicle.uasset").write_bytes(b"\0needle inside binary")
+            (root / "blob.bin").write_bytes(b"\0needle inside binary")
+
+            with patch("uedev.tools.workspace.subprocess.run", side_effect=FileNotFoundError):
+                asset_result = grep(root, "Vehicle")
+                binary_result = grep(root, "needle", include_asset_paths=False)
+
+            self.assertIn("Vehicle.uasset: asset path match", asset_result)
+            self.assertEqual(binary_result, "(no matches)")
+
+    def test_grep_parses_ripgrep_json_results(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            (root / "Source").mkdir()
+            (root / "Source" / "Game.cpp").write_text("int target;\n", encoding="utf-8")
+            stdout = json.dumps(
+                {
+                    "type": "match",
+                    "data": {
+                        "path": {"text": "Source/Game.cpp"},
+                        "lines": {"text": "int target;\n"},
+                        "line_number": 7,
+                        "submatches": [{"match": {"text": "target"}, "start": 4, "end": 10}],
+                    },
+                }
+            )
+            completed = type("Completed", (), {"returncode": 0, "stdout": stdout + "\n", "stderr": ""})()
+
+            with patch("uedev.tools.workspace.subprocess.run", return_value=completed) as run:
+                result = grep(root, "target", glob="*.cpp", excluded_dirs=())
+
+            command = run.call_args.args[0]
+            self.assertIn("--json", command)
+            self.assertIn("-g", command)
+            self.assertIn("Source", result)
+            self.assertIn("Game.cpp:7:5: int target;", result)
+
+    def test_grep_invalid_regex_is_clear(self) -> None:
+        with workspace_temp_dir() as temp:
+            with self.assertRaisesRegex(ValueError, "Invalid grep pattern"):
+                grep(Path(temp), "[")
 
 class SkillLoaderTests(unittest.TestCase):
     def test_load_skill_from_frontmatter(self) -> None:

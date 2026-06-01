@@ -86,6 +86,7 @@ class TurnViewState:
         tool_events = [event for event in self.events if event.type in {"tool_result", "tool_error"}]
         edited_files = sum(1 for event in tool_events if event.name in {"edit_file", "write_file"})
         errors = sum(1 for event in self.events if event.is_error)
+        incomplete = any(event.status == "incomplete" for event in self.events)
         duration_ms = max((event.duration_ms or 0 for event in self.events), default=0)
 
         if duration_ms:
@@ -97,6 +98,8 @@ class TurnViewState:
             parts.append(f"{edited_files} file{'s' if edited_files != 1 else ''} edited")
         if errors:
             parts.append(f"{errors} error{'s' if errors != 1 else ''}")
+        if incomplete:
+            parts.append("incomplete")
         return " | ".join(parts)
 
 
@@ -244,8 +247,15 @@ class TuiRenderer:
             summary = turn.summary()
             self._record("summary", summary)
             self._print(Rule(summary, style="dim"))
-            self._record("assistant" if event.type == "final" else "stopped", event.message)
-            self._print(self._assistant_block(event.message, is_error=event.type == "stopped"))
+            record_type = "assistant" if event.type == "final" else event.status or "stopped"
+            self._record(record_type, event.message)
+            self._print(
+                self._assistant_block(
+                    event.message,
+                    is_error=event.is_error,
+                    is_incomplete=event.status == "incomplete",
+                )
+            )
             return
 
         turn.add_event(event)
@@ -320,8 +330,6 @@ class TuiRenderer:
         return None
 
     def _thinking_text(self, event: AgentEvent) -> str:
-        if event.step and event.total:
-            return f"Thinking... ({event.step}/{event.total})"
         return "Thinking..."
 
     def _tool_start_text(self, event: AgentEvent) -> str:
@@ -349,9 +357,11 @@ class TuiRenderer:
             renderable = Text(body)
         return Panel(renderable, title=f"tool: {name}", border_style=style, box=box.ASCII, expand=False)
 
-    def _assistant_block(self, message: str, *, is_error: bool = False) -> RenderableType:
+    def _assistant_block(self, message: str, *, is_error: bool = False, is_incomplete: bool = False) -> RenderableType:
         if is_error:
             return _block("stopped", Text(message), style="bold red")
+        if is_incomplete:
+            return _block("incomplete", Text(message), style="bold yellow")
         try:
             renderable: RenderableType = Markdown(message)
         except Exception:
@@ -417,8 +427,12 @@ def _block(label: str, renderable: RenderableType, *, style: str) -> RenderableT
 
 
 def _event_from_dict(raw: dict[str, object]) -> AgentEvent:
+    event_type = str(raw.get("type") or "stopped")
+    status = str(raw.get("status") or "")
+    raw_is_error = raw.get("is_error")
+    is_error = bool(raw_is_error) if raw_is_error is not None else event_type == "stopped" and status != "incomplete"
     return AgentEvent(
-        type=str(raw.get("type") or "stopped"),  # type: ignore[arg-type]
+        type=event_type,  # type: ignore[arg-type]
         message=str(raw.get("message") or ""),
         name=str(raw.get("name") or ""),
         input=raw.get("input") if isinstance(raw.get("input"), dict) else {},
@@ -426,10 +440,10 @@ def _event_from_dict(raw: dict[str, object]) -> AgentEvent:
         step=_int_value(raw.get("step")),
         total=_int_value(raw.get("total")),
         turn_id=str(raw.get("turn_id") or ""),
-        status=str(raw.get("status") or ""),
+        status=status,
         summary=str(raw.get("summary") or ""),
         duration_ms=_int_value(raw.get("duration_ms")),
-        is_error=bool(raw.get("is_error", False)),
+        is_error=is_error,
     )
 
 

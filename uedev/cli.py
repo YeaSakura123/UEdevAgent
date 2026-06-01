@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="run one agent task")
     run_parser.add_argument("task", nargs="+", help="task for the agent")
-    run_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=8, help=argparse.SUPPRESS)
+    run_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=None, help=argparse.SUPPRESS)
     run_parser.add_argument("--timeout", type=int, default=120, help="shell command timeout in seconds")
     run_parser.add_argument("-y", "--yes", action="store_true", help="start this run in full-access permission mode")
     run_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     chat_parser = subparsers.add_parser("chat", help="start an interactive agent chat session")
-    chat_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=8, help=argparse.SUPPRESS)
+    chat_parser.add_argument("--max-iterations", "--max-steps", dest="max_steps", type=int, default=None, help=argparse.SUPPRESS)
     chat_parser.add_argument("--timeout", type=int, default=120, help="shell command timeout in seconds")
     chat_parser.add_argument("-y", "--yes", action="store_true", help="start this chat in full-access permission mode")
     chat_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory for shell commands")
@@ -120,10 +120,11 @@ def main() -> None:
         elif args.command == "doctor":
             doctor()
         elif args.command == "run":
+            max_steps = _resolve_max_steps(args.max_steps)
             run_agent(
                 AgentOptions(
                     task=" ".join(args.task),
-                    max_steps=args.max_steps,
+                    max_steps=max_steps,
                     auto_approve=args.yes,
                     cwd=Path(args.cwd).resolve(),
                     timeout_seconds=args.timeout,
@@ -132,10 +133,11 @@ def main() -> None:
                 )
             )
         elif args.command == "chat":
+            max_steps = _resolve_max_steps(args.max_steps)
             run_chat(
                 AgentOptions(
                     task="",
-                    max_steps=args.max_steps,
+                    max_steps=max_steps,
                     auto_approve=args.yes,
                     cwd=Path(args.cwd).resolve(),
                     timeout_seconds=args.timeout,
@@ -187,6 +189,14 @@ def init_config(cwd: Path, force: bool = False) -> None:
     else:
         write_json(project_path, project_config_template())
         print(f"Created project config: {project_path}")
+
+
+def _resolve_max_steps(cli_value: int | None) -> int:
+    if cli_value is not None:
+        if cli_value <= 0:
+            raise ConfigError("--max-steps must be a positive integer")
+        return cli_value
+    return load_system_config().runtime_default_max_steps
 
 
 def doctor() -> None:

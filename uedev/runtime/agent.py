@@ -51,6 +51,7 @@ from .. import __version__
 from ..tools.background import BackgroundManager
 from ..state.config import (
     ConfigError,
+    DEFAULT_WORKSPACE_EXCLUDED_DIRS,
     active_model_name,
     agent_dir,
     format_model_profiles,
@@ -74,6 +75,7 @@ from ..ui.events import (
     AgentEvent,
     compact_event,
     final_event,
+    incomplete_event,
     stopped_event,
     thinking_event,
     tool_error_event,
@@ -127,7 +129,7 @@ from ..ue import (
     render_run_result,
     run_ue_build,
 )
-from ..tools.workspace import edit_file, list_files, read_file, write_file
+from ..tools.workspace import edit_file, grep, list_files, read_file, write_file
 from ..tools.worktrees import WorktreeManager
 
 
@@ -173,6 +175,12 @@ SLASH_COMMANDS = [
     ("/compact", "Compact the current conversation context."),
     ("/clear", "Reset the current chat conversation context."),
 ]
+
+FORCED_FINALIZATION_PROMPT = """You have reached the tool and step budget for this turn.
+
+Do not call tools. Provide the final answer now. Summarize what changed, what failed, and what remains. If work is incomplete, say so clearly and mention the next concrete step.
+
+If Plan Mode is active, the final answer must be wrapped exactly in <proposed_plan> and </proposed_plan>."""
 
 
 # 外部函数：生成 /help 命令展示的帮助文本，负责 agent 主循环、chat 界面、工具分发和运行时观察。
@@ -768,6 +776,7 @@ class AgentRuntime:
         self.bus = MessageBus(self.agent_dir / "team")
         self.team = TeamManager(self.agent_dir / "team", self.task_manager, self.bus)
         self.worktrees = WorktreeManager(options.cwd, self.agent_dir / "worktrees", self.task_manager)
+        self.workspace_excluded_dirs = self._load_workspace_excluded_dirs()
         self.subagents = SubagentManager(
             self.agent_dir,
             options.max_steps,
@@ -807,6 +816,8 @@ class AgentRuntime:
         started_at = time.perf_counter()
         standalone_subagents_dir: Path | None = None
         tool_names_this_turn: list[str] = []
+        tool_events_this_turn: list[AgentEvent] = []
+        edited_paths_this_turn: list[str] = []
         goal_message = ChatMessage(role="user", content=goal)
         goal_already_appended = bool(messages and messages[-1].role == "user" and messages[-1].content == goal)
         if goal_already_appended:
@@ -852,7 +863,11 @@ class AgentRuntime:
                 self._inject_runtime_observations(messages)
             yield thinking_event(step, self.options.max_steps, current_turn_id)
 
-            response = call_model(messages, self.current_model_profile(), tools=self.tool_specs)
+            try:
+                response = call_model(messages, self.current_model_profile(), tools=self.tool_specs)
+            except Exception as error:
+                yield stopped_event(str(error), current_turn_id, _duration_ms(started_at))
+                return
             if response.tool_calls:
                 assistant_message = ChatMessage(
                     role="assistant",
@@ -907,6 +922,10 @@ class AgentRuntime:
                     else:
                         tool_names_this_turn.append(action.name)
                         yield tool_start_event(action.name, action.input, current_turn_id)
+                        if action.name in {"edit_file", "write_file"}:
+                            path = str(action.input.get("path") or "").strip()
+                            if path and path not in edited_paths_this_turn:
+                                edited_paths_this_turn.append(path)
                         output, is_error = self._execute_tool_with_status(action)
                     if action.name == "todo_update":
                         rounds_without_todo = 0
@@ -914,9 +933,11 @@ class AgentRuntime:
                         rounds_without_todo += 1
 
                     if is_error:
-                        yield tool_error_event(action.name, output, current_turn_id)
+                        event = tool_error_event(action.name, output, current_turn_id)
                     else:
-                        yield tool_result_event(action.name, output, current_turn_id)
+                        event = tool_result_event(action.name, output, current_turn_id)
+                    tool_events_this_turn.append(event)
+                    yield event
 
                     tool_content = f"Tool result for: {action.name}\n{truncate(output)}"
                     if self.todo_manager.has_open_items() and rounds_without_todo >= 3:
@@ -999,12 +1020,111 @@ class AgentRuntime:
             yield final_event(final_answer, current_turn_id, _duration_ms(started_at))
             return
 
-        yield stopped_event(
-            f"Stopped after {self.options.max_steps} iterations without a final answer.",
+        yield self._force_finalize_turn(
+            messages,
             current_turn_id,
-            _duration_ms(started_at),
+            started_at,
+            history,
+            tool_events_this_turn,
+            edited_paths_this_turn,
         )
         return
+
+    def _force_finalize_turn(
+        self,
+        messages: list[ChatMessage],
+        turn_id: str,
+        started_at: float,
+        history: HistoryRecorder | None,
+        tool_events: list[AgentEvent],
+        edited_paths: list[str],
+    ) -> AgentEvent:
+        request = [
+            *messages,
+            ChatMessage(role="system", content=FORCED_FINALIZATION_PROMPT),
+        ]
+        try:
+            response = call_model(request, self.current_model_profile())
+        except Exception as error:
+            return incomplete_event(
+                self._render_incomplete_summary(
+                    f"Stopped after {self.options.max_steps} iterations without a final answer. "
+                    f"Forced finalization failed: {error}",
+                    tool_events,
+                    edited_paths,
+                ),
+                turn_id,
+                _duration_ms(started_at),
+            )
+
+        final_answer = response.content.strip()
+        if response.tool_calls:
+            return incomplete_event(
+                self._render_incomplete_summary(
+                    f"Stopped after {self.options.max_steps} iterations without a final answer. "
+                    "Forced finalization returned tool calls instead of a final answer.",
+                    tool_events,
+                    edited_paths,
+                ),
+                turn_id,
+                _duration_ms(started_at),
+            )
+        if not final_answer:
+            return incomplete_event(
+                self._render_incomplete_summary(
+                    f"Stopped after {self.options.max_steps} iterations without a final answer. "
+                    "Forced finalization returned an empty answer.",
+                    tool_events,
+                    edited_paths,
+                ),
+                turn_id,
+                _duration_ms(started_at),
+            )
+        if self.collaboration_mode == "plan" and not is_proposed_plan(final_answer):
+            return incomplete_event(
+                self._render_incomplete_summary(
+                    f"Stopped after {self.options.max_steps} iterations without a valid Plan Mode final answer.",
+                    tool_events,
+                    edited_paths,
+                ),
+                turn_id,
+                _duration_ms(started_at),
+            )
+
+        assistant_message = ChatMessage(
+            role="assistant",
+            content=final_answer,
+            reasoning_content=response.reasoning_content,
+        )
+        messages.append(assistant_message)
+        if history is not None:
+            history.append(assistant_message)
+        return final_event(final_answer, turn_id, _duration_ms(started_at))
+
+    def _render_incomplete_summary(
+        self,
+        reason: str,
+        tool_events: list[AgentEvent],
+        edited_paths: list[str],
+    ) -> str:
+        lines = [
+            "Incomplete turn.",
+            "",
+            f"Reason: {reason}",
+            f"Max steps: {self.options.max_steps}",
+            f"Tools completed: {len(tool_events)}",
+        ]
+        if edited_paths:
+            lines.append(f"Edited files: {', '.join(edited_paths[:8])}")
+            if len(edited_paths) > 8:
+                lines.append(f"... ({len(edited_paths) - 8} more edited files)")
+        if tool_events:
+            last = tool_events[-1]
+            label = "Last tool error" if last.type == "tool_error" else "Last tool result"
+            detail = last.message or last.output
+            lines.extend(["", f"{label}: {last.name}", truncate(detail, 1200)])
+        lines.extend(["", "Continue with a new turn to resume from the current workspace state."])
+        return "\n".join(lines)
 
     # 外部函数：处理 chat 内本地 slash command，负责 agent 主循环、chat 界面、工具分发和运行时观察。
     def handle_slash_command(
@@ -1281,6 +1401,14 @@ class AgentRuntime:
     def _diff_output_max_chars(self) -> int:
         return load_system_config().diff_output_max_chars
 
+    def _load_workspace_excluded_dirs(self) -> tuple[str, ...]:
+        try:
+            return load_system_config().workspace_excluded_dirs
+        except ConfigError as error:
+            if "Config file not found" in str(error):
+                return DEFAULT_WORKSPACE_EXCLUDED_DIRS
+            raise
+
     def switch_model(self, name: str) -> str:
         if not name:
             return self.render_models()
@@ -1375,12 +1503,26 @@ class AgentRuntime:
                         raise ValueError("each edit must be an object")
                     old_text = str(edit.get("old_text", edit.get("oldText", "")))
                     new_text = str(edit.get("new_text", edit.get("newText", "")))
-                    results.append(edit_file(self.options.cwd, path, old_text, new_text))
+                    results.append(edit_file(self.options.cwd, path, old_text, new_text, excluded_dirs=self.workspace_excluded_dirs))
                 return "\n".join(results)
 
             old_text = str(tool_input.get("old_text", tool_input.get("oldText", "")))
             new_text = str(tool_input.get("new_text", tool_input.get("newText", "")))
-            return edit_file(self.options.cwd, path, old_text, new_text)
+            return edit_file(self.options.cwd, path, old_text, new_text, excluded_dirs=self.workspace_excluded_dirs)
+
+        def grep_tool(tool_input: dict[str, object]) -> str:
+            limit = _optional_int(tool_input.get("limit"))
+            return grep(
+                self.options.cwd,
+                str(tool_input.get("pattern", "")),
+                str(tool_input.get("path", ".")),
+                _optional_str(tool_input.get("glob")),
+                limit if limit is not None else 100,
+                case_sensitive=_optional_bool(tool_input.get("case_sensitive"), default=True),
+                output_mode=str(tool_input.get("output_mode") or "content"),
+                include_asset_paths=_optional_bool(tool_input.get("include_asset_paths"), default=True),
+                excluded_dirs=self.workspace_excluded_dirs,
+            )
 
         # 内部函数：处理 subagent 工具调用，启动受限子 agent 完成子任务。
         def subagent_tool(tool_input: dict[str, object]) -> str:
@@ -1390,15 +1532,27 @@ class AgentRuntime:
 
         handlers: dict[str, ToolHandler] = {
             "shell": shell_tool,
-            "read_file": lambda data: read_file(self.options.cwd, str(data.get("path", "")), _optional_int(data.get("limit"))),
-            "write_file": lambda data: write_file(self.options.cwd, str(data.get("path", "")), str(data.get("content", ""))),
+            "read_file": lambda data: read_file(
+                self.options.cwd,
+                str(data.get("path", "")),
+                _optional_int(data.get("limit")),
+                excluded_dirs=self.workspace_excluded_dirs,
+            ),
+            "write_file": lambda data: write_file(
+                self.options.cwd,
+                str(data.get("path", "")),
+                str(data.get("content", "")),
+                excluded_dirs=self.workspace_excluded_dirs,
+            ),
             "edit_file": edit_file_tool,
             "list_files": lambda data: list_files(
                 self.options.cwd,
                 str(data.get("path", ".")),
                 str(data.get("pattern", "*")),
                 int(data.get("limit", 200)),
+                excluded_dirs=self.workspace_excluded_dirs,
             ),
+            "grep": grep_tool,
             "todo_update": lambda data: self.todo_manager.update(_require_list_of_dicts(data.get("items"), "items")),
             "todo_list": lambda data: self.todo_manager.render_current(),
             "subagent": subagent_tool,
@@ -1560,7 +1714,7 @@ class AgentRuntime:
 def _permission_prompt_label(name: str, tool_input: dict[str, object]) -> str:
     if name in {"shell", "background_run", "worktree_run"}:
         return str(tool_input.get("command") or name)
-    if name in {"write_file", "edit_file", "read_file", "list_files"}:
+    if name in {"write_file", "edit_file", "read_file", "list_files", "grep"}:
         path = str(tool_input.get("path") or "").strip()
         return f"{name} {path}".strip()
     if name == "ue_build":
@@ -1694,6 +1848,19 @@ def _optional_str(value: object) -> str | None:
         return None
     text = str(value)
     return text if text else None
+
+
+def _optional_bool(value: object, *, default: bool) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(value)
 
 
 # 内部函数：处理 _optional_int 辅助逻辑，支撑 agent 主循环、chat 界面、工具分发和运行时观察。

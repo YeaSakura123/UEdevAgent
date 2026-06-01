@@ -1301,6 +1301,100 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertEqual(events[-1].message, "<proposed_plan>\n# Plan\n</proposed_plan>")
             self.assertTrue(any(message.role == "system" and "Plan Mode final answers" in message.content for message in messages))
 
+    def test_max_steps_forces_final_answer_without_tools(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            write_file(root, "a.txt", "hello")
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})]),
+                ModelResponse("Forced final summary."),
+            ]
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses) as mock_call:
+                    events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test", history=history))
+
+            self.assertEqual(events[-1].type, "final")
+            self.assertEqual(events[-1].message, "Forced final summary.")
+            self.assertNotIn("tools", mock_call.call_args_list[1].kwargs)
+            loaded = load_history_file(history.path or Path())
+            self.assertEqual(loaded[-1].role, "assistant")
+            self.assertEqual(loaded[-1].content, "Forced final summary.")
+
+    def test_max_steps_tool_call_during_finalization_becomes_incomplete(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            write_file(root, "a.txt", "hello")
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})]),
+                ModelResponse("", [ToolCall(id="call_2", name="read_file", arguments={"path": "a.txt"})]),
+            ]
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
+                    events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test", history=history))
+
+            self.assertEqual(events[-1].type, "stopped")
+            self.assertEqual(events[-1].status, "incomplete")
+            self.assertFalse(events[-1].is_error)
+            self.assertIn("Forced finalization returned tool calls", events[-1].message)
+            loaded = load_history_file(history.path or Path())
+            self.assertFalse(any(message.content.startswith("Incomplete turn.") for message in loaded))
+
+    def test_model_request_error_is_stopped_error(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=RuntimeError("model exploded")):
+                    events = list(runtime.run_turn_events(messages, "hello", turn_id="turn-test"))
+
+            self.assertEqual(events[-1].type, "stopped")
+            self.assertEqual(events[-1].status, "stopped")
+            self.assertTrue(events[-1].is_error)
+            self.assertIn("model exploded", events[-1].message)
+
 class BackgroundTests(unittest.TestCase):
     def test_background_check_empty(self) -> None:
         with workspace_temp_dir() as temp:

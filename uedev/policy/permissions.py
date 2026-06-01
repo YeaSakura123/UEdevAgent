@@ -23,6 +23,7 @@ class PermissionDecision:
 _READ_TOOLS = {
     "read_file",
     "list_files",
+    "grep",
     "todo_list",
     "task_get",
     "task_list",

@@ -44,6 +44,12 @@ Edit the system JSON config at `~/.uedev/config.json`:
   "display": {
     "diff_output_max_chars": 20000
   },
+  "runtime": {
+    "default_max_steps": 8
+  },
+  "workspace": {
+    "excluded_dirs": [".agent", ".git", ".vs", "Binaries", "Intermediate", "Saved", "DerivedDataCache"]
+  },
   "ue": {
     "engines": {
       "5.4": {
@@ -68,6 +74,10 @@ models such as DeepSeek thinking mode that require assistant
 `reasoning_content` to be replayed with later requests.
 `display.diff_output_max_chars` controls per-section `/diff` output truncation
 and defaults to 20000 characters.
+`runtime.default_max_steps` controls the default agent work-loop budget when
+`--max-steps` is not supplied, and defaults to 8.
+`workspace.excluded_dirs` controls directory names skipped by workspace file
+tools and defaults to the listed agent, VCS, IDE, and UE generated folders.
 
 ## Usage
 
@@ -128,6 +138,7 @@ Useful options:
 
 ```bash
 uedev chat --timeout 180
+uedev chat --max-steps 16
 uedev chat --plain
 uedev run "inspect this project" --yes
 uedev run "debug this folder" --verbose

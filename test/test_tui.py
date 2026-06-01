@@ -30,7 +30,7 @@ except ModuleNotFoundError as error:
 from uedev.tools.background import BackgroundManager
 from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
 from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
-from uedev.ui.events import compact_event, final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
+from uedev.ui.events import compact_event, final_event, incomplete_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
@@ -110,6 +110,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("Never answer with acknowledgements about future behavior", prompt)
         self.assertIn("Do not use todo_update to acknowledge instructions", prompt)
         self.assertIn("meaningful multi-step task tracking only", prompt)
+        self.assertIn("grep for structured content searches", prompt)
         self.assertIn("call ue_doctor directly and do not call list_files or shell `p4 info`", prompt)
         self.assertIn("Only use shell `p4 info` for raw Perforce diagnostics", prompt)
         self.assertIn("Available skills:\n- ue-editor: UE workflow", prompt)
@@ -142,7 +143,8 @@ class RendererTests(unittest.TestCase):
         text = renderer.render_text()
         rendered = stream.getvalue()
 
-        self.assertIn("thinking:\nThinking... (1/3)", text)
+        self.assertIn("thinking:\nThinking...", text)
+        self.assertNotIn("Thinking... (1/3)", text)
         self.assertIn("summary:\nWorked", text)
         self.assertIn("1 tool used", text)
         self.assertIn("assistant:\ndone", text)
@@ -176,6 +178,24 @@ class RendererTests(unittest.TestCase):
 
         self.assertIn("tool_error:\nFailed shell\nboom", text)
         self.assertIn("Failed shell", rendered)
+
+    def test_tui_renderer_renders_incomplete_without_error_count(self) -> None:
+        stream = StringIO()
+        renderer = TuiRenderer("banner", verbose=False, stream=stream)
+        renderer.start_turn("turn-1", "loop")
+
+        renderer.render(thinking_event(1, 1, "turn-1"))
+        renderer.render(tool_result_event("read_file", "ok", "turn-1"))
+        renderer.render(incomplete_event("Incomplete turn.", "turn-1"))
+
+        text = renderer.render_text()
+        rendered = stream.getvalue()
+
+        self.assertIn("summary:\nWorked", text)
+        self.assertIn("incomplete", text)
+        self.assertNotIn("1 error", text)
+        self.assertIn("incomplete:\nIncomplete turn.", text)
+        self.assertIn("incomplete", rendered)
 
     def test_console_renderer_compacts_long_output(self) -> None:
         renderer = ConsoleRenderer(verbose=True, max_output_chars=24)
@@ -237,7 +257,8 @@ class RendererTests(unittest.TestCase):
         rendered = stream.getvalue()
 
         self.assertIn("user:\nrun shell", transcript)
-        self.assertIn("thinking:\nThinking... (1/3)", transcript)
+        self.assertIn("thinking:\nThinking...", transcript)
+        self.assertNotIn("Thinking... (1/3)", transcript)
         self.assertIn("tool_start:\nRunning shell", transcript)
         self.assertIn("tool_result:\nOK shell", transcript)
         self.assertIn("summary:\nWorked for 2s | 1 tool used", transcript)

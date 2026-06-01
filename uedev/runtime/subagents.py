@@ -318,7 +318,7 @@ def parse_subagent_spec(tool_input: dict[str, object]) -> SubagentSpec:
 
 
 def _allowed_tools(agent_type: str) -> set[str]:
-    allowed = {"read_file", "list_files", "shell"}
+    allowed = {"read_file", "list_files", "grep", "shell"}
     if agent_type == "worker":
         allowed.update({"write_file", "edit_file"})
     return allowed

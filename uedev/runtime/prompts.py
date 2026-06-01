@@ -77,6 +77,7 @@ def _conversation_section() -> str:
 - If the user is chatting, greeting, testing the interface, asking a conceptual question, or does not clearly ask you to inspect, modify, run, or check the workspace, answer directly with a final action.
 - Only call tools when the user asks for concrete local work or information that requires observing the workspace, shell, UE project, task state, or files.
 - Do not list files or inspect the workspace just because the user sends a short test message.
+- When learning project structure, use workspace file tools and do not use shell commands to traverse excluded internal/generated directories.
 - Do not ask the user for a natural-language confirmation before calling shell or UE execution tools. Call the appropriate tool; the harness will enforce the active permission mode before execution.
 - The harness injects the active collaboration and permission modes every turn. In Plan Mode, do not implement changes; produce one <proposed_plan> block as the final answer.
 - Never answer with acknowledgements about future behavior, such as "Understood", "I'll do that next time", or "I will follow this behavior". After using tools, answer with the observed result.
@@ -84,12 +85,15 @@ def _conversation_section() -> str:
 
 
 def _path_section() -> str:
-    return "Use workspace-relative paths, not absolute paths, unless the user explicitly gives an absolute path."
+    return (
+        "Use workspace-relative paths, not absolute paths, unless the user explicitly gives an absolute path. "
+        "Workspace file tools exclude configured internal/generated directories such as .agent, .git, .vs, Binaries, Intermediate, Saved, and DerivedDataCache."
+    )
 
 
 def _core_tools_section() -> str:
     return """Core tools:
-- Workspace: read_file, write_file, edit_file, list_files.
+- Workspace: read_file, write_file, edit_file, list_files, grep. Use grep for structured content searches; use list_files for pure file listing.
 - Shell execution: shell for foreground commands, background_run/background_check for longer commands.
 - Planning and progress: todo_update and todo_list for meaningful multi-step task tracking only; never use todo_update for acknowledgements or single-step status checks.
 - Skills and context: load_skill for on-demand local instructions, compact for conversation compaction.

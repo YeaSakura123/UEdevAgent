@@ -535,6 +535,17 @@ class ToolSpecTests(unittest.TestCase):
         self.assertNotIn("kind", properties)
         self.assertNotIn("execute", properties)
 
+    def test_grep_schema_declares_structured_search(self) -> None:
+        specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
+
+        properties = specs["grep"]["function"]["parameters"]["properties"]
+        description = specs["grep"]["function"]["description"]
+
+        for name in ["pattern", "path", "glob", "limit", "case_sensitive", "output_mode", "include_asset_paths"]:
+            self.assertIn(name, properties)
+        self.assertIn("structured", description)
+        self.assertIn("UE asset path", description)
+
     def test_ue_build_schema_declares_fixed_editor_build(self) -> None:
         specs = {spec["function"]["name"]: spec for spec in get_tool_specs()}
 

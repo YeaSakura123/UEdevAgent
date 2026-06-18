@@ -25,12 +25,12 @@ def workspace_temp_dir():
 
 
 from uedev.tools.background import BackgroundManager
-from uedev.state.config import ConfigError, ModelProfile, agent_dir, load_project_config, load_system_config, resolve_model_profile
+from uedev.state.config import ConfigError, ModelProfile, agent_dir, default_responses_options, load_project_config, load_system_config, resolve_model_profile
 from uedev.runtime.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file
+from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file, load_session_metadata
 from uedev.runtime.subagents import SubagentSpec
-from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message, call_model
+from uedev.llm.client import ChatMessage, ModelResponse, ModelStreamEvent, ToolCall, _serialize_message, call_model, call_model_stream
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
@@ -191,6 +191,205 @@ class LlmMessageTests(unittest.TestCase):
 
         self.assertEqual(response.reasoning_content, "extra thinking")
 
+    def test_call_model_uses_responses_options_and_adapted_tools_for_gpt_model_profile(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(output_text="done", output=[])
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        options = default_responses_options()
+        options["store"] = True
+        options["reasoning"]["effort"] = "high"
+        options["max_output_tokens"] = 512
+        options["parallel_tool_calls"] = True
+        options["built_in_tools"]["web_search"]["enabled"] = True
+        profile = ModelProfile(
+            name="openai",
+            model="gpt-5",
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            gpt_model=True,
+            responses=options,
+        )
+        messages = [
+            ChatMessage(role="system", content="system prompt"),
+            ChatMessage(role="user", content="hello"),
+        ]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ]
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model(messages, profile, tools=tools)
+
+        self.assertEqual(captured["model"], "gpt-5")
+        self.assertEqual(captured["instructions"], "system prompt")
+        self.assertEqual(captured["input"], [{"role": "user", "content": "hello"}])
+        self.assertEqual(captured["store"], True)
+        self.assertEqual(captured["reasoning"], {"effort": "high"})
+        self.assertEqual(captured["max_output_tokens"], 512)
+        self.assertEqual(captured["parallel_tool_calls"], True)
+        self.assertEqual(captured["tool_choice"], "auto")
+        self.assertEqual(
+            captured["tools"],
+            [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                    "strict": False,
+                },
+                {"type": "web_search_preview"},
+            ],
+        )
+        self.assertNotIn("built_in_tools", captured)
+        self.assertNotIn("strict_function_tools", captured)
+        self.assertEqual(response.content, "done")
+
+    def test_call_model_reads_responses_output_text(self) -> None:
+        class FakeResponses:
+            def create(self, **kwargs):
+                return SimpleNamespace(output_text="done", output=[])
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        profile = ModelProfile(
+            name="openai",
+            model="gpt-5",
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            gpt_model=True,
+            responses=default_responses_options(),
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile)
+
+        self.assertEqual(response.content, "done")
+
+    def test_responses_tools_none_disables_configured_built_in_tools(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(output_text="done", output=[])
+
+        options = default_responses_options()
+        options["built_in_tools"]["web_search"]["enabled"] = True
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        profile = ModelProfile(
+            name="openai",
+            model="gpt-5",
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            gpt_model=True,
+            responses=options,
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile, tools=None)
+
+        self.assertEqual(response.content, "done")
+        self.assertNotIn("tools", captured)
+        self.assertNotIn("built_in_tools", captured)
+
+    def test_responses_empty_tool_list_allows_configured_built_in_tools(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return SimpleNamespace(output_text="done", output=[])
+
+        options = default_responses_options()
+        options["built_in_tools"]["web_search"]["enabled"] = True
+        options["built_in_tools"]["file_search"]["enabled"] = True
+        options["built_in_tools"]["file_search"]["vector_store_ids"] = ["vs_1"]
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        profile = ModelProfile(
+            name="openai",
+            model="gpt-5",
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            gpt_model=True,
+            responses=options,
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile, tools=[])
+
+        self.assertEqual(response.content, "done")
+        self.assertEqual(captured["tools"], [{"type": "web_search_preview"}, {"type": "file_search", "vector_store_ids": ["vs_1"]}])
+        self.assertNotIn("built_in_tools", captured)
+
+    def test_call_model_stream_reads_responses_completed_function_call(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponses:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return iter(
+                    [
+                        SimpleNamespace(type="response.output_text.delta", delta="working"),
+                        SimpleNamespace(
+                            type="response.completed",
+                            response=SimpleNamespace(
+                                output_text="",
+                                output=[
+                                    {
+                                        "type": "function_call",
+                                        "call_id": "call_1",
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "a.txt"}),
+                                    }
+                                ],
+                            ),
+                        ),
+                    ]
+                )
+
+        fake_client = SimpleNamespace(responses=FakeResponses())
+        profile = ModelProfile(
+            name="openai",
+            model="gpt-5",
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            gpt_model=True,
+            responses=default_responses_options(),
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                },
+            }
+        ]
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            events = list(call_model_stream([ChatMessage(role="user", content="hello")], profile, tools=tools))
+
+        self.assertEqual([event.type for event in events], ["delta", "final"])
+        self.assertEqual(events[0].delta, "working")
+        response = events[-1].response
+        self.assertIsNotNone(response)
+        self.assertEqual(response.tool_calls, [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})])
+        self.assertTrue(captured["stream"])
+        self.assertEqual(captured["tools"][0]["strict"], False)
+
 
 class AgentEventLoopTests(unittest.TestCase):
     def test_run_turn_events_emits_tool_flow(self) -> None:
@@ -227,6 +426,86 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertEqual(event_types[-1], "final")
             self.assertEqual(events[1].name, "read_file")
             self.assertEqual(events[-1].message, "done")
+
+    def test_responses_function_call_runs_existing_tool_and_round_trips_output(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "openai": {
+                        "gpt_model": True,
+                        "model": "gpt-5",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    }
+                },
+            )
+            write_file(root, "a.txt", "hello")
+            captured_calls: list[dict[str, object]] = []
+
+            class FakeResponses:
+                def create(self, **kwargs):
+                    captured_calls.append(kwargs)
+                    if len(captured_calls) == 1:
+                        return iter(
+                            [
+                                SimpleNamespace(
+                                    type="response.completed",
+                                    response=SimpleNamespace(
+                                        output_text="",
+                                        output=[
+                                            {
+                                                "type": "function_call",
+                                                "call_id": "call_1",
+                                                "name": "read_file",
+                                                "arguments": json.dumps({"path": "a.txt"}),
+                                            }
+                                        ],
+                                    ),
+                                )
+                            ]
+                        )
+                    return iter(
+                        [
+                            SimpleNamespace(
+                                type="response.completed",
+                                response=SimpleNamespace(output_text="done", output=[]),
+                            )
+                        ]
+                    )
+
+            fake_client = SimpleNamespace(responses=FakeResponses())
+
+            with (
+                patch("uedev.state.config.default_system_config_path", return_value=config_path),
+                patch("uedev.llm.client.OpenAI", return_value=fake_client),
+            ):
+                runtime = AgentRuntime(
+                    AgentOptions(
+                        task="",
+                        max_steps=3,
+                        auto_approve=True,
+                        cwd=root,
+                        timeout_seconds=120,
+                        verbose=False,
+                    )
+                )
+                messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+                events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-responses-tool"))
+
+            self.assertEqual([event.type for event in events], ["thinking", "tool_start", "tool_result", "thinking", "final"])
+            self.assertEqual(events[1].name, "read_file")
+            self.assertEqual(events[-1].message, "done")
+            first_tools = captured_calls[0]["tools"]
+            self.assertTrue(any(tool.get("name") == "read_file" and tool.get("strict") is False for tool in first_tools))
+            second_input = captured_calls[1]["input"]
+            self.assertTrue(any(item.get("type") == "function_call" and item.get("call_id") == "call_1" for item in second_input))
+            tool_outputs = [item for item in second_input if item.get("type") == "function_call_output"]
+            self.assertEqual(tool_outputs[0]["call_id"], "call_1")
+            self.assertIn("Tool result for: read_file", tool_outputs[0]["output"])
+            self.assertIn("hello", tool_outputs[0]["output"])
 
     def test_run_turn_events_records_reasoning_content_on_tool_call_messages(self) -> None:
         with workspace_temp_dir() as temp:
@@ -1300,6 +1579,46 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertEqual(events[-1].type, "final")
             self.assertEqual(events[-1].message, "<proposed_plan>\n# Plan\n</proposed_plan>")
             self.assertTrue(any(message.role == "system" and "Plan Mode final answers" in message.content for message in messages))
+
+    def test_plan_mode_persists_plan_metadata_and_display_event(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=2,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            runtime.collaboration_mode = "plan"
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            history = HistoryRecorder(agent_dir(root), messages)
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch(
+                    "uedev.runtime.agent.call_model",
+                    return_value=ModelResponse("<proposed_plan>\n# Persisted Plan\n\n- Implement\n</proposed_plan>"),
+                ):
+                    events = list(runtime.run_turn_events(messages, "make a plan", turn_id="turn-test", history=history))
+
+            self.assertEqual([event.type for event in events], ["thinking", "plan", "final"])
+            metadata = load_session_metadata(history.session_dir or Path())
+            active_plan = metadata["active_plan"]
+            plan_path = Path(active_plan["path"])
+            self.assertEqual(active_plan["title"], "Persisted Plan")
+            self.assertEqual(active_plan["status"], "pending")
+            self.assertEqual(plan_path.parent, config_path.parent.resolve() / "plan")
+            self.assertEqual(plan_path.read_text(encoding="utf-8"), "# Persisted Plan\n\n- Implement\n")
+
+            display_records = load_display_history(history.display_path or Path())
+            plan_records = [record for record in display_records if record["type"] == "event" and record["event"]["type"] == "plan"]
+            self.assertEqual(len(plan_records), 1)
+            self.assertEqual(plan_records[0]["event"]["output"], str(plan_path))
 
     def test_max_steps_forces_final_answer_without_tools(self) -> None:
         with workspace_temp_dir() as temp:

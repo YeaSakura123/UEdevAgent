@@ -41,6 +41,18 @@ class HistoryEntry:
         return f"{timestamp} [{self.kind}] {self.message_count} messages - {self.preview}"
 
 
+@dataclass(frozen=True)
+class HistorySnapshot:
+    session_dir: Path | None
+    path: Path | None
+    display_path: Path | None
+    transcript_path: Path | None
+    display_seeded: bool
+    initial_messages: list[ChatMessage]
+    initial_display_records: list[dict[str, Any]]
+    file_sizes: dict[Path, int | None]
+
+
 class HistoryRecorder:
     def __init__(
         self,
@@ -93,6 +105,60 @@ class HistoryRecorder:
         path = self._ensure_display_path()
         append_display_event(path, event)
         self._write_metadata()
+
+    def snapshot(self) -> HistorySnapshot:
+        paths = [self.path, self.display_path, self.transcript_path]
+        if self.session_dir is not None:
+            paths.append(self.session_dir / METADATA_FILE)
+        file_sizes: dict[Path, int | None] = {}
+        for path in paths:
+            if path is None or path in file_sizes:
+                continue
+            try:
+                file_sizes[path] = path.stat().st_size
+            except FileNotFoundError:
+                file_sizes[path] = None
+        return HistorySnapshot(
+            session_dir=self.session_dir,
+            path=self.path,
+            display_path=self.display_path,
+            transcript_path=self.transcript_path,
+            display_seeded=self._display_seeded,
+            initial_messages=list(self.initial_messages),
+            initial_display_records=list(self.initial_display_records),
+            file_sizes=file_sizes,
+        )
+
+    def restore(self, snapshot: HistorySnapshot) -> None:
+        current_paths = [self.path, self.display_path, self.transcript_path]
+        if self.session_dir is not None:
+            current_paths.append(self.session_dir / METADATA_FILE)
+        for path in current_paths:
+            if path is None or path in snapshot.file_sizes:
+                continue
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        for path, size in snapshot.file_sizes.items():
+            if size is None:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                continue
+            try:
+                with path.open("r+b") as handle:
+                    handle.truncate(size)
+            except FileNotFoundError:
+                pass
+        self.session_dir = snapshot.session_dir
+        self.path = snapshot.path
+        self.display_path = snapshot.display_path
+        self.transcript_path = snapshot.transcript_path
+        self._display_seeded = snapshot.display_seeded
+        self.initial_messages = list(snapshot.initial_messages)
+        self.initial_display_records = list(snapshot.initial_display_records)
 
     def _ensure_path(self) -> Path:
         if self.path is None:
@@ -157,11 +223,13 @@ def create_session_dir(agent_dir: Path) -> Path:
 def write_session_metadata(session_dir: Path, messages_path: Path, display_path: Path, transcript_path: Path) -> None:
     metadata_path = session_dir / METADATA_FILE
     created_at = time.time()
+    active_plan: Any = None
     if metadata_path.exists():
         try:
             raw = json.loads(metadata_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 created_at = float(raw.get("created_at") or created_at)
+                active_plan = raw.get("active_plan")
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
     metadata = {
@@ -173,6 +241,30 @@ def write_session_metadata(session_dir: Path, messages_path: Path, display_path:
         "display_path": display_path.name,
         "transcript_path": transcript_path.name,
     }
+    if isinstance(active_plan, dict):
+        metadata["active_plan"] = active_plan
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_session_metadata(session_dir: Path) -> dict[str, Any]:
+    return _load_session_metadata(session_dir / METADATA_FILE)
+
+
+def update_session_active_plan(session_dir: Path, active_plan: dict[str, Any]) -> None:
+    metadata_path = session_dir / METADATA_FILE
+    try:
+        metadata = _load_session_metadata(metadata_path)
+    except HistoryError:
+        metadata = {
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_dir.name,
+            "created_at": time.time(),
+            "messages_path": MESSAGES_FILE,
+            "display_path": DISPLAY_FILE,
+            "transcript_path": TRANSCRIPT_FILE,
+        }
+    metadata["updated_at"] = time.time()
+    metadata["active_plan"] = active_plan
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -204,6 +296,8 @@ def append_display_turn_start(path: Path, turn_id: str, message: str) -> None:
 
 
 def append_display_event(path: Path, event: AgentEvent) -> None:
+    if event.type == "assistant_delta":
+        return
     append_display_record(path, {"type": "event", "event": asdict(event)})
 
 

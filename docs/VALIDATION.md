@@ -16,13 +16,13 @@ python -m unittest discover -s test
 python -m uedev chat
 ```
 
-- Confirm the coding-agent terminal UI opens with structured user, system, tool,
-  approval, and assistant blocks.
+- Confirm the coding-agent terminal UI opens as a full-screen app with a
+  persistent transcript area, fixed bottom input, progress line, and status bar.
 - Type `test`; it should answer directly without tool activity.
 - Type `/`; slash commands should complete with descriptions.
 - Run `/help`, `/model`, `/plan`, `/plan off`, `/permissions`, `/clear`, and `/ue doctor`.
-- Confirm the TUI status bar below the input line shows the active model and
-  directory.
+- Confirm the TUI status bar below the input line shows the active model,
+  directory, and permission mode.
 - After `/plan`, confirm the same status bar shows `Plan mode (Shift+Tab to exit)`
   on the right, and that Shift+Tab exits Plan Mode.
 - Run `/permissions`; the permission selector should open and support up/down
@@ -30,9 +30,12 @@ python -m uedev chat
   `/permissions auto-review`, and `/permissions full-access`; the selected value
   should affect only the current chat session.
 - Ask for a response with Markdown headings, a list, a table, and a code block;
-  the final answer should render as rich terminal Markdown.
+  the assistant text should stream while running and the final answer should
+  render as rich terminal Markdown.
 - Ask the agent to read a small file; the turn should show tool activity while
   running and collapse to a summary after the final answer.
+- Trigger a command that requires approval; the full-screen approval modal should
+  support `y`, `n`, and Esc.
 - Ask the agent to edit `test/main.py`; the turn should show edit activity and
   collapse after the final answer.
 - Run `python -m uedev chat --plain`; it should keep the script-friendly plain

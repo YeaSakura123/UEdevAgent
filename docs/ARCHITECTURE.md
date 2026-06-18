@@ -53,3 +53,10 @@ UE 操作示例是模型调用原生工具，而不是把 JSON 写进正文：
 - Agent 想启动 UE 时，harness 会在执行前展示命令并要求用户 y/N 确认。
 - 独立 CLI 的 `uedev ue run-python` 仍必须传 `--execute` 才会启动 UE。
 - 真实 UE 项目验证由用户在自己的测试工程中执行，避免开发过程误启动或误改项目。
+
+# API transport note
+
+Profiles with `gpt_model=true` use the OpenAI Responses API. Other profiles keep
+the existing OpenAI-compatible Chat Completions protocol for providers such as
+DeepSeek-compatible endpoints. The runtime keeps the same internal `ToolCall`
+and `ChatMessage` abstractions in both modes.

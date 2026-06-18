@@ -157,7 +157,7 @@ def build_compacted_history(
     for message in reversed(messages):
         if not is_real_user_message(message):
             continue
-        message_tokens = estimate_tokens([message])
+        message_tokens = max(1, len(message.content) // 4)
         if used_tokens + message_tokens > max_user_tokens:
             continue
         selected_users.append(message)

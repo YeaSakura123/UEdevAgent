@@ -30,6 +30,7 @@ from uedev.state.config import (
     DEFAULT_WORKSPACE_EXCLUDED_DIRS,
     ConfigError,
     agent_dir,
+    default_responses_options,
     format_model_profiles,
     load_project_config,
     load_system_config,
@@ -240,6 +241,51 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.models["deepseek"].requires_reasoning_content)
             self.assertIn("requires_reasoning_content=True", format_model_profiles(root, config))
 
+    def test_gpt_model_responses_options_default_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "plain": {
+                        "model": "plain-model",
+                        "base_url": "https://api.deepseek.com",
+                        "api_key": "key",
+                    },
+                    "openai": {
+                        "gpt_model": True,
+                        "model": "gpt-5",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "timeout_seconds": 60,
+                        "requires_reasoning_content": True,
+                        "responses": {
+                            "parallel_tool_calls": False,
+                            "max_output_tokens": 1024,
+                            "reasoning": {"effort": "medium"},
+                            "built_in_tools": {
+                                "web_search": {"enabled": True},
+                                "file_search": {"enabled": True, "vector_store_ids": ["vs_1"]},
+                            },
+                        },
+                    },
+                },
+            )
+
+            config = load_system_config(config_path)
+
+            self.assertFalse(config.models["plain"].gpt_model)
+            self.assertTrue(config.models["openai"].gpt_model)
+            self.assertFalse(config.models["openai"].requires_reasoning_content)
+            self.assertEqual(config.models["openai"].timeout_seconds, 60)
+            self.assertFalse(config.models["openai"].responses["parallel_tool_calls"])
+            self.assertEqual(config.models["openai"].responses["max_output_tokens"], 1024)
+            self.assertEqual(config.models["openai"].responses["reasoning"]["effort"], "medium")
+            self.assertTrue(config.models["openai"].responses["built_in_tools"]["web_search"]["enabled"])
+            self.assertEqual(config.models["openai"].responses["built_in_tools"]["file_search"]["vector_store_ids"], ["vs_1"])
+            self.assertIn("mode=responses", format_model_profiles(root, config))
+
     def test_invalid_model_reasoning_content_replay_raises(self) -> None:
         with workspace_temp_dir() as temp:
             config_path = Path(temp) / "system-config.json"
@@ -303,7 +349,10 @@ class ConfigTests(unittest.TestCase):
         template = system_config_template()
 
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
-        self.assertFalse(template["models"]["my-model"]["requires_reasoning_content"])
+        self.assertTrue(template["models"]["openai-gpt"]["gpt_model"])
+        self.assertEqual(template["models"]["openai-gpt"]["responses"], default_responses_options())
+        self.assertFalse(template["models"]["compatible-chat"]["gpt_model"])
+        self.assertFalse(template["models"]["compatible-chat"]["requires_reasoning_content"])
 
     def test_runtime_default_max_steps_defaults_and_can_be_configured(self) -> None:
         with workspace_temp_dir() as temp:

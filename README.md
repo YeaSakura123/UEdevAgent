@@ -5,11 +5,12 @@ Unreal Engine editor workflows. It keeps a conversation, lets the model request
 tools, enforces configurable permission modes, and feeds observations back into
 the model until the task is complete.
 
-Tool use goes through OpenAI-compatible native tool/function calling. Tool
-schemas live in `uedev.tool_specs`, while implementations live in
-`AgentRuntime._build_tool_handlers`. The loop executes returned `tool_calls`,
-adds `tool` result messages, and asks the model to continue until it gives a
-normal final answer.
+Tool use goes through native tool/function calling. GPT model profiles can use
+the OpenAI Responses API, while OpenAI-compatible model profiles continue to use
+Chat Completions. Tool schemas live in `uedev.tool_specs`, while implementations
+live in `AgentRuntime._build_tool_handlers`. The loop executes returned tool
+calls, adds tool results, and asks the model to continue until it gives a normal
+final answer.
 
 ## Install
 
@@ -31,13 +32,52 @@ Edit the system JSON config at `~/.uedev/config.json`:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "default_model": "openai-gpt",
   "models": {
-    "work": {
-      "model": "your_model",
+    "openai-gpt": {
+      "gpt_model": true,
+      "model": "gpt-5",
       "base_url": "https://api.openai.com/v1",
       "api_key": "your_api_key",
       "context_window": 262144,
+      "timeout_seconds": 120,
+      "responses": {
+        "store": false,
+        "reasoning": {
+          "effort": null,
+          "summary": null
+        },
+        "text": {
+          "format": {
+            "type": "text"
+          }
+        },
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "strict_function_tools": false,
+        "max_output_tokens": null,
+        "truncation": "disabled",
+        "include": [],
+        "built_in_tools": {
+          "web_search": {
+            "enabled": false
+          },
+          "file_search": {
+            "enabled": false,
+            "vector_store_ids": []
+          },
+          "remote_mcp": []
+        }
+      }
+    },
+    "compatible-chat": {
+      "gpt_model": false,
+      "model": "your_model",
+      "base_url": "https://your.api.com/v1",
+      "api_key": "your_api_key",
+      "context_window": 262144,
+      "timeout_seconds": 120,
       "requires_reasoning_content": false
     }
   },
@@ -64,14 +104,22 @@ Edit the system JSON config at `~/.uedev/config.json`:
 }
 ```
 
-The CLI uses the official `openai` Python package and supports
-OpenAI-compatible Chat Completions endpoints.
+The CLI uses the official `openai` Python package. Set `gpt_model` to `true` for
+OpenAI GPT profiles that should use the Responses API; leave it unset or `false`
+for OpenAI-compatible Chat Completions endpoints such as DeepSeek-compatible
+profiles.
 `context_window` is optional for each model profile and defaults to 262144
 estimated tokens. Auto compaction defaults to 90% of that window unless
 `--context-threshold` is supplied.
+`timeout_seconds` is optional for each model profile and defaults to 120.
 `requires_reasoning_content` is optional and defaults to `false`. Enable it for
 models such as DeepSeek thinking mode that require assistant
-`reasoning_content` to be replayed with later requests.
+`reasoning_content` to be replayed with later requests. It only applies when
+`gpt_model` is `false`. Responses profiles currently run in a prompt-only
+compatibility mode: the runtime sends only `model`, `input`, and optional
+`instructions` to `client.responses.create()`. The `responses` config block is
+kept in the template for future rollout, but reasoning options, tools, built-in
+tools, truncation, text formatting, and storage options are not sent yet.
 `display.diff_output_max_chars` controls per-section `/diff` output truncation
 and defaults to 20000 characters.
 `runtime.default_max_steps` controls the default agent work-loop budget when
@@ -155,13 +203,17 @@ omitting it produces a dry-run command preview.
 - `run` handles one task and exits.
 - `chat` keeps the same message history across turns.
 - `chat` shows the current version, model, and working directory when it starts.
-- `chat` uses a Rich + Prompt Toolkit terminal UI when a terminal is available:
-  Prompt Toolkit handles input/history/completion, while Rich renders structured
-  user, system, tool, approval, and assistant blocks.
+- `chat` uses a full-screen Rich + Prompt Toolkit terminal UI when a terminal is
+  available: Prompt Toolkit owns the persistent transcript, fixed input, status,
+  selector, and approval surfaces, while Rich formats structured user, system,
+  tool, approval, and assistant blocks.
+- Full-screen chat keeps terminal-native copy behavior for visible text. It does
+  not implement a custom mouse selection or clipboard layer; use `chat --plain`
+  when a scrollback-first transcript is required.
 - `chat` renders final model answers as Markdown, including common headings,
   lists, links, code blocks, and tables.
-- `chat` shows per-turn thinking/tool events while running, then renders a
-  collapsed process summary before the final answer.
+- `chat` shows loading, assistant streaming text, and tool events while running,
+  then renders a collapsed process summary before the final answer.
 - `chat` supports slash commands such as `/help`, `/context`, `/diff`, `/todos`,
   `/tasks`, `/team`, `/inbox`, `/history`, `/subagents`, `/worktree`, `/model`, `/mcp`,
   `/plan`, `/permissions`, `/compact`, `/clear`, and `/ue doctor`; type `/` to

@@ -161,3 +161,10 @@ UE 工具作为同一 dispatch map 的领域工具存在：
 
 - agent 会话在启动 UE 前必须展示命令并等待用户 y/N 确认
 - 本项目开发和测试阶段不启动 UE
+
+# API transport note
+
+Profiles with `gpt_model=true` use the OpenAI Responses API. Other profiles keep
+the existing OpenAI-compatible Chat Completions protocol, so third-party
+compatible endpoints can continue to use the current message and tool-call
+shape.

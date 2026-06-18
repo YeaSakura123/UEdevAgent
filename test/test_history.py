@@ -17,6 +17,7 @@ from uedev.runtime.history import (
     write_history_messages,
 )
 from uedev.ui.events import final_event, thinking_event, tool_result_event, tool_start_event
+from uedev.ui.events import plan_event
 from uedev.llm.client import ChatMessage, ToolCall
 
 
@@ -121,6 +122,19 @@ class HistoryTests(unittest.TestCase):
             self.assertEqual(loaded[1]["event"]["type"], "thinking")
             self.assertEqual(loaded[2]["event"]["name"], "shell")
             self.assertEqual(loaded[-1]["event"]["duration_ms"], 1234)
+
+    def test_display_history_round_trips_plan_event(self) -> None:
+        with workspace_temp_dir() as root:
+            path = root / ".agent" / "history" / "session_1.display.jsonl"
+
+            append_display_event(path, plan_event("# Plan\n\n- Step", str(root / "plan.md"), "Plan", "pending", "turn-1"))
+
+            loaded = load_display_history(path)
+
+            self.assertEqual(loaded[0]["type"], "event")
+            self.assertEqual(loaded[0]["event"]["type"], "plan")
+            self.assertEqual(loaded[0]["event"]["summary"], "Plan")
+            self.assertEqual(loaded[0]["event"]["status"], "pending")
 
     def test_history_recorder_seeds_loaded_display_records(self) -> None:
         with workspace_temp_dir() as root:

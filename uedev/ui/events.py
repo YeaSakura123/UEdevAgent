@@ -6,7 +6,9 @@ from typing import Literal
 
 AgentEventType = Literal[
     "thinking",
+    "assistant_delta",
     "compact",
+    "plan",
     "tool_start",
     "tool_result",
     "tool_error",
@@ -35,8 +37,16 @@ def thinking_event(step: int, total: int, turn_id: str = "") -> AgentEvent:
     return AgentEvent(type="thinking", step=step, total=total, turn_id=turn_id, status="thinking")
 
 
+def assistant_delta_event(delta: str, turn_id: str = "") -> AgentEvent:
+    return AgentEvent(type="assistant_delta", message=delta, turn_id=turn_id, status="streaming")
+
+
 def compact_event(message: str, turn_id: str = "", output: str = "") -> AgentEvent:
     return AgentEvent(type="compact", message=message, output=output, turn_id=turn_id, status="compacted")
+
+
+def plan_event(message: str, path: str, title: str, status: str = "pending", turn_id: str = "") -> AgentEvent:
+    return AgentEvent(type="plan", message=message, output=path, summary=title, status=status, turn_id=turn_id)
 
 
 def tool_start_event(name: str, tool_input: dict[str, object], turn_id: str = "") -> AgentEvent:

@@ -63,7 +63,9 @@ except ModuleNotFoundError:  # pragma: no cover - only used in minimal test envi
             print(str(renderable), file=self.file)
 
 from uedev.ui.events import AgentEvent
+from ..policy.permissions import is_proposed_plan
 from ..runtime.context import SUMMARY_PREFIX, is_runtime_state_message
+from ..state.plans import extract_proposed_plan_content
 from ..llm.client import ChatMessage
 
 
@@ -123,6 +125,10 @@ class ConsoleRenderer:
 
         if event.type == "compact":
             return event.message
+
+        if event.type == "plan":
+            path = f"\nPath: {event.output}" if event.output else ""
+            return f"Plan ({event.status or 'pending'}): {event.summary or 'Proposed plan'}{path}\n{event.message}"
 
         if event.type == "tool_start":
             suffix = f" {self._format_input(event.input)}" if event.input else ""
@@ -232,6 +238,9 @@ class TuiRenderer:
         elif event.type == "compact":
             self._record("compact", event.message)
             self._print(_block("system", Text(event.message), style="bold blue"))
+        elif event.type == "plan":
+            self._record("plan", self._plan_record_text(event))
+            self._print(self._plan_block(event))
         elif event.type == "tool_start":
             self._record("tool_start", self._tool_start_text(event))
             self._print(self._tool_block(event.name, self._tool_start_text(event), "yellow"))
@@ -242,11 +251,14 @@ class TuiRenderer:
             self._record("tool_error", self._tool_error_text(event))
             self._print(self._tool_block(event.name, self._tool_error_text(event), "red"))
         elif event.type in {"final", "stopped"}:
+            plan_already_rendered = any(existing.type == "plan" for existing in turn.events)
             turn.add_event(event)
             self.running = False
             summary = turn.summary()
             self._record("summary", summary)
             self._print(Rule(summary, style="dim"))
+            if event.type == "final" and plan_already_rendered and is_proposed_plan(event.message):
+                return
             record_type = "assistant" if event.type == "final" else event.status or "stopped"
             self._record(record_type, event.message)
             self._print(
@@ -286,8 +298,18 @@ class TuiRenderer:
                 continue
             if message.role == "assistant":
                 if message.content.strip():
-                    self._record("assistant", message.content)
-                    self._print(self._assistant_block(message.content))
+                    if is_proposed_plan(message.content):
+                        event = AgentEvent(
+                            type="plan",
+                            message=extract_proposed_plan_content(message.content),
+                            status="pending",
+                            summary="Proposed plan",
+                        )
+                        self._record("plan", self._plan_record_text(event))
+                        self._print(self._plan_block(event))
+                    else:
+                        self._record("assistant", message.content)
+                        self._print(self._assistant_block(message.content))
                 elif message.tool_calls:
                     names = ", ".join(tool_call.name for tool_call in message.tool_calls)
                     rendered = f"Tool calls: {names}"
@@ -356,6 +378,30 @@ class TuiRenderer:
         else:
             renderable = Text(body)
         return Panel(renderable, title=f"tool: {name}", border_style=style, box=box.ASCII, expand=False)
+
+    def _plan_block(self, event: AgentEvent) -> RenderableType:
+        title = event.summary or "Proposed plan"
+        header = Text()
+        header.append(f"{title}\n", style="bold")
+        header.append(f"status: {event.status or 'pending'}")
+        if event.output:
+            header.append(f"\npath: {event.output}")
+        try:
+            body: RenderableType = Markdown(event.message)
+        except Exception:
+            body = Text(event.message)
+        return Panel(Group(header, body), title="plan", border_style="magenta", box=box.ASCII, expand=False)
+
+    def _plan_record_text(self, event: AgentEvent) -> str:
+        lines = [
+            f"title: {event.summary or 'Proposed plan'}",
+            f"status: {event.status or 'pending'}",
+        ]
+        if event.output:
+            lines.append(f"path: {event.output}")
+        if event.message:
+            lines.extend(["", event.message])
+        return "\n".join(lines)
 
     def _assistant_block(self, message: str, *, is_error: bool = False, is_incomplete: bool = False) -> RenderableType:
         if is_error:

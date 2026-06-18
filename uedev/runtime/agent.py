@@ -73,9 +73,11 @@ from .context import (
 )
 from ..ui.events import (
     AgentEvent,
+    assistant_delta_event,
     compact_event,
     final_event,
     incomplete_event,
+    plan_event,
     stopped_event,
     thinking_event,
     tool_error_event,
@@ -88,9 +90,17 @@ from .history import (
     create_standalone_session_transcript_path,
     ensure_system_prompt,
     list_history_entries,
+    load_session_metadata,
     load_history_file,
+    update_session_active_plan,
 )
-from ..llm.client import ChatMessage, call_model
+from ..llm.client import (
+    ChatMessage,
+    ModelResponse,
+    ModelStreamEvent,
+    call_model as _client_call_model,
+    call_model_stream as _client_call_model_stream,
+)
 from ..mcp.registry import McpToolRegistry, is_mcp_tool_name
 from ..policy.permissions import (
     CollaborationMode,
@@ -108,6 +118,12 @@ from .subagents import SubagentManager, parse_subagent_spec
 from ..ui.renderer import ConsoleRenderer
 from ..tools.shell import ApprovalProvider, confirm_command, run_shell, shell_name
 from .skills import SkillLoader
+from ..state.plans import (
+    PlanManager,
+    PlanRecord,
+    extract_proposed_plan_content,
+    plan_record_from_dict,
+)
 from ..state.tasks import TaskManager, TodoManager
 from ..state.team import MessageBus, TeamManager
 from ..tools.specs import get_tool_specs
@@ -147,6 +163,21 @@ class AgentOptions:
 
 ToolHandler = Callable[[dict[str, object]], str]
 RUNTIME_STATE_MARKER = "<runtime-state>"
+call_model = _client_call_model
+
+
+def call_model_stream(
+    messages: list[ChatMessage],
+    profile: Any,
+    tools: list[dict[str, Any]] | None = None,
+) -> Iterator[ModelStreamEvent]:
+    if call_model is not _client_call_model:
+        yield ModelStreamEvent(type="final", response=call_model(messages, profile, tools=tools))
+        return
+    try:
+        yield from _client_call_model_stream(messages, profile, tools=tools)
+    except Exception:
+        yield ModelStreamEvent(type="final", response=call_model(messages, profile, tools=tools))
 
 
 @dataclass(frozen=True)
@@ -546,14 +577,11 @@ def _match_slash_commands(text: str) -> list[tuple[str, str]]:
         elif query in command_compact or _is_subsequence(query, command_compact):
             fuzzy_matches.append((command, description))
 
-    ordered: list[tuple[str, str]] = []
-    emitted: set[str] = set()
-    for group in (prefix_matches, word_matches, fuzzy_matches):
-        for command, description in group:
-            if command not in emitted:
-                ordered.append((command, description))
-                emitted.add(command)
-    return ordered
+    if prefix_matches:
+        return prefix_matches
+    if word_matches:
+        return word_matches
+    return fuzzy_matches
 
 
 def _match_permission_mode_commands(text: str) -> list[tuple[str, str]]:
@@ -569,7 +597,7 @@ def _match_permission_mode_commands(text: str) -> list[tuple[str, str]]:
     for mode in VALID_PERMISSION_MODES:
         label = permission_mode_label(mode)
         command = f"/permissions {label}"
-        if not query or label.startswith(query) or query in label:
+        if not query or label.startswith(query):
             matches.append((command, permission_mode_description(mode)))
     return matches
 
@@ -771,6 +799,8 @@ class AgentRuntime:
         self.permission_mode: PermissionMode = "full_access" if options.auto_approve else project_config.permission_mode
         self.todo_manager = TodoManager(self.agent_dir)
         self.task_manager = TaskManager(self.agent_dir / "tasks")
+        self.plan_manager = PlanManager()
+        self.active_plan: PlanRecord | None = None
         self.skill_loader = SkillLoader(options.cwd / "skills")
         self.background = BackgroundManager(options.cwd)
         self.bus = MessageBus(self.agent_dir / "team")
@@ -864,7 +894,15 @@ class AgentRuntime:
             yield thinking_event(step, self.options.max_steps, current_turn_id)
 
             try:
-                response = call_model(messages, self.current_model_profile(), tools=self.tool_specs)
+                response: ModelResponse | None = None
+                for model_event in call_model_stream(messages, self.current_model_profile(), tools=self.tool_specs):
+                    if model_event.type == "delta":
+                        if model_event.delta:
+                            yield assistant_delta_event(model_event.delta, current_turn_id)
+                        continue
+                    response = model_event.response
+                if response is None:
+                    raise RuntimeError("Model stream ended without a final response.")
             except Exception as error:
                 yield stopped_event(str(error), current_turn_id, _duration_ms(started_at))
                 return
@@ -1017,6 +1055,11 @@ class AgentRuntime:
             messages.append(assistant_message)
             if history is not None:
                 history.append(assistant_message)
+            if self.collaboration_mode == "plan" and is_proposed_plan(final_answer):
+                proposed_plan_event = self._persist_proposed_plan(final_answer, current_turn_id, history)
+                if history is not None:
+                    history.record_event(proposed_plan_event)
+                yield proposed_plan_event
             yield final_event(final_answer, current_turn_id, _duration_ms(started_at))
             return
 
@@ -1207,7 +1250,7 @@ class AgentRuntime:
                 emit(f"Config error: {error}")
             return True
         if command == "/plan" or command.startswith("/plan "):
-            emit(self.handle_plan_command(raw_command))
+            emit(self.handle_plan_command(raw_command, history=history))
             return True
         if command == "/permissions" or command.startswith("/permissions "):
             try:
@@ -1240,7 +1283,7 @@ class AgentRuntime:
         emit(f"Unknown slash command: {query}")
         return True
 
-    def handle_plan_command(self, raw_command: str) -> str:
+    def handle_plan_command(self, raw_command: str, history: HistoryRecorder | None = None) -> str:
         arg = raw_command.split(maxsplit=1)[1].strip().lower() if len(raw_command.split(maxsplit=1)) > 1 else ""
         if arg in {"", "on"}:
             self.collaboration_mode = "plan"
@@ -1249,8 +1292,107 @@ class AgentRuntime:
             self.collaboration_mode = "default"
             return "Plan Mode disabled."
         if arg == "status":
-            return f"Collaboration mode: {self.collaboration_mode}"
-        return "Usage: /plan, /plan off, or /plan status"
+            return self._render_plan_status(history)
+        if arg == "approve":
+            return self._review_active_plan("approved", history)
+        if arg == "reject":
+            return self._review_active_plan("rejected", history)
+        return "Usage: /plan, /plan off, /plan status, /plan approve, or /plan reject"
+
+    def _persist_proposed_plan(
+        self,
+        final_answer: str,
+        turn_id: str,
+        history: HistoryRecorder | None,
+    ) -> AgentEvent:
+        content = extract_proposed_plan_content(final_answer)
+        session_id = "standalone"
+        session_dir: Path | None = None
+        if history is not None:
+            session_dir = history.ensure_session()
+            session_id = session_dir.name
+        record = self.plan_manager.save_proposed_plan(session_id, turn_id, content)
+        self.active_plan = record
+        if session_dir is not None:
+            update_session_active_plan(session_dir, record.to_dict())
+        return plan_event(content, record.path, record.title, record.status, turn_id)
+
+    def _render_plan_status(self, history: HistoryRecorder | None = None) -> str:
+        record = self._load_active_plan(history)
+        lines = [
+            f"Collaboration mode: {self.collaboration_mode}",
+            f"Plan directory: {self.plan_manager.plans_dir}",
+        ]
+        if record is None:
+            lines.append("Active plan: none")
+            return "\n".join(lines)
+        lines.extend(
+            [
+                f"Active plan: {record.title}",
+                f"Status: {record.status}",
+                f"Path: {record.path}",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _review_active_plan(self, status: str, history: HistoryRecorder | None) -> str:
+        if status not in {"approved", "rejected"}:
+            raise ValueError(f"unsupported plan status: {status}")
+        record = self._load_active_plan(history)
+        if record is None:
+            return "No active plan."
+        content, readable_record = self.plan_manager.read_content(record)
+        if readable_record.status == "missing":
+            self.active_plan = readable_record
+            if history is not None and history.session_dir is not None:
+                update_session_active_plan(history.session_dir, readable_record.to_dict())
+                history.record_event(
+                    plan_event(content, readable_record.path, readable_record.title, readable_record.status, readable_record.turn_id)
+                )
+            return f"Active plan file is missing: {readable_record.path}"
+
+        updated = self.plan_manager.with_status(record, status)  # type: ignore[arg-type]
+        self.active_plan = updated
+        if history is not None and history.session_dir is not None:
+            update_session_active_plan(history.session_dir, updated.to_dict())
+            history.record_event(plan_event(content, updated.path, updated.title, updated.status, updated.turn_id))
+        if status == "approved":
+            self.collaboration_mode = "default"
+            return f"Plan approved: {updated.path}"
+        self.collaboration_mode = "plan"
+        return f"Plan rejected: {updated.path}"
+
+    def _load_active_plan(self, history: HistoryRecorder | None = None) -> PlanRecord | None:
+        if history is not None and history.session_dir is not None:
+            try:
+                metadata = load_session_metadata(history.session_dir)
+            except HistoryError:
+                metadata = {}
+            record = plan_record_from_dict(metadata.get("active_plan"))
+            if record is not None:
+                self.active_plan = record
+                return record
+        return self.active_plan
+
+    def plan_display_records_for_session(self, session_dir: Path | None) -> list[dict[str, object]]:
+        if session_dir is None:
+            return []
+        try:
+            metadata = load_session_metadata(session_dir)
+        except HistoryError:
+            return []
+        record = plan_record_from_dict(metadata.get("active_plan"))
+        if record is None:
+            return []
+        content, visible_record = self.plan_manager.read_content(record)
+        event = plan_event(
+            content,
+            visible_record.path,
+            visible_record.title,
+            visible_record.status,
+            visible_record.turn_id,
+        )
+        return [{"type": "event", "event": event.__dict__}]
 
     def handle_permissions_command(self, raw_command: str) -> str:
         parts = raw_command.split(maxsplit=1)

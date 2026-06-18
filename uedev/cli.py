@@ -218,7 +218,9 @@ def doctor() -> None:
 
     print(f"Active model profile: {active}")
     print(f"Model: {profile.model or '(missing)'}")
+    print(f"API mode: {'Responses' if profile.gpt_model else 'Chat Completions'}")
     print(f"Base URL: {profile.base_url}")
+    print(f"Timeout: {profile.timeout_seconds}s")
     print(f"API key: {'set' if profile.api_key else '(missing)'}")
     if not config.ue_engines:
         print("UE engines: (none)")

@@ -52,7 +52,12 @@ from uedev.runtime.prompts import (
     build_tool_confirmation_reminder,
 )
 from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
-from uedev.runtime.history import load_display_history
+from uedev.runtime.history import (
+    HistoryEntry,
+    HistoryRecorder,
+    load_display_history,
+    update_session_active_plan,
+)
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
@@ -519,6 +524,50 @@ class TuiHistoryRecordingTests(unittest.TestCase):
                 self.assertTrue(runtime.handle_slash_command("/context", emit=app.renderer.print_system, messages=app.messages))
 
             self.assertIsNone(app.history.display_path)
+
+    def test_load_history_falls_back_to_active_plan_metadata_when_display_is_missing(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+                runtime = AgentRuntime(options)
+                messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+                history = HistoryRecorder(agent_dir(root), messages)
+                history.append(ChatMessage(role="user", content="make a plan"))
+                record = runtime.plan_manager.save_proposed_plan(
+                    (history.session_dir or Path()).name,
+                    "turn-plan",
+                    "# Restored Plan\n\n- Replay from metadata",
+                )
+                update_session_active_plan(history.session_dir or Path(), record.to_dict())
+
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+                entry = HistoryEntry(
+                    path=history.path or Path(),
+                    kind="session",
+                    modified_at=1.0,
+                    message_count=2,
+                    preview="make a plan",
+                    display_path=None,
+                    session_dir=history.session_dir,
+                    transcript_path=history.transcript_path,
+                )
+
+                app.load_history(entry)
+
+            transcript = app.renderer.render_text()
+            self.assertIn("plan:\ntitle: Restored Plan", transcript)
+            self.assertIn("Replay from metadata", transcript)
 
 
 class TaskAndTeamTests(unittest.TestCase):

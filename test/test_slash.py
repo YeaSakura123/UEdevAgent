@@ -33,7 +33,13 @@ from uedev.state.config import ConfigError, agent_dir, load_project_config, load
 from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
-from uedev.runtime.history import HistoryRecorder, load_history_file
+from uedev.runtime.history import (
+    HistoryRecorder,
+    load_display_history,
+    load_history_file,
+    load_session_metadata,
+    update_session_active_plan,
+)
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
@@ -55,6 +61,7 @@ from uedev.runtime.prompts import (
     build_tool_confirmation_reminder,
 )
 from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
+from uedev.ui.tui import ChatTuiApplication
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
@@ -262,6 +269,70 @@ class SlashCommandTests(unittest.TestCase):
 
             self.assertTrue(runtime.handle_slash_command("/plan off", emit=output.append))
             self.assertEqual(runtime.collaboration_mode, "default")
+
+    def test_plan_approve_updates_active_plan_and_leaves_plan_mode(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            runtime.collaboration_mode = "plan"
+            history = HistoryRecorder(agent_dir(root), [ChatMessage(role="system", content=runtime.system_prompt)])
+            session_dir = history.ensure_session()
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                record = runtime.plan_manager.save_proposed_plan(session_dir.name, "turn-1", "# Ready Plan")
+                update_session_active_plan(session_dir, record.to_dict())
+                output: list[str] = []
+
+                self.assertTrue(runtime.handle_slash_command("/plan approve", emit=output.append, history=history))
+
+            metadata = load_session_metadata(session_dir)
+            display_records = load_display_history(history.display_path or Path())
+            self.assertEqual(runtime.collaboration_mode, "default")
+            self.assertIn("Plan approved", output[-1])
+            self.assertEqual(metadata["active_plan"]["status"], "approved")
+            self.assertEqual(display_records[-1]["event"]["type"], "plan")
+            self.assertEqual(display_records[-1]["event"]["status"], "approved")
+
+    def test_plan_reject_updates_active_plan_and_stays_in_plan_mode(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=1,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                )
+            )
+            history = HistoryRecorder(agent_dir(root), [ChatMessage(role="system", content=runtime.system_prompt)])
+            session_dir = history.ensure_session()
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                record = runtime.plan_manager.save_proposed_plan(session_dir.name, "turn-1", "# Needs Work")
+                update_session_active_plan(session_dir, record.to_dict())
+                output: list[str] = []
+
+                self.assertTrue(runtime.handle_slash_command("/plan reject", emit=output.append, history=history))
+
+            metadata = load_session_metadata(session_dir)
+            self.assertEqual(runtime.collaboration_mode, "plan")
+            self.assertIn("Plan rejected", output[-1])
+            self.assertEqual(metadata["active_plan"]["status"], "rejected")
 
     def test_paln_is_not_supported(self) -> None:
         with workspace_temp_dir() as temp:

@@ -65,7 +65,6 @@ from uedev.ui.tui import ChatTuiApplication
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
-from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
 from uedev.tools.workspace import edit_file, read_file, write_file
 from uedev.tools.worktrees import WorktreeManager
@@ -130,6 +129,8 @@ class SlashCommandTests(unittest.TestCase):
         self.assertIn("Compact the current conversation context.", help_text)
         self.assertIn("/clear", help_text)
         self.assertIn("Reset the current chat conversation context.", help_text)
+        self.assertIn("/exit", help_text)
+        self.assertIn("Exit interactive chat.", help_text)
 
     def test_chat_banner_includes_runtime_details(self) -> None:
         with workspace_temp_dir() as temp:

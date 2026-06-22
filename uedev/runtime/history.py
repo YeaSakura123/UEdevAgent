@@ -296,7 +296,7 @@ def append_display_turn_start(path: Path, turn_id: str, message: str) -> None:
 
 
 def append_display_event(path: Path, event: AgentEvent) -> None:
-    if event.type == "assistant_delta":
+    if event.type in {"assistant_delta", "budget"}:
         return
     append_display_record(path, {"type": "event", "event": asdict(event)})
 

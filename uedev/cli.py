@@ -7,6 +7,7 @@ from pathlib import Path
 from . import __version__
 from .state.config import (
     ConfigError,
+    RuntimeBudgetConfig,
     active_model_name,
     agent_dir,
     default_system_config_path,
@@ -21,7 +22,6 @@ from .state.config import (
 from .runtime.agent import AgentOptions, run_agent, run_chat
 from .tools.shell import shell_name
 from .state.tasks import TaskManager, TodoManager
-from .state.team import MessageBus, TeamManager
 from .ue import discover_ue, render_build_result, render_doctor, render_run_result, run_ue_build, run_ue_python
 from .tools.worktrees import WorktreeManager
 
@@ -72,9 +72,6 @@ def build_parser() -> argparse.ArgumentParser:
     task_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
     task_parser.add_argument("--graph", action="store_true", help="show persistent task graph instead of short todos")
 
-    team_parser = subparsers.add_parser("team", help="show persistent teammate roster")
-    team_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
-
     worktree_parser = subparsers.add_parser("worktrees", help="show managed task worktrees")
     worktree_parser.add_argument("--cwd", default=str(Path.cwd()), help="working directory that contains .agent state")
 
@@ -121,6 +118,7 @@ def main() -> None:
             doctor()
         elif args.command == "run":
             max_steps = _resolve_max_steps(args.max_steps)
+            runtime_budget = _resolve_runtime_budget(args.max_steps)
             run_agent(
                 AgentOptions(
                     task=" ".join(args.task),
@@ -130,10 +128,12 @@ def main() -> None:
                     timeout_seconds=args.timeout,
                     verbose=args.verbose,
                     context_threshold=args.context_threshold,
+                    runtime_budget=runtime_budget,
                 )
             )
         elif args.command == "chat":
             max_steps = _resolve_max_steps(args.max_steps)
+            runtime_budget = _resolve_runtime_budget(args.max_steps)
             run_chat(
                 AgentOptions(
                     task="",
@@ -144,6 +144,7 @@ def main() -> None:
                     verbose=args.verbose,
                     context_threshold=args.context_threshold,
                     plain=args.plain,
+                    runtime_budget=runtime_budget,
                 )
             )
         elif args.command == "tasks":
@@ -153,12 +154,6 @@ def main() -> None:
                 print(TaskManager(state_dir / "tasks").list_all())
             else:
                 print(TodoManager(state_dir).render_current())
-        elif args.command == "team":
-            cwd = Path(args.cwd).resolve()
-            state_dir = agent_dir(cwd)
-            task_manager = TaskManager(state_dir / "tasks")
-            bus = MessageBus(state_dir / "team")
-            print(TeamManager(state_dir / "team", task_manager, bus).list_all())
         elif args.command == "worktrees":
             cwd = Path(args.cwd).resolve()
             state_dir = agent_dir(cwd)
@@ -197,6 +192,26 @@ def _resolve_max_steps(cli_value: int | None) -> int:
             raise ConfigError("--max-steps must be a positive integer")
         return cli_value
     return load_system_config().runtime_default_max_steps
+
+
+def _resolve_runtime_budget(cli_max_steps: int | None) -> RuntimeBudgetConfig:
+    config = load_system_config()
+    budget = config.runtime_budget
+    if cli_max_steps is None:
+        return budget
+    if cli_max_steps <= 0:
+        raise ConfigError("--max-steps must be a positive integer")
+    return RuntimeBudgetConfig(
+        model_request_hard_limit=cli_max_steps,
+        tool_call_soft_limit=budget.tool_call_soft_limit,
+        tool_call_limits=dict(budget.tool_call_limits),
+        wall_clock_seconds=budget.wall_clock_seconds,
+        consecutive_tool_failures=budget.consecutive_tool_failures,
+        permission_denials=budget.permission_denials,
+        no_progress_rounds=budget.no_progress_rounds,
+        output_token_soft_ratio=budget.output_token_soft_ratio,
+        context_compact_ratio=budget.context_compact_ratio,
+    )
 
 
 def doctor() -> None:

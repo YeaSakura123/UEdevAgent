@@ -215,8 +215,8 @@ omitting it produces a dry-run command preview.
 - `chat` shows loading, assistant streaming text, and tool events while running,
   then renders a collapsed process summary before the final answer.
 - `chat` supports slash commands such as `/help`, `/context`, `/diff`, `/todos`,
-  `/tasks`, `/team`, `/inbox`, `/history`, `/subagents`, `/worktree`, `/model`, `/mcp`,
-  `/plan`, `/permissions`, `/compact`, `/clear`, and `/ue doctor`; type `/` to
+  `/tasks`, `/history`, `/subagents`, `/worktree`, `/model`, `/mcp`,
+  `/plan`, `/permissions`, `/compact`, `/clear`, `/exit`, and `/ue doctor`; type `/` to
   autocomplete commands with descriptions.
 - `/context` shows the current estimated model-context usage, configured context
   window, auto compact threshold, and remaining capacity.
@@ -255,7 +255,7 @@ omitting it produces a dry-run command preview.
   sessions, and automation.
 - The harness implements the staged mechanisms from `learn-claude-code-main`:
   loop, tool dispatch, TodoWrite, subagent, skill loading, context compact,
-  persistent task graph, background tasks, team inbox/protocols, autonomous task
+  persistent task graph, background tasks, autonomous task
   claiming, and task-aware git worktrees.
 - Commands run in the selected working directory.
 - Shell commands time out after 120 seconds by default.
@@ -272,7 +272,6 @@ omitting it produces a dry-run command preview.
   and `metadata.json`.
 - Todos are stored in `.agent/todos.json`.
 - Persistent tasks are stored in `.agent/tasks/`.
-- Team state is stored in `.agent/team/`.
 - Managed worktree indexes and directories are stored in `.agent/worktrees/`.
 - UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; UE build artifacts are stored in `.agent/ue_builds/<run_id>/`. The authoritative executed script snapshot is `user_script.py` in the UE run directory. `.agent/ue_scripts/` is a legacy location and is not the current execution entrypoint.
 - Manual validation steps are documented in `docs/VALIDATION.md`.

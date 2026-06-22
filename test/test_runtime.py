@@ -25,7 +25,7 @@ def workspace_temp_dir():
 
 
 from uedev.tools.background import BackgroundManager
-from uedev.state.config import ConfigError, ModelProfile, agent_dir, default_responses_options, load_project_config, load_system_config, resolve_model_profile
+from uedev.state.config import ConfigError, ModelProfile, RuntimeBudgetConfig, agent_dir, default_responses_options, load_project_config, load_system_config, resolve_model_profile
 from uedev.runtime.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file, load_session_metadata
@@ -55,7 +55,6 @@ from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
-from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
 from uedev.tools.workspace import edit_file, read_file, write_file
 from uedev.tools.worktrees import WorktreeManager
@@ -1687,6 +1686,71 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertIn("Forced finalization returned tool calls", events[-1].message)
             loaded = load_history_file(history.path or Path())
             self.assertFalse(any(message.content.startswith("Incomplete turn.") for message in loaded))
+
+    def test_single_tool_limit_returns_tool_error_without_executing_again(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            write_file(root, "a.txt", "hello")
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=3,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                    runtime_budget=RuntimeBudgetConfig(model_request_hard_limit=3, tool_call_limits={"read_file": 1}),
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})]),
+                ModelResponse("", [ToolCall(id="call_2", name="read_file", arguments={"path": "a.txt"})]),
+                ModelResponse("done"),
+            ]
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
+                    events = list(runtime.run_turn_events(messages, "read twice", turn_id="turn-test"))
+
+        tool_errors = [event for event in events if event.type == "tool_error"]
+        self.assertEqual(len(tool_errors), 1)
+        self.assertIn("Tool call limit reached for read_file", tool_errors[0].message)
+        tool_messages = [message for message in messages if message.role == "tool"]
+        self.assertEqual(len(tool_messages), 2)
+        self.assertIn("Tool call limit reached for read_file", tool_messages[-1].content)
+
+    def test_tool_soft_limit_injects_budget_reminder(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            write_file(root, "a.txt", "hello")
+            runtime = AgentRuntime(
+                AgentOptions(
+                    task="",
+                    max_steps=2,
+                    auto_approve=True,
+                    cwd=root,
+                    timeout_seconds=120,
+                    verbose=False,
+                    runtime_budget=RuntimeBudgetConfig(model_request_hard_limit=2, tool_call_soft_limit=1),
+                )
+            )
+            messages = [ChatMessage(role="system", content=runtime.system_prompt)]
+            responses = [
+                ModelResponse("", [ToolCall(id="call_1", name="read_file", arguments={"path": "a.txt"})]),
+                ModelResponse("done"),
+            ]
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                with patch("uedev.runtime.agent.call_model", side_effect=responses):
+                    list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-test"))
+
+        reminders = [message.content for message in messages if message.role == "system" and message.content.startswith("<budget-reminder>")]
+        self.assertTrue(any("Tool call soft budget reached" in reminder for reminder in reminders))
 
     def test_model_request_error_is_stopped_error(self) -> None:
         with workspace_temp_dir() as temp:

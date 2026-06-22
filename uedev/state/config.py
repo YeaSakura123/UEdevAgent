@@ -19,6 +19,13 @@ DEFAULT_DIFF_OUTPUT_MAX_CHARS = 20000
 DEFAULT_WORKTREE_ROOT = ""
 DEFAULT_MAX_STEPS = 8
 DEFAULT_MODEL_TIMEOUT_SECONDS = 120
+DEFAULT_TOOL_CALL_SOFT_LIMIT = 24
+DEFAULT_WALL_CLOCK_SECONDS = 900
+DEFAULT_CONSECUTIVE_TOOL_FAILURES = 3
+DEFAULT_PERMISSION_DENIALS = 2
+DEFAULT_NO_PROGRESS_ROUNDS = 3
+DEFAULT_OUTPUT_TOKEN_SOFT_RATIO = 0.8
+DEFAULT_CONTEXT_COMPACT_RATIO = 0.9
 DEFAULT_WORKSPACE_EXCLUDED_DIRS = (
     ".agent",
     ".git",
@@ -30,8 +37,35 @@ DEFAULT_WORKSPACE_EXCLUDED_DIRS = (
 )
 
 
+def default_tool_call_limits() -> dict[str, int]:
+    return {
+        "compact": 2,
+        "subagent": 4,
+        "background_run": 4,
+        "write_file": 16,
+        "edit_file": 16,
+        "shell": 12,
+        "worktree_run": 12,
+        "ue_run_python": 12,
+        "ue_build": 12,
+    }
+
+
 class ConfigError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class RuntimeBudgetConfig:
+    model_request_hard_limit: int = DEFAULT_MAX_STEPS
+    tool_call_soft_limit: int = DEFAULT_TOOL_CALL_SOFT_LIMIT
+    tool_call_limits: dict[str, int] = field(default_factory=default_tool_call_limits)
+    wall_clock_seconds: int = DEFAULT_WALL_CLOCK_SECONDS
+    consecutive_tool_failures: int = DEFAULT_CONSECUTIVE_TOOL_FAILURES
+    permission_denials: int = DEFAULT_PERMISSION_DENIALS
+    no_progress_rounds: int = DEFAULT_NO_PROGRESS_ROUNDS
+    output_token_soft_ratio: float = DEFAULT_OUTPUT_TOKEN_SOFT_RATIO
+    context_compact_ratio: float = DEFAULT_CONTEXT_COMPACT_RATIO
 
 
 @dataclass(frozen=True)
@@ -73,6 +107,7 @@ class SystemConfig:
     diff_output_max_chars: int = DEFAULT_DIFF_OUTPUT_MAX_CHARS
     worktree_default_root: Path | None = None
     runtime_default_max_steps: int = DEFAULT_MAX_STEPS
+    runtime_budget: RuntimeBudgetConfig = field(default_factory=RuntimeBudgetConfig)
     workspace_excluded_dirs: tuple[str, ...] = DEFAULT_WORKSPACE_EXCLUDED_DIRS
 
 
@@ -131,6 +166,7 @@ def system_config_template() -> dict[str, Any]:
         },
         "runtime": {
             "default_max_steps": DEFAULT_MAX_STEPS,
+            "budgets": runtime_budget_template(),
         },
         "workspace": {
             "excluded_dirs": list(DEFAULT_WORKSPACE_EXCLUDED_DIRS),
@@ -171,6 +207,20 @@ def default_responses_options() -> dict[str, Any]:
             },
         }
     )
+
+
+def runtime_budget_template() -> dict[str, Any]:
+    return {
+        "model_request_hard_limit": DEFAULT_MAX_STEPS,
+        "tool_call_soft_limit": DEFAULT_TOOL_CALL_SOFT_LIMIT,
+        "tool_call_limits": default_tool_call_limits(),
+        "wall_clock_seconds": DEFAULT_WALL_CLOCK_SECONDS,
+        "consecutive_tool_failures": DEFAULT_CONSECUTIVE_TOOL_FAILURES,
+        "permission_denials": DEFAULT_PERMISSION_DENIALS,
+        "no_progress_rounds": DEFAULT_NO_PROGRESS_ROUNDS,
+        "output_token_soft_ratio": DEFAULT_OUTPUT_TOKEN_SOFT_RATIO,
+        "context_compact_ratio": DEFAULT_CONTEXT_COMPACT_RATIO,
+    }
 
 
 def project_config_template(active_model: str | None = None, permission_mode: PermissionMode | None = None) -> dict[str, Any]:
@@ -267,7 +317,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
 
     mcp_servers = _parse_mcp_servers(data.get("mcp", {}), config_path)
     diff_output_max_chars = _parse_display_config(data.get("display", {}), config_path)
-    runtime_default_max_steps = _parse_runtime_config(data.get("runtime", {}), config_path)
+    runtime_default_max_steps, runtime_budget = _parse_runtime_config(data.get("runtime", {}), config_path)
     workspace_excluded_dirs = _parse_workspace_config(data.get("workspace", {}), config_path)
     worktree_default_root = _parse_worktree_config(data.get("worktrees", {}), config_path)
     subagent_model_profile = _parse_subagent_config(data.get("subagents", {}), models, config_path)
@@ -282,6 +332,7 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
         diff_output_max_chars=diff_output_max_chars,
         worktree_default_root=worktree_default_root,
         runtime_default_max_steps=runtime_default_max_steps,
+        runtime_budget=runtime_budget,
         workspace_excluded_dirs=workspace_excluded_dirs,
     )
 
@@ -430,6 +481,20 @@ def _optional_bool(value: object, default: bool, path: Path, label: str) -> bool
     if not isinstance(value, bool):
         raise ConfigError(f"{label} must be a boolean: {path}")
     return value
+
+
+def _optional_ratio(value: object, default: float, path: Path, label: str) -> float:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise ConfigError(f"{label} must be a number between 0 and 1: {path}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as error:
+        raise ConfigError(f"{label} must be a number between 0 and 1: {path}") from error
+    if parsed <= 0 or parsed > 1:
+        raise ConfigError(f"{label} must be a number between 0 and 1: {path}")
+    return parsed
 
 
 def _optional_str_or_none(value: object, path: Path, label: str) -> str | None:
@@ -595,17 +660,97 @@ def _parse_display_config(raw_display: object, config_path: Path) -> int:
     )
 
 
-def _parse_runtime_config(raw_runtime: object, config_path: Path) -> int:
+def _parse_runtime_config(raw_runtime: object, config_path: Path) -> tuple[int, RuntimeBudgetConfig]:
     if raw_runtime is None:
-        return DEFAULT_MAX_STEPS
+        budget = RuntimeBudgetConfig()
+        return DEFAULT_MAX_STEPS, budget
     if not isinstance(raw_runtime, dict):
         raise ConfigError(f"System config runtime must be an object: {config_path}")
-    return _optional_positive_int(
+    default_max_steps = _optional_positive_int(
         raw_runtime.get("default_max_steps"),
         DEFAULT_MAX_STEPS,
         config_path,
         "runtime.default_max_steps",
     )
+    raw_budgets = raw_runtime.get("budgets")
+    budget = _parse_runtime_budget_config(raw_budgets, config_path, default_max_steps)
+    return default_max_steps, budget
+
+
+def _parse_runtime_budget_config(raw_budgets: object, config_path: Path, default_max_steps: int) -> RuntimeBudgetConfig:
+    if raw_budgets is None:
+        return RuntimeBudgetConfig(model_request_hard_limit=default_max_steps)
+    if not isinstance(raw_budgets, dict):
+        raise ConfigError(f"runtime.budgets must be an object: {config_path}")
+    return RuntimeBudgetConfig(
+        model_request_hard_limit=_optional_positive_int(
+            raw_budgets.get("model_request_hard_limit"),
+            default_max_steps,
+            config_path,
+            "runtime.budgets.model_request_hard_limit",
+        ),
+        tool_call_soft_limit=_optional_positive_int(
+            raw_budgets.get("tool_call_soft_limit"),
+            DEFAULT_TOOL_CALL_SOFT_LIMIT,
+            config_path,
+            "runtime.budgets.tool_call_soft_limit",
+        ),
+        tool_call_limits=_parse_tool_call_limits(raw_budgets.get("tool_call_limits"), config_path),
+        wall_clock_seconds=_optional_positive_int(
+            raw_budgets.get("wall_clock_seconds"),
+            DEFAULT_WALL_CLOCK_SECONDS,
+            config_path,
+            "runtime.budgets.wall_clock_seconds",
+        ),
+        consecutive_tool_failures=_optional_positive_int(
+            raw_budgets.get("consecutive_tool_failures"),
+            DEFAULT_CONSECUTIVE_TOOL_FAILURES,
+            config_path,
+            "runtime.budgets.consecutive_tool_failures",
+        ),
+        permission_denials=_optional_positive_int(
+            raw_budgets.get("permission_denials"),
+            DEFAULT_PERMISSION_DENIALS,
+            config_path,
+            "runtime.budgets.permission_denials",
+        ),
+        no_progress_rounds=_optional_positive_int(
+            raw_budgets.get("no_progress_rounds"),
+            DEFAULT_NO_PROGRESS_ROUNDS,
+            config_path,
+            "runtime.budgets.no_progress_rounds",
+        ),
+        output_token_soft_ratio=_optional_ratio(
+            raw_budgets.get("output_token_soft_ratio"),
+            DEFAULT_OUTPUT_TOKEN_SOFT_RATIO,
+            config_path,
+            "runtime.budgets.output_token_soft_ratio",
+        ),
+        context_compact_ratio=_optional_ratio(
+            raw_budgets.get("context_compact_ratio"),
+            DEFAULT_CONTEXT_COMPACT_RATIO,
+            config_path,
+            "runtime.budgets.context_compact_ratio",
+        ),
+    )
+
+
+def _parse_tool_call_limits(raw_limits: object, config_path: Path) -> dict[str, int]:
+    limits = default_tool_call_limits()
+    if raw_limits is None:
+        return limits
+    if not isinstance(raw_limits, dict):
+        raise ConfigError(f"runtime.budgets.tool_call_limits must be an object: {config_path}")
+    for name, value in raw_limits.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ConfigError(f"runtime.budgets.tool_call_limits keys must be non-empty strings: {config_path}")
+        limits[name.strip()] = _optional_positive_int(
+            value,
+            1,
+            config_path,
+            f"runtime.budgets.tool_call_limits.{name}",
+        )
+    return limits
 
 
 def _parse_workspace_config(raw_workspace: object, config_path: Path) -> tuple[str, ...]:

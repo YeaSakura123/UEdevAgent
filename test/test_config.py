@@ -28,6 +28,7 @@ from uedev.state.config import (
     DEFAULT_MAX_STEPS,
     DEFAULT_WORKTREE_ROOT,
     DEFAULT_WORKSPACE_EXCLUDED_DIRS,
+    DEFAULT_TOOL_CALL_SOFT_LIMIT,
     ConfigError,
     agent_dir,
     default_responses_options,
@@ -38,7 +39,7 @@ from uedev.state.config import (
     resolve_subagent_model_profile,
     system_config_template,
 )
-from uedev.cli import _resolve_max_steps
+from uedev.cli import _resolve_max_steps, _resolve_runtime_budget
 from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
@@ -65,7 +66,6 @@ from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
-from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
 from uedev.tools.workspace import edit_file, read_file, write_file
 from uedev.tools.worktrees import WorktreeManager
@@ -360,10 +360,46 @@ class ConfigTests(unittest.TestCase):
             write_system_config(config_path)
 
             self.assertEqual(load_system_config(config_path).runtime_default_max_steps, DEFAULT_MAX_STEPS)
+            self.assertEqual(load_system_config(config_path).runtime_budget.model_request_hard_limit, DEFAULT_MAX_STEPS)
 
             write_system_config(config_path, runtime={"default_max_steps": 24})
 
             self.assertEqual(load_system_config(config_path).runtime_default_max_steps, 24)
+            self.assertEqual(load_system_config(config_path).runtime_budget.model_request_hard_limit, 24)
+
+    def test_runtime_budgets_default_and_can_be_configured(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(
+                config_path,
+                runtime={
+                    "default_max_steps": 9,
+                    "budgets": {
+                        "model_request_hard_limit": 7,
+                        "tool_call_soft_limit": 11,
+                        "tool_call_limits": {"read_file": 3},
+                        "wall_clock_seconds": 60,
+                        "consecutive_tool_failures": 2,
+                        "permission_denials": 1,
+                        "no_progress_rounds": 4,
+                        "output_token_soft_ratio": 0.5,
+                        "context_compact_ratio": 0.75,
+                    },
+                },
+            )
+
+            budget = load_system_config(config_path).runtime_budget
+
+            self.assertEqual(budget.model_request_hard_limit, 7)
+            self.assertEqual(budget.tool_call_soft_limit, 11)
+            self.assertEqual(budget.tool_call_limits["read_file"], 3)
+            self.assertEqual(budget.tool_call_limits["shell"], 12)
+            self.assertEqual(budget.wall_clock_seconds, 60)
+            self.assertEqual(budget.consecutive_tool_failures, 2)
+            self.assertEqual(budget.permission_denials, 1)
+            self.assertEqual(budget.no_progress_rounds, 4)
+            self.assertEqual(budget.output_token_soft_ratio, 0.5)
+            self.assertEqual(budget.context_compact_ratio, 0.75)
 
     def test_invalid_runtime_default_max_steps_raises(self) -> None:
         for value in (0, -1, "many", True):
@@ -379,6 +415,7 @@ class ConfigTests(unittest.TestCase):
         template = system_config_template()
 
         self.assertEqual(template["runtime"]["default_max_steps"], DEFAULT_MAX_STEPS)
+        self.assertEqual(template["runtime"]["budgets"]["tool_call_soft_limit"], DEFAULT_TOOL_CALL_SOFT_LIMIT)
 
     def test_cli_max_steps_uses_system_config_when_omitted(self) -> None:
         with workspace_temp_dir() as temp:
@@ -387,6 +424,8 @@ class ConfigTests(unittest.TestCase):
 
             with patch("uedev.state.config.default_system_config_path", return_value=config_path):
                 self.assertEqual(_resolve_max_steps(None), 13)
+                self.assertEqual(_resolve_runtime_budget(None).model_request_hard_limit, 13)
+                self.assertEqual(_resolve_runtime_budget(5).model_request_hard_limit, 5)
             self.assertEqual(_resolve_max_steps(5), 5)
 
     def test_workspace_excluded_dirs_default_and_can_be_configured(self) -> None:

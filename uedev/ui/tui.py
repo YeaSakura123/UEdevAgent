@@ -25,6 +25,7 @@ from prompt_toolkit.layout import Float, FloatContainer, HSplit, Layout
 from prompt_toolkit.layout.containers import ConditionalContainer, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.mouse_events import MouseEventType
 from prompt_toolkit.output.base import Output
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame, Label, TextArea
@@ -129,6 +130,9 @@ class ChatScreenState:
         self.history_index: int | None = None
         self.sticky_scroll = True
         self._stream_block: TranscriptBlock | None = None
+        self._active_turn_id = ""
+        self._active_turn_started_at = 0.0
+        self._active_status_detail = "thinking"
 
     def print_banner(self) -> None:
         self.blocks.append(TranscriptBlock(role="system", title="uedev", body=self.banner))
@@ -140,6 +144,9 @@ class ChatScreenState:
         self.status_message = "ready"
         self.sticky_scroll = True
         self._stream_block = None
+        self._active_turn_id = ""
+        self._active_turn_started_at = 0.0
+        self._active_status_detail = "thinking"
 
     def print_system(self, message: str) -> None:
         self.blocks.append(TranscriptBlock(role="system", body=message))
@@ -153,8 +160,12 @@ class ChatScreenState:
         self.status_message = "thinking"
         self.sticky_scroll = True
         self._stream_block = None
+        self._active_turn_id = turn_id
+        self._active_turn_started_at = time.monotonic()
+        self._active_status_detail = "thinking"
         if echo_user:
             self.blocks.append(TranscriptBlock(role="user", body=user_message, turn_id=turn_id))
+        self.blocks.append(TranscriptBlock(role="status", body=self._turn_status_text(), turn_id=turn_id, transient=True))
 
     def begin_turn_snapshot(self) -> ScreenTurnSnapshot:
         return ScreenTurnSnapshot(
@@ -175,6 +186,9 @@ class ChatScreenState:
         self.sticky_scroll = snapshot.sticky_scroll
         self.modal = snapshot.modal
         self._stream_block = snapshot.stream_block if snapshot.stream_block in self.blocks else None
+        if not self.running:
+            self._active_turn_id = ""
+            self._active_turn_started_at = 0.0
 
     def render(self, event) -> None:
         turn = self._find_turn(event.turn_id)
@@ -185,6 +199,7 @@ class ChatScreenState:
         if event.type == "assistant_delta":
             if not event.message:
                 return
+            self._remove_turn_status(event.turn_id)
             if self._stream_block is None:
                 self._stream_block = TranscriptBlock(role="assistant", body="", turn_id=event.turn_id, transient=True)
                 self.blocks.append(self._stream_block)
@@ -194,22 +209,31 @@ class ChatScreenState:
 
         if event.type == "thinking":
             self.status_message = _thinking_status(event)
+            self._update_turn_status(event.turn_id, self.status_message)
             if self.verbose or not any(existing.type == "thinking" for existing in turn.events):
                 self.blocks.append(TranscriptBlock(role="thinking", body="Thinking...", turn_id=event.turn_id))
+        elif event.type == "budget":
+            self.status_message = event.summary or event.message or "running"
+            self._update_turn_status(event.turn_id, self.status_message)
         elif event.type == "compact":
             self.status_message = "compacted context"
+            self._update_turn_status(event.turn_id, self.status_message)
             self.blocks.append(TranscriptBlock(role="system", body=event.message, turn_id=event.turn_id))
         elif event.type == "plan":
             self.status_message = event.summary or "plan"
+            self._update_turn_status(event.turn_id, self.status_message)
             self.blocks.append(TranscriptBlock(role="plan", body=_plan_text(event), turn_id=event.turn_id))
         elif event.type == "tool_start":
             self.status_message = f"running {event.name}"
+            self._update_turn_status(event.turn_id, self.status_message)
             self.blocks.append(TranscriptBlock(role=f"tool: {event.name}", body=_tool_start_text(event, self.verbose, self.max_output_chars), turn_id=event.turn_id))
         elif event.type == "tool_result":
             self.status_message = f"completed {event.name}"
+            self._update_turn_status(event.turn_id, self.status_message)
             self.blocks.append(TranscriptBlock(role=f"tool: {event.name}", body=_tool_result_text(event, self.verbose, self.max_output_chars), turn_id=event.turn_id))
         elif event.type == "tool_error":
             self.status_message = f"failed {event.name}"
+            self._update_turn_status(event.turn_id, self.status_message)
             self.blocks.append(TranscriptBlock(role=f"tool: {event.name}", body=_tool_error_text(event), turn_id=event.turn_id))
         elif event.type in {"final", "stopped"}:
             plan_already_rendered = any(existing.type == "plan" for existing in turn.events)
@@ -219,8 +243,11 @@ class ChatScreenState:
                 except ValueError:
                     pass
                 self._stream_block = None
+            self._remove_turn_status(event.turn_id)
             turn.add_event(event)
             self.running = False
+            self._active_turn_id = ""
+            self._active_turn_started_at = 0.0
             summary = turn.summary()
             self.blocks.append(TranscriptBlock(role="summary", body=summary, turn_id=event.turn_id))
             self.status_message = "ready" if event.type == "final" else event.status or "stopped"
@@ -231,6 +258,43 @@ class ChatScreenState:
             return
 
         turn.add_event(event)
+
+    def tick_running_status(self) -> None:
+        if not self.running or not self._active_turn_id:
+            return
+        self._update_turn_status(self._active_turn_id, self._active_status_detail)
+
+    def _update_turn_status(self, turn_id: str, detail: str) -> None:
+        if not turn_id:
+            turn_id = self._active_turn_id
+        if not turn_id:
+            return
+        self._active_turn_id = turn_id
+        self._active_status_detail = detail or self._active_status_detail
+        block = self._find_status_block(turn_id)
+        if block is not None:
+            block.body = self._turn_status_text()
+
+    def _remove_turn_status(self, turn_id: str) -> None:
+        block = self._find_status_block(turn_id)
+        if block is None:
+            return
+        try:
+            self.blocks.remove(block)
+        except ValueError:
+            pass
+
+    def _find_status_block(self, turn_id: str) -> TranscriptBlock | None:
+        for block in reversed(self.blocks):
+            if block.role == "status" and (not turn_id or block.turn_id == turn_id):
+                return block
+        return None
+
+    def _turn_status_text(self) -> str:
+        elapsed = 0
+        if self._active_turn_started_at:
+            elapsed = max(0, int(time.monotonic() - self._active_turn_started_at))
+        return f"{_format_elapsed(elapsed)} · {self._active_status_detail}"
 
     def render_history(self, messages: list[ChatMessage], source: str) -> None:
         from ..runtime.context import SUMMARY_PREFIX, is_runtime_state_message
@@ -391,7 +455,7 @@ def _label_style(label: str) -> str:
         return "class:transcript.assistant"
     if lowered == "plan":
         return "class:transcript.plan"
-    if lowered in {"summary", "thinking"}:
+    if lowered in {"summary", "thinking", "status"}:
         return "class:transcript.dim"
     if lowered.startswith("tool:"):
         return "class:transcript.tool"
@@ -432,6 +496,14 @@ def _thinking_status(event) -> str:
     if event.step and event.total:
         return f"thinking {event.step}/{event.total}"
     return "thinking"
+
+
+def _format_elapsed(seconds: int) -> str:
+    minutes, remainder = divmod(max(0, seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{minutes:02d}:{remainder:02d}"
+    return f"{minutes:02d}:{remainder:02d}"
 
 
 def _tool_start_text(event, verbose: bool, max_output_chars: int) -> str:
@@ -539,7 +611,7 @@ class ChatTuiApplication:
             except (EOFError, KeyboardInterrupt):
                 return
 
-            if query.lower() in {"", "quit", "exit"}:
+            if query.lower() in {"", "quit", "exit", "/exit"}:
                 return
 
             if query.lower() == "/clear":
@@ -614,6 +686,7 @@ class ChatTuiApplication:
             wrap_lines=True,
             focusable=False,
         )
+        self._install_transcript_mouse_handler()
         self._input_area = TextArea(
             height=1,
             prompt=[("class:prompt", "> ")],
@@ -674,6 +747,22 @@ class ChatTuiApplication:
         )
         self._fullscreen_app.run()
 
+    def _install_transcript_mouse_handler(self) -> None:
+        if self._transcript_area is None:
+            return
+        original_handler = self._transcript_area.control.mouse_handler
+
+        def mouse_handler(mouse_event):
+            if mouse_event.event_type == MouseEventType.SCROLL_UP:
+                self._scroll_transcript(-3)
+                return None
+            if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+                self._scroll_transcript(3)
+                return None
+            return original_handler(mouse_event)
+
+        self._transcript_area.control.mouse_handler = mouse_handler
+
     def _request_refresh(self) -> None:
         self._schedule_invalidate()
 
@@ -728,6 +817,7 @@ class ChatTuiApplication:
         if self.screen is None or self._transcript_area is None:
             return
         with self._ui_lock:
+            self.screen.tick_running_status()
             rendered = self.screen.render_text()
             previous_row = self._transcript_cursor_row()
             if self._transcript_area.text != rendered:
@@ -1060,6 +1150,20 @@ class ChatTuiApplication:
             return
         text = self._transcript_area.text
         document = Document(text, cursor_position=self._transcript_area.buffer.cursor_position)
+        info = self._transcript_area.window.render_info
+        if info is not None:
+            max_scroll = max(0, info.content_height - info.window_height)
+            row = max(0, min(max_scroll, info.vertical_scroll + delta_rows))
+            self._transcript_area.window.vertical_scroll = row
+            if row >= max_scroll:
+                self._transcript_area.buffer.cursor_position = len(text)
+            else:
+                cursor_row = max(0, min(document.line_count - 1, row))
+                self._transcript_area.buffer.cursor_position = document.translate_row_col_to_index(cursor_row, 0)
+            if self.screen is not None:
+                self.screen.sticky_scroll = row >= max_scroll
+            self._request_refresh()
+            return
         row = max(0, min(document.line_count - 1, document.cursor_position_row + delta_rows))
         self._transcript_area.buffer.cursor_position = document.translate_row_col_to_index(row, 0)
         if self.screen is not None:
@@ -1089,7 +1193,7 @@ class ChatTuiApplication:
             self._pending_worktree_name = False
             self.create_ue_linked_worktree(query)
             return
-        if lowered in {"quit", "exit"}:
+        if lowered in {"quit", "exit", "/exit"}:
             if self._fullscreen_app is not None:
                 self._fullscreen_app.exit()
             return
@@ -1555,11 +1659,17 @@ class ChatTuiApplication:
         self.renderer.start_turn(turn_id, goal)
         self.history.record_turn_start(turn_id, goal)
         try:
-            for event in self.runtime.run_turn_events(self.messages, goal=goal, turn_id=turn_id, history=self.history):
+            for event in self.runtime.run_turn_events(
+                self.messages,
+                goal=goal,
+                turn_id=turn_id,
+                history=self.history,
+                emit_budget_events=True,
+            ):
                 if self._cancel_requested:
                     raise TurnCancelled()
                 self.renderer.render(event)
-                if event.type not in {"plan", "assistant_delta"}:
+                if event.type not in {"plan", "assistant_delta", "budget"}:
                     self.history.record_event(event)
         except TurnCancelled:
             if rollback_snapshot is not None:

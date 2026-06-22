@@ -57,7 +57,6 @@ from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
-from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
 from uedev.tools.workspace import edit_file, grep, list_files, read_file, safe_path, write_file
 from uedev.tools.worktrees import WorktreeManager

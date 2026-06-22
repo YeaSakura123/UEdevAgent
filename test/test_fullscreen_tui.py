@@ -4,12 +4,15 @@ import json
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from contextlib import contextmanager
 
 from prompt_toolkit.document import Document
 from prompt_toolkit.buffer import CompletionState
+from prompt_toolkit.data_structures import Point
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.widgets import TextArea
 
 from uedev.llm.client import ChatMessage, ModelResponse, ModelStreamEvent, ToolCall
@@ -17,7 +20,7 @@ from uedev.runtime.agent import AgentOptions, AgentRuntime, SlashCommandComplete
 from uedev.runtime.history import append_display_event, load_display_history, load_history_file
 from uedev.state.config import agent_dir
 from uedev.tools.workspace import write_file
-from uedev.ui.events import assistant_delta_event, final_event, thinking_event
+from uedev.ui.events import assistant_delta_event, budget_event, final_event, thinking_event
 from uedev.ui.tui import ApprovalModal, ChatScreenState, ChatTuiApplication, FullscreenRenderer, SelectionModal
 
 
@@ -68,6 +71,22 @@ class FullscreenStateTests(unittest.TestCase):
         self.assertIn("summary", transcript)
         self.assertIn("assistant", transcript)
 
+    def test_turn_status_appears_under_user_until_assistant_streams(self) -> None:
+        state = ChatScreenState("banner")
+        state.start_turn("turn-1", "hello")
+        state.render(budget_event("model 1/3 · requesting model", "turn-1", summary="model 1/3 · requesting model"))
+
+        pending = state.render_text()
+
+        self.assertLess(pending.index("user\nhello"), pending.index("status\n"))
+        self.assertIn("model 1/3", pending)
+
+        state.render(assistant_delta_event("hi", "turn-1"))
+        streaming = state.render_text()
+
+        self.assertNotIn("status\n", streaming)
+        self.assertIn("assistant\nhi", streaming)
+
     def test_selection_modal_submit_invokes_callback(self) -> None:
         selected: list[object] = []
         with workspace_temp_dir() as root:
@@ -99,6 +118,27 @@ class FullscreenStateTests(unittest.TestCase):
                 app._drain_ui_events()
 
         self.assertIn("queued", app.screen.render_text())
+
+    def test_exit_slash_command_exits_fullscreen_app(self) -> None:
+        class FakeApp:
+            def __init__(self) -> None:
+                self.exited = False
+
+            def exit(self) -> None:
+                self.exited = True
+
+        with workspace_temp_dir() as root:
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                runtime = AgentRuntime(AgentOptions("", 1, True, root, 120, False))
+                app = ChatTuiApplication(AgentOptions("", 1, True, root, 120, False), runtime, "banner", SlashCommandCompleter())
+                fake_app = FakeApp()
+                app._fullscreen_app = fake_app  # type: ignore[assignment]
+
+                app._handle_fullscreen_query("/exit")
+
+        self.assertTrue(fake_app.exited)
 
     def test_throttled_refresh_coalesces_invalidates(self) -> None:
         class FakeApp:
@@ -158,6 +198,42 @@ class FullscreenStateTests(unittest.TestCase):
         self.assertLess(scrolled, bottom)
         self.assertEqual(app._transcript_cursor_row(), scrolled)
         self.assertFalse(state.sticky_scroll)
+
+    def test_mouse_wheel_scrolls_transcript_before_page_keys(self) -> None:
+        state = ChatScreenState("banner")
+        for index in range(30):
+            state.print_system(f"line {index}")
+
+        with workspace_temp_dir() as root:
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                runtime = AgentRuntime(AgentOptions("", 1, True, root, 120, False))
+                app = ChatTuiApplication(AgentOptions("", 1, True, root, 120, False), runtime, "banner", SlashCommandCompleter())
+                app.screen = state
+                app._transcript_area = TextArea(text="", read_only=True, focusable=False)
+                app._install_transcript_mouse_handler()
+                app._sync_fullscreen_controls()
+                app._transcript_area.window.render_info = SimpleNamespace(content_height=100, window_height=20, vertical_scroll=80)
+                scroll_up = MouseEvent(Point(x=0, y=0), MouseEventType.SCROLL_UP, MouseButton.NONE, frozenset())
+                scroll_down = MouseEvent(Point(x=0, y=0), MouseEventType.SCROLL_DOWN, MouseButton.NONE, frozenset())
+
+                app._transcript_area.control.mouse_handler(scroll_up)
+                first_scroll_offset = app._transcript_area.window.vertical_scroll
+                scrolled = app._transcript_cursor_row()
+                app._transcript_area.window.render_info = SimpleNamespace(content_height=100, window_height=20, vertical_scroll=first_scroll_offset)
+                for _ in range(20):
+                    app._transcript_area.control.mouse_handler(scroll_down)
+                    app._transcript_area.window.render_info = SimpleNamespace(
+                        content_height=100,
+                        window_height=20,
+                        vertical_scroll=app._transcript_area.window.vertical_scroll,
+                    )
+
+        self.assertEqual(first_scroll_offset, 77)
+        self.assertLess(scrolled, 80)
+        self.assertTrue(state.sticky_scroll)
+        self.assertEqual(app._transcript_area.window.vertical_scroll, 80)
 
     def test_slash_completion_panel_accepts_completion(self) -> None:
         class FakePromptApp:
@@ -273,6 +349,7 @@ class FullscreenHistoryTests(unittest.TestCase):
             path = root / "display.jsonl"
 
             append_display_event(path, assistant_delta_event("partial", "turn-1"))
+            append_display_event(path, budget_event("model 1/3", "turn-1"))
             append_display_event(path, final_event("done", "turn-1"))
 
             records = load_display_history(path)

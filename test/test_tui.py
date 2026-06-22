@@ -61,7 +61,6 @@ from uedev.runtime.history import (
 from uedev.tools.shell import ShellResult, run_shell
 from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
-from uedev.state.team import MessageBus, TeamManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
 from uedev.runtime.subagents import SubagentRecord
 from uedev.ui.tui import ChatTuiApplication
@@ -580,36 +579,6 @@ class TaskAndTeamTests(unittest.TestCase):
             manager.update(1, status="completed")
 
             self.assertNotIn("blockedBy=[1]", manager.list_all())
-
-    def test_team_message_and_claim(self) -> None:
-        with workspace_temp_dir() as temp:
-            root = Path(temp)
-            state_dir = agent_dir(root)
-            task_manager = TaskManager(state_dir / "tasks")
-            bus = MessageBus(state_dir / "team")
-            team = TeamManager(state_dir / "team", task_manager, bus)
-            task_manager.create("Ready task")
-            team.spawn("alice", "coder")
-
-            self.assertIn("alice", team.list_all())
-            self.assertIn("claimed task #1", team.claim_ready_task("alice"))
-            bus.send("lead", "alice", "hello")
-            self.assertEqual(bus.read_inbox("alice")[0]["content"], "hello")
-
-    def test_team_state_tolerates_empty_or_bad_json(self) -> None:
-        with workspace_temp_dir() as temp:
-            root = Path(temp)
-            state_dir = agent_dir(root)
-            task_manager = TaskManager(state_dir / "tasks")
-            bus = MessageBus(state_dir / "team")
-            team = TeamManager(state_dir / "team", task_manager, bus)
-            team.config_path.write_text("", encoding="utf-8")
-            team.requests_path.write_text("{bad", encoding="utf-8")
-            (bus.inbox_dir / "lead.jsonl").write_text("{bad\n{\"content\":\"ok\"}\n", encoding="utf-8")
-
-            self.assertIn("No teammates", team.list_all())
-            self.assertEqual(bus.read_inbox("lead"), [{"content": "ok"}])
-            self.assertIn("unknown shutdown request", self._raises_text(lambda: team.shutdown_response("missing", True)))
 
     def _raises_text(self, callback) -> str:
         try:

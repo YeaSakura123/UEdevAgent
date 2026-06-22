@@ -52,6 +52,7 @@ from ..tools.background import BackgroundManager
 from ..state.config import (
     ConfigError,
     DEFAULT_WORKSPACE_EXCLUDED_DIRS,
+    RuntimeBudgetConfig,
     active_model_name,
     agent_dir,
     format_model_profiles,
@@ -74,6 +75,7 @@ from .context import (
 from ..ui.events import (
     AgentEvent,
     assistant_delta_event,
+    budget_event,
     compact_event,
     final_event,
     incomplete_event,
@@ -125,7 +127,6 @@ from ..state.plans import (
     plan_record_from_dict,
 )
 from ..state.tasks import TaskManager, TodoManager
-from ..state.team import MessageBus, TeamManager
 from ..tools.specs import get_tool_specs
 from ..ue import (
     discover_ue,
@@ -159,6 +160,7 @@ class AgentOptions:
     verbose: bool
     context_threshold: int | None = None
     plain: bool = False
+    runtime_budget: RuntimeBudgetConfig | None = None
 
 
 ToolHandler = Callable[[dict[str, object]], str]
@@ -186,14 +188,75 @@ class ToolAction:
     input: dict[str, Any]
 
 
+@dataclass
+class TurnBudgetState:
+    config: RuntimeBudgetConfig
+    started_at: float
+    model_requests: int = 0
+    tool_calls: int = 0
+    total_output_tokens: int = 0
+    consecutive_tool_failures: int = 0
+    permission_denials: int = 0
+    no_progress_rounds: int = 0
+    tool_soft_limit_reminded: bool = False
+    output_soft_limit_reminded: bool = False
+    no_progress_reminded: bool = False
+
+    def __post_init__(self) -> None:
+        self.per_tool_calls: dict[str, int] = {}
+
+    def elapsed_ms(self) -> int:
+        return _duration_ms(self.started_at)
+
+    def elapsed_seconds(self) -> int:
+        return max(0, int(time.perf_counter() - self.started_at))
+
+    def can_request_model(self) -> bool:
+        return self.model_requests < self.config.model_request_hard_limit
+
+    def next_model_request(self) -> int:
+        self.model_requests += 1
+        return self.model_requests
+
+    def record_tool_call(self, name: str) -> int:
+        self.tool_calls += 1
+        self.per_tool_calls[name] = self.per_tool_calls.get(name, 0) + 1
+        return self.per_tool_calls[name]
+
+    def tool_limit_for(self, name: str) -> int | None:
+        return self.config.tool_call_limits.get(name)
+
+    def wall_clock_exceeded(self) -> bool:
+        return self.elapsed_seconds() >= self.config.wall_clock_seconds
+
+    def record_tool_result(self, *, is_error: bool, permission_denied: bool, progress: bool) -> None:
+        if permission_denied:
+            self.permission_denials += 1
+        if is_error:
+            self.consecutive_tool_failures += 1
+        else:
+            self.consecutive_tool_failures = 0
+        if progress:
+            self.no_progress_rounds = 0
+        else:
+            self.no_progress_rounds += 1
+
+    def status(self, phase: str = "") -> str:
+        parts = [
+            f"model {self.model_requests}/{self.config.model_request_hard_limit}",
+            f"tools {self.tool_calls}/{self.config.tool_call_soft_limit}",
+        ]
+        if phase:
+            parts.append(phase)
+        return " · ".join(parts)
+
+
 SLASH_COMMANDS = [
     ("/help", "Show available chat slash commands."),
     ("/context", "Show current conversation context usage."),
     ("/diff", "Show Git and Perforce workspace changes."),
     ("/todos", "Show the current lightweight todo list."),
     ("/tasks", "Show the persistent task graph."),
-    ("/team", "Show the persistent teammate roster."),
-    ("/inbox", "Show pending messages for the lead agent."),
     ("/history", "Load a previous conversation from this project."),
     ("/subagents", "Choose a subagent conversation to view."),
     ("/worktree", "Create a UE Git linked worktree from the current project."),
@@ -205,6 +268,7 @@ SLASH_COMMANDS = [
     ("/ue doctor", "Inspect Unreal Engine project and editor configuration."),
     ("/compact", "Compact the current conversation context."),
     ("/clear", "Reset the current chat conversation context."),
+    ("/exit", "Exit interactive chat."),
 ]
 
 FORCED_FINALIZATION_PROMPT = """You have reached the tool and step budget for this turn.
@@ -222,14 +286,18 @@ def render_slash_help() -> str:
     return "\n".join(lines)
 
 
-def render_context_usage(messages: list[ChatMessage], model_profile: Any, compact_threshold: int) -> str:
+def render_context_usage(
+    messages: list[ChatMessage],
+    model_profile: Any,
+    compact_threshold: int,
+    budget_config: RuntimeBudgetConfig | None = None,
+) -> str:
     estimated = estimate_tokens(messages)
     context_window = int(getattr(model_profile, "context_window", 0) or 0)
     model_name = str(getattr(model_profile, "model", "") or "(missing model)")
     profile_name = str(getattr(model_profile, "name", "") or "(unknown)")
 
-    return "\n".join(
-        [
+    lines = [
             "Context:",
             f"model: {model_name} (profile: {profile_name})",
             f"estimated tokens: {_format_number(estimated)}",
@@ -240,8 +308,23 @@ def render_context_usage(messages: list[ChatMessage], model_profile: Any, compac
             f"threshold usage: {_format_percent(estimated, compact_threshold)}",
             f"remaining to threshold: {_format_number(max(0, compact_threshold - estimated))}",
             f"remaining to window: {_format_number(max(0, context_window - estimated))}",
-        ]
-    )
+    ]
+    if budget_config is not None:
+        lines.extend(
+            [
+                "",
+                "Budgets:",
+                f"model requests: {_format_number(budget_config.model_request_hard_limit)}",
+                f"tool calls soft limit: {_format_number(budget_config.tool_call_soft_limit)}",
+                f"wall clock: {_format_number(budget_config.wall_clock_seconds)}s",
+                f"consecutive tool failures: {_format_number(budget_config.consecutive_tool_failures)}",
+                f"permission denials: {_format_number(budget_config.permission_denials)}",
+                f"no-progress rounds: {_format_number(budget_config.no_progress_rounds)}",
+                f"context compact ratio: {budget_config.context_compact_ratio:.2f}",
+                f"output soft ratio: {budget_config.output_token_soft_ratio:.2f}",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def _format_number(value: int) -> str:
@@ -729,7 +812,7 @@ def run_plain_chat(options: AgentOptions) -> None:
     print(render_chat_banner(options))
     while True:
         query = session.prompt([("class:prompt", "\n> ")], **create_chat_prompt_options()).strip()
-        if query.lower() in {"", "quit", "exit"}:
+        if query.lower() in {"", "quit", "exit", "/exit"}:
             return
 
         if query.lower() == "/clear":
@@ -791,6 +874,7 @@ class AgentRuntime:
     # 内部函数：初始化当前类实例，准备 agent 主循环、chat 界面、工具分发和运行时观察 所需状态。
     def __init__(self, options: AgentOptions, approval_provider: ApprovalProvider | None = None):
         self.options = options
+        self.budget_config = options.runtime_budget or RuntimeBudgetConfig(model_request_hard_limit=options.max_steps)
         self.approval_provider = approval_provider or confirm_command
         self.agent_dir = agent_dir(options.cwd)
         self.agent_dir.mkdir(parents=True, exist_ok=True)
@@ -803,13 +887,11 @@ class AgentRuntime:
         self.active_plan: PlanRecord | None = None
         self.skill_loader = SkillLoader(options.cwd / "skills")
         self.background = BackgroundManager(options.cwd)
-        self.bus = MessageBus(self.agent_dir / "team")
-        self.team = TeamManager(self.agent_dir / "team", self.task_manager, self.bus)
         self.worktrees = WorktreeManager(options.cwd, self.agent_dir / "worktrees", self.task_manager)
         self.workspace_excluded_dirs = self._load_workspace_excluded_dirs()
         self.subagents = SubagentManager(
             self.agent_dir,
-            options.max_steps,
+            self.budget_config.model_request_hard_limit,
             self._execute_subagent_tool,
             self.current_subagent_model_profile,
         )
@@ -840,10 +922,12 @@ class AgentRuntime:
         goal: str,
         turn_id: str | None = None,
         history: HistoryRecorder | None = None,
+        emit_budget_events: bool = False,
     ) -> Iterator[AgentEvent]:
         rounds_without_todo = 0
         current_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
-        started_at = time.perf_counter()
+        budget = TurnBudgetState(self.budget_config, time.perf_counter())
+        started_at = budget.started_at
         standalone_subagents_dir: Path | None = None
         tool_names_this_turn: list[str] = []
         tool_events_this_turn: list[AgentEvent] = []
@@ -872,7 +956,18 @@ class AgentRuntime:
         if history is not None:
             history.append(goal_message)
 
-        for step in range(1, self.options.max_steps + 1):
+        for step in range(1, budget.config.model_request_hard_limit + 1):
+            if budget.wall_clock_exceeded():
+                yield incomplete_event(
+                    self._render_incomplete_summary(
+                        f"Stopped after reaching the wall clock budget of {budget.config.wall_clock_seconds}s.",
+                        tool_events_this_turn,
+                        edited_paths_this_turn,
+                    ),
+                    current_turn_id,
+                    budget.elapsed_ms(),
+                )
+                return
             self._inject_runtime_observations(messages)
             if estimate_tokens(messages) > context_threshold:
                 try:
@@ -891,13 +986,17 @@ class AgentRuntime:
                     str(transcript),
                 )
                 self._inject_runtime_observations(messages)
-            yield thinking_event(step, self.options.max_steps, current_turn_id)
+            budget.next_model_request()
+            yield thinking_event(step, budget.config.model_request_hard_limit, current_turn_id)
+            if emit_budget_events:
+                yield budget_event(budget.status("requesting model"), current_turn_id, budget.elapsed_ms(), budget.status("requesting model"))
 
             try:
                 response: ModelResponse | None = None
                 for model_event in call_model_stream(messages, self.current_model_profile(), tools=self.tool_specs):
                     if model_event.type == "delta":
                         if model_event.delta:
+                            budget.total_output_tokens += _estimate_text_tokens(model_event.delta)
                             yield assistant_delta_event(model_event.delta, current_turn_id)
                         continue
                     response = model_event.response
@@ -906,6 +1005,7 @@ class AgentRuntime:
             except Exception as error:
                 yield stopped_event(str(error), current_turn_id, _duration_ms(started_at))
                 return
+            budget.total_output_tokens += _estimate_text_tokens(response.content)
             if response.tool_calls:
                 assistant_message = ChatMessage(
                     role="assistant",
@@ -955,20 +1055,39 @@ class AgentRuntime:
 
                 for tool_call in response.tool_calls:
                     action = ToolAction(name=tool_call.name, input=tool_call.arguments)
+                    tool_call_count = budget.record_tool_call(action.name)
+                    tool_limit = budget.tool_limit_for(action.name)
+                    limit_exceeded = tool_limit is not None and tool_call_count > tool_limit
+                    if emit_budget_events:
+                        yield budget_event(budget.status(f"running {action.name}"), current_turn_id, budget.elapsed_ms(), budget.status(f"running {action.name}"))
                     if action.name == "subagent":
-                        output, is_error = subagent_outputs.get(tool_call.id, ("Subagent did not return a result.", True))
+                        if limit_exceeded:
+                            output, is_error = _tool_limit_message(action.name, tool_call_count, tool_limit or 0), True
+                        else:
+                            output, is_error = subagent_outputs.get(tool_call.id, ("Subagent did not return a result.", True))
                     else:
                         tool_names_this_turn.append(action.name)
                         yield tool_start_event(action.name, action.input, current_turn_id)
-                        if action.name in {"edit_file", "write_file"}:
+                        if limit_exceeded:
+                            output, is_error = _tool_limit_message(action.name, tool_call_count, tool_limit or 0), True
+                        elif action.name in {"edit_file", "write_file"}:
                             path = str(action.input.get("path") or "").strip()
                             if path and path not in edited_paths_this_turn:
                                 edited_paths_this_turn.append(path)
-                        output, is_error = self._execute_tool_with_status(action)
+                            output, is_error = self._execute_tool_with_status(action)
+                        else:
+                            output, is_error = self._execute_tool_with_status(action)
+                    permission_denied = _is_permission_denial_output(output)
+                    if permission_denied:
+                        is_error = True
                     if action.name == "todo_update":
                         rounds_without_todo = 0
                     else:
                         rounds_without_todo += 1
+                    progress = not is_error and bool((output or "").strip())
+                    if action.name in {"edit_file", "write_file"} and not is_error:
+                        progress = True
+                    budget.record_tool_result(is_error=is_error, permission_denied=permission_denied, progress=progress)
 
                     if is_error:
                         event = tool_error_event(action.name, output, current_turn_id)
@@ -991,6 +1110,7 @@ class AgentRuntime:
                     messages.append(tool_message)
                     if history is not None:
                         history.append(tool_message)
+                    self._append_budget_reminders(messages, budget)
 
                     if action.name == "compact":
                         try:
@@ -1091,7 +1211,7 @@ class AgentRuntime:
         except Exception as error:
             return incomplete_event(
                 self._render_incomplete_summary(
-                    f"Stopped after {self.options.max_steps} iterations without a final answer. "
+                    f"Stopped after {self.budget_config.model_request_hard_limit} model requests without a final answer. "
                     f"Forced finalization failed: {error}",
                     tool_events,
                     edited_paths,
@@ -1104,7 +1224,7 @@ class AgentRuntime:
         if response.tool_calls:
             return incomplete_event(
                 self._render_incomplete_summary(
-                    f"Stopped after {self.options.max_steps} iterations without a final answer. "
+                    f"Stopped after {self.budget_config.model_request_hard_limit} model requests without a final answer. "
                     "Forced finalization returned tool calls instead of a final answer.",
                     tool_events,
                     edited_paths,
@@ -1115,7 +1235,7 @@ class AgentRuntime:
         if not final_answer:
             return incomplete_event(
                 self._render_incomplete_summary(
-                    f"Stopped after {self.options.max_steps} iterations without a final answer. "
+                    f"Stopped after {self.budget_config.model_request_hard_limit} model requests without a final answer. "
                     "Forced finalization returned an empty answer.",
                     tool_events,
                     edited_paths,
@@ -1126,7 +1246,7 @@ class AgentRuntime:
         if self.collaboration_mode == "plan" and not is_proposed_plan(final_answer):
             return incomplete_event(
                 self._render_incomplete_summary(
-                    f"Stopped after {self.options.max_steps} iterations without a valid Plan Mode final answer.",
+                    f"Stopped after {self.budget_config.model_request_hard_limit} model requests without a valid Plan Mode final answer.",
                     tool_events,
                     edited_paths,
                 ),
@@ -1154,7 +1274,7 @@ class AgentRuntime:
             "Incomplete turn.",
             "",
             f"Reason: {reason}",
-            f"Max steps: {self.options.max_steps}",
+            f"Model request budget: {self.budget_config.model_request_hard_limit}",
             f"Tools completed: {len(tool_events)}",
         ]
         if edited_paths:
@@ -1190,7 +1310,7 @@ class AgentRuntime:
                 emit("Use /context inside chat to inspect the current conversation context.")
                 return True
             try:
-                emit(render_context_usage(messages, self.current_model_profile(), self._context_threshold()))
+                emit(render_context_usage(messages, self.current_model_profile(), self._context_threshold(), self.budget_config))
             except ConfigError as error:
                 emit(f"Config error: {error}")
             return True
@@ -1211,12 +1331,6 @@ class AgentRuntime:
             return True
         if command == "/tasks":
             emit(self.task_manager.list_all())
-            return True
-        if command == "/team":
-            emit(self.team.list_all())
-            return True
-        if command == "/inbox":
-            emit(json.dumps(self.bus.read_inbox("lead"), ensure_ascii=False, indent=2))
             return True
         if command == "/history":
             emit("Use /history inside chat to choose and load a previous conversation.")
@@ -1460,10 +1574,6 @@ class AgentRuntime:
             rendered = "\n".join(f"[bg:{task.id}] {task.status}\n{truncate(task.result, 1000)}" for task in notifications)
             messages.append(ChatMessage(role="user", content=f"<background-results>\n{rendered}\n</background-results>"))
 
-        inbox = self.bus.read_inbox("lead")
-        if inbox:
-            messages.append(ChatMessage(role="user", content=f"<inbox>{json.dumps(inbox, ensure_ascii=False, indent=2)}</inbox>"))
-
     def _inject_runtime_state(self, messages: list[ChatMessage]) -> None:
         messages[:] = [
             message
@@ -1535,10 +1645,54 @@ class AgentRuntime:
     def render_models(self) -> str:
         return format_model_profiles(self.options.cwd)
 
+    def _append_budget_reminders(self, messages: list[ChatMessage], budget: TurnBudgetState) -> None:
+        reminders: list[str] = []
+        if budget.tool_calls >= budget.config.tool_call_soft_limit and not budget.tool_soft_limit_reminded:
+            budget.tool_soft_limit_reminded = True
+            reminders.append(
+                "Tool call soft budget reached. Stop exploring unless absolutely necessary; summarize results or produce the final answer."
+            )
+        output_limit = self._output_token_soft_limit()
+        if output_limit is not None and budget.total_output_tokens >= output_limit and not budget.output_soft_limit_reminded:
+            budget.output_soft_limit_reminded = True
+            reminders.append(
+                "Output token soft budget is nearly used. Keep the next response concise and finish the turn."
+            )
+        if budget.consecutive_tool_failures >= budget.config.consecutive_tool_failures:
+            reminders.append(
+                "Several tools have failed consecutively. Change strategy or stop and explain the blocker instead of repeating the same attempt."
+            )
+            budget.consecutive_tool_failures = 0
+        if budget.permission_denials >= budget.config.permission_denials:
+            reminders.append(
+                "Permission was denied repeatedly. Do not retry the same restricted action; ask for a different approach or provide a final explanation."
+            )
+            budget.permission_denials = 0
+        if budget.no_progress_rounds >= budget.config.no_progress_rounds and not budget.no_progress_reminded:
+            budget.no_progress_reminded = True
+            reminders.append(
+                "No meaningful progress has been observed for several tool rounds. Converge on a final answer or choose a clearly different strategy."
+            )
+        for reminder in reminders:
+            messages.append(ChatMessage(role="system", content=f"<budget-reminder>{reminder}</budget-reminder>"))
+
+    def _output_token_soft_limit(self) -> int | None:
+        profile = self.current_model_profile()
+        max_output = None
+        responses = getattr(profile, "responses", {}) or {}
+        if isinstance(responses, dict):
+            max_output = responses.get("max_output_tokens")
+        if isinstance(max_output, int) and max_output > 0:
+            return max(1, int(max_output * self.budget_config.output_token_soft_ratio))
+        context_window = int(getattr(profile, "context_window", 0) or 0)
+        if context_window <= 0:
+            return None
+        return max(1, int(context_window * 0.1 * self.budget_config.output_token_soft_ratio))
+
     def _context_threshold(self) -> int:
         if self.options.context_threshold is not None:
             return self.options.context_threshold
-        return max(1, int(self.current_model_profile().context_window * 0.9))
+        return max(1, int(self.current_model_profile().context_window * self.budget_config.context_compact_ratio))
 
     def _diff_output_max_chars(self) -> int:
         return load_system_config().diff_output_max_chars
@@ -1719,33 +1873,6 @@ class AgentRuntime:
             "claim_task": lambda data: self.task_manager.claim(int(data.get("task_id", 0)), str(data.get("owner", "lead"))),
             "background_run": background_run_tool,
             "background_check": lambda data: self.background.check(_optional_str(data.get("task_id"))),
-            "spawn_teammate": lambda data: self.team.spawn(
-                str(data.get("name", "")),
-                str(data.get("role", "")),
-                str(data.get("prompt", "")),
-            ),
-            "list_teammates": lambda data: self.team.list_all(),
-            "send_message": lambda data: self.bus.send(
-                "lead",
-                str(data.get("to", "")),
-                str(data.get("content", "")),
-                str(data.get("msg_type", "message")),
-            ),
-            "read_inbox": lambda data: json.dumps(self.bus.read_inbox("lead"), ensure_ascii=False, indent=2),
-            "broadcast": lambda data: self.team.broadcast("lead", str(data.get("content", ""))),
-            "shutdown_request": lambda data: self.team.shutdown_request(str(data.get("teammate", ""))),
-            "shutdown_response": lambda data: self.team.shutdown_response(
-                str(data.get("request_id", "")),
-                bool(data.get("approve", False)),
-                str(data.get("reason", "")),
-            ),
-            "plan_submit": lambda data: self.team.plan_submit(str(data.get("teammate", "lead")), str(data.get("plan", ""))),
-            "plan_review": lambda data: self.team.plan_review(
-                str(data.get("request_id", "")),
-                bool(data.get("approve", False)),
-                str(data.get("feedback", "")),
-            ),
-            "idle": lambda data: self.team.idle(str(data.get("teammate", "lead"))),
             "worktree_create": lambda data: self.worktrees.create(
                 str(data.get("name", "")),
                 _optional_int(data.get("task_id")),
@@ -1888,6 +2015,24 @@ def truncate(value: str, max_length: int = 12000) -> str:
 # 内部函数：计算当前 turn 已耗时毫秒数，负责事件摘要中的耗时字段。
 def _duration_ms(started_at: float) -> int:
     return max(0, int((time.perf_counter() - started_at) * 1000))
+
+
+def _estimate_text_tokens(value: str) -> int:
+    if not value:
+        return 0
+    return max(1, len(value) // 4)
+
+
+def _tool_limit_message(name: str, observed: int, limit: int) -> str:
+    return (
+        f"Tool call limit reached for {name}: attempted call {observed}, "
+        f"limit is {limit} for this turn. Choose another strategy or finalize."
+    )
+
+
+def _is_permission_denial_output(output: str) -> bool:
+    normalized = output.strip().lower()
+    return "the user rejected that action" in normalized or "tool denied by policy" in normalized
 
 
 def defers_tool_confirmation(goal: str, answer: str) -> bool:

@@ -235,6 +235,10 @@ class TuiRenderer:
             if self.verbose or not any(existing.type == "thinking" for existing in turn.events):
                 self._record("thinking", self._thinking_text(event))
                 self._print(Text(self._thinking_text(event), style="dim"))
+        elif event.type == "budget":
+            if self.verbose:
+                self._record("budget", event.message)
+                self._print(Text(event.message, style="dim"))
         elif event.type == "compact":
             self._record("compact", event.message)
             self._print(_block("system", Text(event.message), style="bold blue"))

@@ -99,7 +99,6 @@ def _core_tools_section() -> str:
 - Skills and context: load_skill for on-demand local instructions, compact for conversation compaction.
 - Delegation: subagent for bounded child-agent work. Use agent_type, task, responsibility, paths, and inherit_context. Multiple subagent calls in one response run in parallel while the main agent waits; only use subagents for independent work. Worker subagents require responsibility and paths.
 - Persistent task graph: task_create, task_get, task_update, task_list, claim_task.
-- Team coordination: spawn_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, shutdown_response, plan_submit, plan_review, idle.
 - Worktree isolation: worktree_create, worktree_list, worktree_run, worktree_keep, worktree_remove.
 - Runtime controls: /plan toggles Plan Mode; /permissions shows or changes permission mode.
 - Unreal Engine: ue_doctor, ue_build, ue_run_python, ue_stop_executor. ue_doctor is the default check for UE project presence, EngineAssociation, configured editor paths, and Perforce read-only status. Use ue_build to compile or validate UE C++/UHT changes; do not hand-write Build.bat shell commands. ue_run_python accepts inline script code or script_path for a .py file, then relies on harness permission checks before launching UE.

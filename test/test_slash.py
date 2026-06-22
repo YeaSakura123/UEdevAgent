@@ -30,7 +30,7 @@ except ModuleNotFoundError as error:
 
 from uedev.tools.background import BackgroundManager
 from uedev.state.config import ConfigError, agent_dir, load_project_config, load_system_config, resolve_model_profile
-from uedev.runtime.context import compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.runtime.context import estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.runtime.history import (
@@ -701,7 +701,6 @@ class WorktreeTests(unittest.TestCase):
             (state_dir / "config.json").write_text('{"active_model": "main"}', encoding="utf-8")
             (state_dir / "worktrees").mkdir()
             (state_dir / "tasks").mkdir()
-            (state_dir / "team").mkdir()
             (state_dir / "sessions" / "2000" / "01" / "01" / "session_old").mkdir(parents=True)
             history = HistoryRecorder(
                 state_dir,
@@ -763,7 +762,6 @@ class WorktreeTests(unittest.TestCase):
             self.assertFalse((target_agent / "sessions" / "2000").exists())
             self.assertFalse((target_agent / "worktrees").exists())
             self.assertFalse((target_agent / "tasks").exists())
-            self.assertFalse((target_agent / "team").exists())
             loaded = load_history_file(target_session / "messages.jsonl")
             self.assertIn(str(target.resolve()), loaded[0].content)
             self.assertEqual(loaded[1].content, f"Working directory: {target.resolve()}\nShell: PowerShell")

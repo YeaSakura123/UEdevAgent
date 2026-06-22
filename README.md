@@ -7,8 +7,8 @@ the model until the task is complete.
 
 Tool use goes through native tool/function calling. GPT model profiles can use
 the OpenAI Responses API, while OpenAI-compatible model profiles continue to use
-Chat Completions. Tool schemas live in `uedev.tool_specs`, while implementations
-live in `AgentRuntime._build_tool_handlers`. The loop executes returned tool
+Chat Completions. Tool schemas live in `uedev.tools.specs`, while implementations
+live in `AgentRuntime._build_tool_handlers()`. The loop executes returned tool
 calls, adds tool results, and asks the model to continue until it gives a normal
 final answer.
 
@@ -115,11 +115,11 @@ estimated tokens. Auto compaction defaults to 90% of that window unless
 `requires_reasoning_content` is optional and defaults to `false`. Enable it for
 models such as DeepSeek thinking mode that require assistant
 `reasoning_content` to be replayed with later requests. It only applies when
-`gpt_model` is `false`. Responses profiles currently run in a prompt-only
-compatibility mode: the runtime sends only `model`, `input`, and optional
-`instructions` to `client.responses.create()`. The `responses` config block is
-kept in the template for future rollout, but reasoning options, tools, built-in
-tools, truncation, text formatting, and storage options are not sent yet.
+`gpt_model` is `false`. Responses profiles send the configured Responses API
+options, including reasoning, tool choice, parallel tool calls, max output
+tokens, truncation, include, text formatting, storage, built-in tools, and
+function tool schemas adapted from the same canonical project tool definitions
+used by Chat Completions profiles.
 `display.diff_output_max_chars` controls per-section `/diff` output truncation
 and defaults to 20000 characters.
 `runtime.default_max_steps` controls the default agent work-loop budget when
@@ -158,7 +158,6 @@ Show the persisted agent todo board:
 ```bash
 uedev tasks
 uedev tasks --graph
-uedev team
 uedev worktrees
 ```
 
@@ -255,8 +254,7 @@ omitting it produces a dry-run command preview.
   sessions, and automation.
 - The harness implements the staged mechanisms from `learn-claude-code-main`:
   loop, tool dispatch, TodoWrite, subagent, skill loading, context compact,
-  persistent task graph, background tasks, autonomous task
-  claiming, and task-aware git worktrees.
+  persistent task graph, background tasks, and task-aware git worktrees.
 - Commands run in the selected working directory.
 - Shell commands time out after 120 seconds by default.
 - Internal iteration and tool diagnostics are hidden unless `--verbose` is enabled.
@@ -273,7 +271,7 @@ omitting it produces a dry-run command preview.
 - Todos are stored in `.agent/todos.json`.
 - Persistent tasks are stored in `.agent/tasks/`.
 - Managed worktree indexes and directories are stored in `.agent/worktrees/`.
-- UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; UE build artifacts are stored in `.agent/ue_builds/<run_id>/`. The authoritative executed script snapshot is `user_script.py` in the UE run directory. `.agent/ue_scripts/` is a legacy location and is not the current execution entrypoint.
+- UE run artifacts are stored in `.agent/ue_runs/<run_id>/`; UE build artifacts are stored in `.agent/ue_builds/<run_id>/`. The authoritative executed script snapshot is `user_script.py` in the UE run directory. `.agent/ue_scripts/` is a legacy location kept only for old workspaces and is not read as the current execution entrypoint.
 - Manual validation steps are documented in `docs/VALIDATION.md`.
 
 ## Unreal Engine Direction

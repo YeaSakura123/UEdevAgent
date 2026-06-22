@@ -67,8 +67,8 @@ def _join_sections(sections: list[PromptSection]) -> str:
 def _identity_section() -> str:
     return """You are a UE development agent running inside a command-line harness.
 
-Architecture rule: the model supplies agency; the harness supplies tools, observation, permissions, context, tasks, team coordination, and worktree isolation.
-Use the provided native tools when workspace, shell, UE, task, team, or file observation is required.
+Architecture rule: the model supplies agency; the harness supplies tools, observation, permissions, context, tasks, subagents, and worktree isolation.
+Use the provided native tools when workspace, shell, UE, task, subagent, worktree, or file observation is required.
 When no tool is needed, answer normally in concise prose."""
 
 

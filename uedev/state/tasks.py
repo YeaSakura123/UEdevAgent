@@ -198,7 +198,7 @@ class TaskManager:
     def claim(self, task_id: int, owner: str) -> str:
         return self.update(task_id, status="in_progress", owner=owner)
 
-    # 内部函数：筛选无 owner、无阻塞的待处理任务，供队友自主认领。
+    # 内部函数：筛选无 owner、无阻塞的待处理任务，供自动认领流程使用。
     def ready_tasks(self) -> list[dict[str, object]]:
         tasks = [self._read_file(path) for path in sorted(self.tasks_dir.glob("task_*.json"))]
         return [

@@ -1,8 +1,10 @@
 # 综合课程设计期末报告：面向 UE 游戏开发流程的 AI Agent CLI 设计与实现
 
+> 当前代码状态说明：Markdown 报告保留课程归档叙述，但当前代码已移除旧协作通信机制；现有协作边界以 subagent、task graph 和 worktree 为主。对应 `.docx` 归档文件本轮不重新生成。
+
 ## 一、项目概述
 
-本课程设计项目实现了一个名为 `uedev-cli` 的 AI Agent 命令行工具。项目目标不是构建一个普通聊天机器人，而是将大语言模型接入真实的软件开发环境，使其能够围绕开发任务完成观察、规划、工具调用、结果反馈和过程记录。项目重点面向 Unreal Engine 游戏客户端开发场景，探索 AI Agent 在代码维护、资源检查、编辑器自动化和团队协作流程中的应用方式。
+本课程设计项目实现了一个名为 `uedev-cli` 的 AI Agent 命令行工具。项目目标不是构建一个普通聊天机器人，而是将大语言模型接入真实的软件开发环境，使其能够围绕开发任务完成观察、规划、工具调用、结果反馈和过程记录。项目重点面向 Unreal Engine 游戏客户端开发场景，探索 AI Agent 在代码维护、资源检查、编辑器自动化和多步骤研发流程中的应用方式。
 
 从整体形态看，`uedev-cli` 是一个 Python CLI 工具。用户可以通过 `uedev run` 发起一次性任务，也可以通过 `uedev chat` 进入交互式会话。Agent 在会话中能够读取项目文件、执行受控命令、维护 todo、创建持久任务、调用子 agent、压缩上下文、处理 UE Python 脚本，并通过权限策略限制高风险操作。
 
@@ -42,11 +44,11 @@
 
 项目采用分层结构组织，主要模块包括：
 
-- `uedev.cli`：命令行入口，负责解析 `init`、`doctor`、`run`、`chat`、`tasks`、`team`、`worktrees`、`ue` 等命令。
+- `uedev.cli`：命令行入口，负责解析 `init`、`doctor`、`run`、`chat`、`tasks`、`worktrees`、`ue` 等命令。
 - `uedev.runtime`：负责 agent 运行时，包括主循环、历史记录、上下文压缩、slash command、subagent 和 prompt 构建。
 - `uedev.llm`：封装模型调用，支持 OpenAI Responses API 以及 OpenAI-compatible Chat Completions。
 - `uedev.tools`：提供工具 schema、workspace 文件工具、shell、后台任务、UE 工具和 worktree 工具。
-- `uedev.state`：管理本地配置、todo、持久任务、团队状态和计划记录。
+- `uedev.state`：管理本地配置、todo、持久任务和计划记录。
 - `uedev.policy`：实现权限模式、命令风险分类和沙箱路径约束。
 - `uedev.ui`：实现 Rich + Prompt Toolkit 的终端交互界面和事件渲染。
 - `uedev.ue`：实现 UE 项目发现、引擎路径解析、UE Python 包装执行、构建结果渲染和 Perforce 状态检查。
@@ -85,7 +87,7 @@ Agent 主循环主要位于 `uedev.runtime.agent.AgentRuntime`。`run_turn_event
 - 基础开发工具：`read_file`、`write_file`、`edit_file`、`list_files`、`grep`、`shell`。
 - 任务规划工具：`todo_update`、`todo_list`、`task_create`、`task_update`、`task_list`、`claim_task`。
 - 上下文与技能工具：`compact`、`load_skill`。
-- 协作工具：`subagent`、`spawn_teammate`、`send_message`、`broadcast`、`read_inbox`。
+- 协作工具：`subagent`、task graph、worktree 隔离执行。
 - 后台与隔离执行：`background_run`、`background_check`、`worktree_create`、`worktree_run`、`worktree_remove`。
 - UE 相关工具：`ue_doctor`、`ue_run_python`、`ue_build`、`ue_stop_executor`。
 - Perforce 辅助工具：`p4_status`、`p4_file_state`、`p4_checkout`、`p4_add`、`p4_delete`、`p4_diff` 等。
@@ -105,11 +107,11 @@ Agent 主循环主要位于 `uedev.runtime.agent.AgentRuntime`。`run_turn_event
 
 此外，工作区文件工具受到 sandbox 路径约束，避免 Agent 越界访问或修改不属于当前项目的文件。UE 操作默认 dry-run，只有在用户明确传入 `--execute` 或通过权限流程确认后才会真正启动编辑器。
 
-### 4. 任务系统与团队协作
+### 4. 任务系统与协作边界
 
 项目同时实现了轻量 todo 和持久 task graph。Todo 更适合当前会话内的多步骤任务，保存在 `.agent/todos.json`；持久任务系统保存在 `.agent/tasks/`，支持任务创建、状态更新、依赖关系、负责人、worktree 绑定和 ready task 认领。
 
-团队协作方面，系统通过 `.agent/team/` 保存队友配置、inbox 消息和协议请求，支持创建 teammate、发送消息、广播、提交计划、审核计划、请求关闭等功能。当前版本实现了数据结构和工具入口，但没有让后台 LLM 队友自动持续轮询，以避免未经授权产生额外模型调用。
+协作边界方面，当前版本保留 subagent、持久 task graph 和 worktree 隔离执行。subagent 用于拆分一次会话内的子任务；task graph 用于保存长期任务状态；worktree 用于隔离复杂代码修改。
 
 ### 5. 上下文压缩与历史记录
 
@@ -138,7 +140,7 @@ UE 适配是本项目的重要应用方向。系统提供 `uedev ue doctor`、`u
 
 项目提供 plain 和 full-screen TUI 两种交互方式。plain 模式适合脚本和管道场景；full-screen TUI 使用 Rich 与 Prompt Toolkit，实现持续 transcript、底部固定输入、状态栏、进度提示、slash command 补全和权限确认弹窗。
 
-常用 slash command 包括 `/help`、`/context`、`/diff`、`/todos`、`/tasks`、`/team`、`/history`、`/subagents`、`/worktree`、`/model`、`/mcp`、`/plan`、`/permissions`、`/compact`、`/clear`、`/ue doctor` 等。它们使用户能够在会话中快速切换模型、查看上下文、调整权限和管理任务。
+常用 slash command 包括 `/help`、`/context`、`/diff`、`/todos`、`/tasks`、`/history`、`/subagents`、`/worktree`、`/model`、`/mcp`、`/plan`、`/permissions`、`/compact`、`/clear`、`/exit`、`/ue doctor` 等。它们使用户能够在会话中快速切换模型、查看上下文、调整权限和管理任务。
 
 ## 六、实验过程说明
 
@@ -148,7 +150,7 @@ UE 适配是本项目的重要应用方向。系统提供 `uedev ue doctor`、`u
 
 第二阶段是搭建最小 Agent CLI。该阶段实现了 `run` 和 `chat` 基础命令，完成用户输入、模型调用、工具调用、observation 回填和最终回答输出。此时系统已经能围绕简单开发任务形成闭环。
 
-第三阶段是扩展工具系统和任务机制。项目逐步加入文件工具、shell、grep、todo、持久任务、subagent、skill loading、background task、team inbox、worktree 隔离等能力。这一阶段的重点是让 Agent 能够处理多步骤任务，并在任务变复杂时保持状态。
+第三阶段是扩展工具系统和任务机制。项目逐步加入文件工具、shell、grep、todo、持久任务、subagent、skill loading、background task、worktree 隔离等能力。这一阶段的重点是让 Agent 能够处理多步骤任务，并在任务变复杂时保持状态。
 
 第四阶段是增强安全和可回溯能力。项目加入权限模式、命令风险分类、sandbox 路径限制、历史记录、上下文压缩和 transcript 保存。该阶段解决的问题是：Agent 不仅要“能做事”，还要“可控地做事”。
 
@@ -193,7 +195,7 @@ python -m unittest discover -s test
 1. 从问答式 AI 转向流程式 AI。Agent 能够读取文件、执行工具、观察结果并继续推理，更接近真实开发流程。
 2. 使用结构化 tool calling。工具调用不依赖正文解析，降低了歧义，也便于权限审查和错误处理。
 3. 安全机制较完整。系统提供多种权限模式、命令风险分类、sandbox 路径限制和 UE dry-run 机制。
-4. 支持长任务协作。Todo、持久 task graph、team inbox、subagent 和 worktree 机制为复杂任务提供了状态基础。
+4. 支持长任务协作。Todo、持久 task graph、subagent 和 worktree 机制为复杂任务提供了状态基础。
 5. 面向 UE 场景有明确适配。项目不是泛化聊天助手，而是针对 UE 资源检查、脚本执行、构建和 Perforce 状态等实际需求设计。
 6. 可验证性较好。项目拥有较多自动化测试，并提供手工验证文档，便于后续维护和扩展。
 
@@ -205,7 +207,7 @@ python -m unittest discover -s test
 
 第三个问题是 UE 操作风险较高。解决方法是默认 dry-run，先输出生成脚本和命令，不直接启动编辑器；真正执行前需要用户明确授权。
 
-第四个问题是复杂任务状态容易丢失。解决方法是同时实现 lightweight todo 和 persistent task graph，并将任务、队友、worktree 等状态保存在 `.agent/` 目录。
+第四个问题是复杂任务状态容易丢失。解决方法是同时实现 lightweight todo 和 persistent task graph，并将任务、worktree 等状态保存在 `.agent/` 目录。
 
 第五个问题是命令行交互信息密度较高。解决方法是提供 full-screen TUI，将 transcript、输入框、状态栏、进度和审批弹窗整合到统一界面，同时保留 plain 模式满足自动化需求。
 
@@ -217,7 +219,7 @@ python -m unittest discover -s test
 
 其次，当前 UE 自动化主要通过命令行启动编辑器或 commandlet。对于大型项目，反复启动编辑器成本较高，后续应考虑通过 UE 插件、TCP 或 HTTP 与已打开编辑器通信。
 
-再次，团队协作机制目前更多是状态和协议层实现，尚未形成真正持续运行的多 Agent 协作系统。后续如果要启用后台 LLM 队友，需要进一步设计调用预算、权限边界和任务调度策略。
+再次，多 Agent 协作目前以 session 内 subagent 为主，尚未扩展为持续运行的后台协作者。后续如果要增强协作能力，需要进一步设计调用预算、权限边界和任务调度策略。
 
 此外，项目规范知识主要依赖用户提供。若要更好支持团队项目，应接入项目文档检索、命名规则、资源规范和代码风格检查，使 Agent 的判断更贴合具体团队流程。
 
@@ -233,7 +235,7 @@ python -m unittest discover -s test
 4. 完善 Perforce 工作流，例如 changelist 管理、锁冲突提示和二进制资源差异说明。
 5. 强化测试体系，增加端到端 CLI 测试和更多真实 UE dry-run 样例。
 6. 扩展 TUI 或编辑器内 UI，使任务状态、审批、日志和结果展示更加直观。
-7. 对后台 team agent 增加预算限制和显式授权机制，在可控前提下实现真正的多 Agent 协作。
+7. 在预算限制和显式授权机制完善后，扩展更可控的多 Agent 协作能力。
 
 ## 十二、课程设计总结
 
@@ -241,4 +243,4 @@ python -m unittest discover -s test
 
 通过实验可以看出，AI 工具真正进入工程实践时，关键不只是模型是否能生成正确文本，更在于它能否安全地连接真实环境、能否根据执行结果持续调整、能否在风险操作前让用户确认、能否留下可追溯记录。本项目在这些方面进行了较系统的探索。
 
-总体而言，`uedev-cli` 已经具备一个 AI 开发助手的基本形态：它能够理解自然语言任务，观察项目状态，调用受控工具，维护任务进度，并面向 UE 开发提供初步自动化能力。后续若继续完善 UE 插件通信、项目规范检索、团队协作和图形化界面，它可以进一步发展为更实用的智能研发工具。
+总体而言，`uedev-cli` 已经具备一个 AI 开发助手的基本形态：它能够理解自然语言任务，观察项目状态，调用受控工具，维护任务进度，并面向 UE 开发提供初步自动化能力。后续若继续完善 UE 插件通信、项目规范检索、多 Agent 协作和图形化界面，它可以进一步发展为更实用的智能研发工具。

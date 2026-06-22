@@ -5,11 +5,11 @@
 ## 阶段 1：基线与参考理解
 
 - [x] 阅读当前项目结构与 README
-- [x] 阅读 `learn-claude-code-main` README 与 s01-s12 分节文档
+- [x] 阅读 `learn-claude-code-main` README 中 s01-s12 分节文档
 - [x] 初始化本地 Git 仓库并提交基线
 - [x] 明确本项目优先落地 harness，而不是训练模型本身
 
-## 阶段 2：CLI Agent Harness（按 s01-s12）
+## 阶段 2：CLI Agent Harness
 
 - [x] 保留最小 agent loop：模型输出动作，CLI 执行动作并回填观察结果
 - [x] 将旧 shell/final 协议扩展为可注册工具协议
@@ -23,11 +23,8 @@
 - [x] s06 Context Compact
 - [x] s07 Task System
 - [x] s08 Background Tasks
-- [x] s09 Agent Teams
-- [x] s10 Team Protocols
-- [x] s11 Autonomous Task Claiming
-- [x] s12 Worktree Task Isolation
-- [ ] 后续可扩展：真正后台 LLM 队友轮询、会话 resume、MCP transport
+- [x] Worktree Task Isolation
+- [ ] 后续可扩展：会话 resume、MCP transport、Responses API provider compatibility hardening
 
 ## 阶段 3：UE Python 能力
 

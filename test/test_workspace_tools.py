@@ -27,7 +27,6 @@ from uedev.runtime.context import (
     SUMMARY_PREFIX,
     build_compacted_history,
     build_compaction_request,
-    compact_locally,
     estimate_tokens,
     micro_compact,
     repair_tool_call_messages,
@@ -406,29 +405,6 @@ class ContextTests(unittest.TestCase):
         self.assertFalse(messages[0].tool_calls)
         self.assertIn("tool calls omitted", messages[0].content)
         self.assertEqual(messages[1].content, "next")
-
-    def test_compact_locally_saves_transcript(self) -> None:
-        with workspace_temp_dir() as temp:
-            messages = [ChatMessage(role="user", content="hello")]
-            compacted = compact_locally(messages, Path(temp), "test")
-
-            self.assertEqual(len(compacted), 1)
-            self.assertTrue(list(Path(temp).glob("transcript_*.jsonl")))
-
-    def test_compact_locally_preserves_system_prompt(self) -> None:
-        with workspace_temp_dir() as temp:
-            messages = [
-                ChatMessage(role="system", content="system rules"),
-                ChatMessage(role="user", content="hello"),
-                ChatMessage(role="assistant", content="hi"),
-            ]
-
-            compacted = compact_locally(messages, Path(temp), "test")
-
-            self.assertEqual(compacted[0].role, "system")
-            self.assertEqual(compacted[0].content, "system rules")
-            self.assertEqual(compacted[1].role, "user")
-            self.assertIn("[Compressed locally: test]", compacted[1].content)
 
     def test_build_compaction_request_omits_runtime_state(self) -> None:
         messages = [

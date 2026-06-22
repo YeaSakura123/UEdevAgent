@@ -24,7 +24,6 @@ from .core import (
     run_ue_build,
     run_ue_python,
     _discover_perforce,
-    _discover_preforce,
 )
 from .perforce import (
     P4CommandResult,
@@ -74,5 +73,4 @@ __all__ = [
     "p4_status",
     "run_p4",
     "_discover_perforce",
-    "_discover_preforce",
 ]

@@ -26,7 +26,7 @@ def workspace_temp_dir():
 
 from uedev.tools.background import BackgroundManager
 from uedev.state.config import ConfigError, ModelProfile, RuntimeBudgetConfig, agent_dir, default_responses_options, load_project_config, load_system_config, resolve_model_profile
-from uedev.runtime.context import SUMMARY_PREFIX, compact_locally, estimate_tokens, micro_compact, repair_tool_call_messages
+from uedev.runtime.context import SUMMARY_PREFIX, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
 from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file, load_session_metadata
 from uedev.runtime.subagents import SubagentSpec

@@ -116,7 +116,7 @@ def is_real_user_message(message: ChatMessage) -> bool:
         return False
     if content.startswith("Working directory:"):
         return False
-    if content.startswith("<background-results>") or content.startswith("<inbox>"):
+    if content.startswith("<background-results>"):
         return False
     return True
 
@@ -169,25 +169,6 @@ def build_compacted_history(
         summary_content = f"{SUMMARY_PREFIX}\n{summary_content}".strip()
 
     compacted = [*selected_users, ChatMessage(role="user", content=summary_content)]
-    if system_message is not None:
-        return [system_message, *compacted]
-    return compacted
-
-
-def compact_locally(messages: list[ChatMessage], transcript_dir: Path, reason: str) -> list[ChatMessage]:
-    """Legacy local compaction used by older tests and callers."""
-
-    transcript = save_transcript(messages, transcript_dir)
-    system_message = messages[0] if messages and messages[0].role == "system" else None
-    recent = [message for message in messages if message.role != "system"][-6:]
-    summary_lines = [
-        f"[Compressed locally: {reason}]",
-        f"Full transcript saved at: {transcript}",
-        "Recent context:",
-    ]
-    for message in recent:
-        summary_lines.append(f"{message.role}: {message.content[:1000]}")
-    compacted = [ChatMessage(role="user", content="\n".join(summary_lines))]
     if system_message is not None:
         return [system_message, *compacted]
     return compacted

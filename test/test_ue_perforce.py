@@ -13,7 +13,6 @@ from uedev.state.tasks import TodoManager
 from uedev.ue import (
     UeRunResult,
     _discover_perforce,
-    _discover_preforce,
     build_editor_executor_script,
     build_python_script,
     build_wrapper_script,
@@ -150,14 +149,6 @@ class UePerforceTests(unittest.TestCase):
         self.assertEqual(result.project_depot_path, "//depot/Demo/Demo.uproject")
         self.assertEqual(result.opened_count, 2)
         self.assertEqual(len(result.opened_preview), 2)
-
-    def test_discover_preforce_keeps_legacy_typo_alias(self) -> None:
-        root = workspace_temp_path()
-
-        with patch("uedev.ue.subprocess.run", side_effect=FileNotFoundError):
-            result = _discover_preforce(root)
-
-        self.assertFalse(result.available)
 
     def test_p4_status_renders_workspace_summary(self) -> None:
         root = workspace_temp_path()

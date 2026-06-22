@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .core import PerforceDiscovery, _discover_perforce, _discover_preforce
+from .core import PerforceDiscovery, _discover_perforce
 
 UE_BINARY_ASSET_SUFFIXES = {".uasset", ".umap", ".ubulk", ".uexp", ".uptnl", ".ushaderbytecode"}
 MAX_RENDERED_OUTPUT = 20000
@@ -362,5 +362,4 @@ __all__ = [
     "p4_status",
     "run_p4",
     "_discover_perforce",
-    "_discover_preforce",
 ]

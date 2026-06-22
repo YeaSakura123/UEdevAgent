@@ -10,43 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-try:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.completion import Completer, Completion
-    from prompt_toolkit.cursor_shapes import CursorShape, SimpleCursorShapeConfig
-    from prompt_toolkit.history import InMemoryHistory
-    from prompt_toolkit.shortcuts.prompt import CompleteStyle
-    from prompt_toolkit.styles import Style
-except ImportError:  # pragma: no cover - exercised only in minimal test environments.
-    PromptSession = None  # type: ignore[assignment]
-
-    class Completer:  # type: ignore[no-redef]
-        pass
-
-    class Completion:  # type: ignore[no-redef]
-        def __init__(self, text: str, **kwargs: object) -> None:
-            self.text = text
-            self.display = kwargs.get("display", text)
-            self.display_meta = kwargs.get("display_meta", "")
-
-    class CompleteStyle:  # type: ignore[no-redef]
-        COLUMN = "COLUMN"
-
-    class CursorShape:  # type: ignore[no-redef]
-        BLINKING_BLOCK = "BLINKING_BLOCK"
-
-    class SimpleCursorShapeConfig:  # type: ignore[no-redef]
-        def __init__(self, cursor_shape: object) -> None:
-            self.cursor_shape = cursor_shape
-
-    class InMemoryHistory:  # type: ignore[no-redef]
-        pass
-
-    class Style:  # type: ignore[no-redef]
-        @staticmethod
-        def from_dict(style: dict[str, str]) -> dict[str, str]:
-            return style
-
 from .. import __version__
 from ..tools.background import BackgroundManager
 from ..state.config import (
@@ -62,6 +25,14 @@ from ..state.config import (
     resolve_model_profile,
     resolve_subagent_model_profile,
     save_project_active_model,
+)
+from .completion import (
+    SLASH_COMMANDS,
+    SlashCommandCompleter,
+    create_chat_prompt_options,
+    create_chat_session,
+    create_chat_style,
+    render_slash_help,
 )
 from .context import (
     build_compacted_history,
@@ -96,6 +67,7 @@ from .history import (
     load_history_file,
     update_session_active_plan,
 )
+from .options import AgentOptions
 from ..llm.client import (
     ChatMessage,
     ModelResponse,
@@ -103,7 +75,16 @@ from ..llm.client import (
     call_model as _client_call_model,
     call_model_stream as _client_call_model_stream,
 )
-from ..mcp.registry import McpToolRegistry, is_mcp_tool_name
+from .tool_guard import ToolHandler, _permission_prompt_label
+from .turn_loop import (
+    ToolAction,
+    TurnBudgetState,
+    _duration_ms,
+    defers_tool_confirmation,
+    is_acknowledgement_answer,
+    truncate,
+)
+from ..mcp.registry import McpToolRegistry
 from ..policy.permissions import (
     CollaborationMode,
     PermissionMode,
@@ -112,7 +93,6 @@ from ..policy.permissions import (
     format_permission_modes,
     is_proposed_plan,
     normalize_permission_mode,
-    permission_mode_description,
     permission_mode_label,
 )
 from .prompts import PromptBundle, build_prompt_bundle, build_system_prompt as render_system_prompt
@@ -150,20 +130,6 @@ from ..tools.workspace import edit_file, grep, list_files, read_file, write_file
 from ..tools.worktrees import WorktreeManager
 
 
-@dataclass(frozen=True)
-class AgentOptions:
-    task: str
-    max_steps: int
-    auto_approve: bool
-    cwd: Path
-    timeout_seconds: int
-    verbose: bool
-    context_threshold: int | None = None
-    plain: bool = False
-    runtime_budget: RuntimeBudgetConfig | None = None
-
-
-ToolHandler = Callable[[dict[str, object]], str]
 RUNTIME_STATE_MARKER = "<runtime-state>"
 call_model = _client_call_model
 
@@ -182,108 +148,11 @@ def call_model_stream(
         yield ModelStreamEvent(type="final", response=call_model(messages, profile, tools=tools))
 
 
-@dataclass(frozen=True)
-class ToolAction:
-    name: str
-    input: dict[str, Any]
-
-
-@dataclass
-class TurnBudgetState:
-    config: RuntimeBudgetConfig
-    started_at: float
-    model_requests: int = 0
-    tool_calls: int = 0
-    total_output_tokens: int = 0
-    consecutive_tool_failures: int = 0
-    permission_denials: int = 0
-    no_progress_rounds: int = 0
-    tool_soft_limit_reminded: bool = False
-    output_soft_limit_reminded: bool = False
-    no_progress_reminded: bool = False
-
-    def __post_init__(self) -> None:
-        self.per_tool_calls: dict[str, int] = {}
-
-    def elapsed_ms(self) -> int:
-        return _duration_ms(self.started_at)
-
-    def elapsed_seconds(self) -> int:
-        return max(0, int(time.perf_counter() - self.started_at))
-
-    def can_request_model(self) -> bool:
-        return self.model_requests < self.config.model_request_hard_limit
-
-    def next_model_request(self) -> int:
-        self.model_requests += 1
-        return self.model_requests
-
-    def record_tool_call(self, name: str) -> int:
-        self.tool_calls += 1
-        self.per_tool_calls[name] = self.per_tool_calls.get(name, 0) + 1
-        return self.per_tool_calls[name]
-
-    def tool_limit_for(self, name: str) -> int | None:
-        return self.config.tool_call_limits.get(name)
-
-    def wall_clock_exceeded(self) -> bool:
-        return self.elapsed_seconds() >= self.config.wall_clock_seconds
-
-    def record_tool_result(self, *, is_error: bool, permission_denied: bool, progress: bool) -> None:
-        if permission_denied:
-            self.permission_denials += 1
-        if is_error:
-            self.consecutive_tool_failures += 1
-        else:
-            self.consecutive_tool_failures = 0
-        if progress:
-            self.no_progress_rounds = 0
-        else:
-            self.no_progress_rounds += 1
-
-    def status(self, phase: str = "") -> str:
-        parts = [
-            f"model {self.model_requests}/{self.config.model_request_hard_limit}",
-            f"tools {self.tool_calls}/{self.config.tool_call_soft_limit}",
-        ]
-        if phase:
-            parts.append(phase)
-        return " · ".join(parts)
-
-
-SLASH_COMMANDS = [
-    ("/help", "Show available chat slash commands."),
-    ("/context", "Show current conversation context usage."),
-    ("/diff", "Show Git and Perforce workspace changes."),
-    ("/todos", "Show the current lightweight todo list."),
-    ("/tasks", "Show the persistent task graph."),
-    ("/history", "Load a previous conversation from this project."),
-    ("/subagents", "Choose a subagent conversation to view."),
-    ("/worktree", "Create a UE Git linked worktree from the current project."),
-    ("/model", "Choose or list model profiles for this project."),
-    ("/mcp", "Show configured MCP server status and tools."),
-    ("/plan", "Enter, leave, or inspect Plan Mode."),
-    ("/permissions", "Show or switch the current permission mode."),
-    ("/doctor", "Inspect Unreal Engine project and editor configuration."),
-    ("/ue doctor", "Inspect Unreal Engine project and editor configuration."),
-    ("/compact", "Compact the current conversation context."),
-    ("/clear", "Reset the current chat conversation context."),
-    ("/exit", "Exit interactive chat."),
-]
-
 FORCED_FINALIZATION_PROMPT = """You have reached the tool and step budget for this turn.
 
 Do not call tools. Provide the final answer now. Summarize what changed, what failed, and what remains. If work is incomplete, say so clearly and mention the next concrete step.
 
 If Plan Mode is active, the final answer must be wrapped exactly in <proposed_plan> and </proposed_plan>."""
-
-
-# 外部函数：生成 /help 命令展示的帮助文本，负责 agent 主循环、chat 界面、工具分发和运行时观察。
-def render_slash_help() -> str:
-    width = max(len(command) for command, _ in SLASH_COMMANDS)
-    lines = ["Chat commands:"]
-    lines.extend(f"  {command.ljust(width)}  {description}" for command, description in SLASH_COMMANDS)
-    return "\n".join(lines)
 
 
 def render_context_usage(
@@ -612,95 +481,6 @@ def _truncate_diff_output(value: str, max_output_chars: int) -> str:
     )
 
 
-class SlashCommandCompleter(Completer):
-    # 外部函数：为 Prompt Toolkit 输入框提供 slash command 补全，负责 agent 主循环、chat 界面、工具分发和运行时观察。
-    def get_completions(self, document, complete_event) -> Iterator[Completion]:
-        text = document.text_before_cursor
-        if not text.startswith("/"):
-            return
-
-        permission_matches = _match_permission_mode_commands(text)
-        if permission_matches:
-            for command, description in permission_matches:
-                yield Completion(
-                    command,
-                    start_position=-len(text),
-                    display=command,
-                    display_meta=description,
-                )
-            return
-
-        for command, description in _match_slash_commands(text):
-            yield Completion(
-                command,
-                start_position=-len(text),
-                display=command,
-                display_meta=description,
-            )
-
-
-def _match_slash_commands(text: str) -> list[tuple[str, str]]:
-    query = _normalize_slash_query(text)
-    if not query:
-        return SLASH_COMMANDS.copy()
-
-    prefix_matches: list[tuple[str, str]] = []
-    word_matches: list[tuple[str, str]] = []
-    fuzzy_matches: list[tuple[str, str]] = []
-
-    for command, description in SLASH_COMMANDS:
-        command_key = command.lower()
-        command_compact = _normalize_slash_query(command)
-        words = [part for part in command_key.replace("/", " ").split() if part]
-
-        if command_key.startswith(text.lower()):
-            prefix_matches.append((command, description))
-        elif any(word.startswith(query) for word in words):
-            word_matches.append((command, description))
-        elif query in command_compact or _is_subsequence(query, command_compact):
-            fuzzy_matches.append((command, description))
-
-    if prefix_matches:
-        return prefix_matches
-    if word_matches:
-        return word_matches
-    return fuzzy_matches
-
-
-def _match_permission_mode_commands(text: str) -> list[tuple[str, str]]:
-    lower = text.lower()
-    if not (lower == "/permissions" or lower.startswith("/permissions ")):
-        return []
-
-    query = ""
-    if lower.startswith("/permissions "):
-        query = lower.split(" ", 1)[1].strip()
-
-    matches: list[tuple[str, str]] = []
-    for mode in VALID_PERMISSION_MODES:
-        label = permission_mode_label(mode)
-        command = f"/permissions {label}"
-        if not query or label.startswith(query):
-            matches.append((command, permission_mode_description(mode)))
-    return matches
-
-
-def _normalize_slash_query(text: str) -> str:
-    return text.lower().lstrip("/").replace(" ", "")
-
-
-def _is_subsequence(needle: str, haystack: str) -> bool:
-    if not needle:
-        return True
-    position = 0
-    for char in haystack:
-        if char == needle[position]:
-            position += 1
-            if position == len(needle):
-                return True
-    return False
-
-
 # 外部函数：生成 chat 启动界面的版本、模型和目录信息，负责 agent 主循环、chat 界面、工具分发和运行时观察。
 def render_chat_banner(options: AgentOptions) -> str:
     try:
@@ -714,55 +494,6 @@ def render_chat_banner(options: AgentOptions) -> str:
             f"directory: {options.cwd}",
         ]
     )
-
-
-# 内部函数：创建 Prompt Toolkit 会话，配置 slash 补全、输入历史和提示样式。
-def create_chat_style() -> Style:
-    return Style.from_dict(
-        {
-            "completion-menu.completion": "fg:#c0c0c0 bg:#202020",
-            "completion-menu.completion.current": "fg:#ffffff bg:#005f87",
-            "completion-menu.meta.completion": "fg:#808080 bg:#202020",
-            "completion-menu.meta.completion.current": "fg:#ffffff bg:#005f87",
-            "prompt": "fg:#5fafff bold",
-        }
-    )
-
-
-def create_chat_prompt_options() -> dict[str, object]:
-    return {
-        "complete_while_typing": True,
-        "complete_style": CompleteStyle.COLUMN,
-        "reserve_space_for_menu": 8,
-        "cursor": SimpleCursorShapeConfig(CursorShape.BLINKING_BLOCK),
-        "refresh_interval": 0.5,
-    }
-
-
-def create_chat_session(
-    completer: Completer | None = None,
-    input=None,
-    output=None,
-    key_bindings=None,
-    input_processors=None,
-) -> PromptSession:
-    if PromptSession is None:
-        raise RuntimeError("prompt_toolkit is required for interactive chat sessions")
-    kwargs = {
-        "completer": completer or SlashCommandCompleter(),
-        "complete_while_typing": True,
-        "history": InMemoryHistory(),
-        "style": create_chat_style(),
-    }
-    if input is not None:
-        kwargs["input"] = input
-    if output is not None:
-        kwargs["output"] = output
-    if key_bindings is not None:
-        kwargs["key_bindings"] = key_bindings
-    if input_processors is not None:
-        kwargs["input_processors"] = input_processors
-    return PromptSession(**kwargs)
 
 
 # 内部函数：构建系统提示词，描述工具协议、安全规则和当前工作目录。
@@ -1979,44 +1710,6 @@ class AgentRuntime:
             raise ValueError(f"UE Python script_path must point to a .py file: {path}")
         return path.read_text(encoding="utf-8"), path
 
-# 内部函数：截断过长工具输出，避免 observation 撑爆上下文。
-def _permission_prompt_label(name: str, tool_input: dict[str, object]) -> str:
-    if name in {"shell", "background_run", "worktree_run"}:
-        return str(tool_input.get("command") or name)
-    if name in {"write_file", "edit_file", "read_file", "list_files", "grep"}:
-        path = str(tool_input.get("path") or "").strip()
-        return f"{name} {path}".strip()
-    if name == "ue_build":
-        cwd = str(tool_input.get("cwd") or "").strip()
-        return f"ue_build {cwd}".strip()
-    if name == "worktree_remove":
-        worktree = str(tool_input.get("name") or "").strip()
-        return f"worktree_remove {worktree}".strip()
-    if name.startswith("p4_"):
-        paths = tool_input.get("paths")
-        if isinstance(paths, list):
-            rendered = " ".join(str(path) for path in paths[:3])
-            if len(paths) > 3:
-                rendered += f" ... ({len(paths)} paths)"
-            return f"{name} {rendered}".strip()
-        path = str(paths or tool_input.get("cwd") or "").strip()
-        return f"{name} {path}".strip()
-    if is_mcp_tool_name(name):
-        return name
-    return name
-
-
-def truncate(value: str, max_length: int = 12000) -> str:
-    if len(value) <= max_length:
-        return value
-    return f"{value[:max_length]}\n...[truncated {len(value) - max_length} chars]"
-
-
-# 内部函数：计算当前 turn 已耗时毫秒数，负责事件摘要中的耗时字段。
-def _duration_ms(started_at: float) -> int:
-    return max(0, int((time.perf_counter() - started_at) * 1000))
-
-
 def _estimate_text_tokens(value: str) -> int:
     if not value:
         return 0
@@ -2033,80 +1726,6 @@ def _tool_limit_message(name: str, observed: int, limit: int) -> str:
 def _is_permission_denial_output(output: str) -> bool:
     normalized = output.strip().lower()
     return "the user rejected that action" in normalized or "tool denied by policy" in normalized
-
-
-def defers_tool_confirmation(goal: str, answer: str) -> bool:
-    goal_text = goal.lower()
-    answer_text = answer.lower()
-    if not any(
-        token in goal_text
-        for token in [
-            "ue",
-            "unreal",
-            "editor",
-            "script",
-            "execute",
-            "launch",
-            "run",
-            "build",
-            "compile",
-            "uht",
-            "脚本",
-            "执行",
-            "启动",
-            "运行",
-            "编译",
-            ".py",
-        ]
-    ):
-        return False
-    confirmation_tokens = ["confirm", "confirmation", "确认", "是否", "y/n", "[y/n]"]
-    action_tokens = ["run", "execute", "launch", "start", "continue", "build", "compile", "执行", "启动", "运行", "继续", "编译"]
-    return any(token in answer_text for token in confirmation_tokens) and any(
-        token in answer_text for token in action_tokens
-    )
-
-
-def is_acknowledgement_answer(answer: str) -> bool:
-    normalized = " ".join(answer.strip().lower().split())
-    if not normalized:
-        return False
-    result_tokens = [
-        "project=",
-        "ue doctor",
-        "engine",
-        "perforce",
-        "项目",
-        "引擎",
-        "版本",
-        "存在",
-        "不存在",
-        "结果",
-        "error",
-        "failed",
-    ]
-    if any(token in normalized for token in result_tokens):
-        return False
-    acknowledgement_tokens = [
-        "understood",
-        "got it",
-        "i'll",
-        "i will",
-        "i’ll",
-        "will follow",
-        "will directly invoke",
-        "future",
-        "harness",
-        "收到",
-        "明白",
-        "了解",
-        "已按你的要求",
-        "会遵循",
-        "遵循该行为",
-        "以后会",
-        "下次会",
-    ]
-    return any(token in normalized for token in acknowledgement_tokens)
 
 
 def _looks_like_inline_runpy_loader(script: str) -> bool:

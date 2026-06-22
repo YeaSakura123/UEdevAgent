@@ -1524,10 +1524,6 @@ def _discover_perforce(cwd: Path, project_path: Path | None = None) -> PerforceD
     )
 
 
-def _discover_preforce(cwd: Path, project_path: Path | None = None) -> PerforceDiscovery:
-    return _discover_perforce(cwd, project_path)
-
-
 def _run_p4(args: list[str], cwd: Path, notes: list[str], timeout_seconds: int = 10) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(

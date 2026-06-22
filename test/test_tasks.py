@@ -13,7 +13,6 @@ from uedev.state.tasks import TodoManager
 from uedev.ue import (
     UeRunResult,
     _discover_perforce,
-    _discover_preforce,
     build_editor_executor_script,
     build_python_script,
     build_wrapper_script,

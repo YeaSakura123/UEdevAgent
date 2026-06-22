@@ -18,7 +18,6 @@ from .shell import shell_name
 
 UE_LINKED_WORKTREE_KIND = "ue-linked-worktree"
 UE_GIT_WORKTREE_MODE = "git-worktree-p4-content"
-UE_LEGACY_TEXT_MODE = "git-text-p4-content"
 SHARED_CONTENT_WARNING = "Content is shared; editing assets in this worktree edits the original project assets."
 
 BRANCH_SAFE_RE = re.compile(r"^[A-Za-z0-9._-]+$")

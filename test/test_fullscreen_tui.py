@@ -71,6 +71,19 @@ class FullscreenStateTests(unittest.TestCase):
         self.assertIn("summary", transcript)
         self.assertIn("assistant", transcript)
 
+    def test_thinking_block_is_removed_after_final(self) -> None:
+        state = ChatScreenState("banner")
+        state.start_turn("turn-1", "hello")
+
+        state.render(thinking_event(1, 3, "turn-1"))
+        self.assertIn("thinking\nThinking...", state.render_text())
+
+        state.render(final_event("done", "turn-1"))
+        transcript = state.render_text()
+
+        self.assertNotIn("thinking\nThinking...", transcript)
+        self.assertIn("assistant\ndone", transcript)
+
     def test_turn_status_appears_under_user_until_assistant_streams(self) -> None:
         state = ChatScreenState("banner")
         state.start_turn("turn-1", "hello")

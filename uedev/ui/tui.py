@@ -244,6 +244,7 @@ class ChatScreenState:
                     pass
                 self._stream_block = None
             self._remove_turn_status(event.turn_id)
+            self._remove_turn_blocks(event.turn_id, "thinking")
             turn.add_event(event)
             self.running = False
             self._active_turn_id = ""
@@ -283,6 +284,13 @@ class ChatScreenState:
             self.blocks.remove(block)
         except ValueError:
             pass
+
+    def _remove_turn_blocks(self, turn_id: str, role: str) -> None:
+        self.blocks = [
+            block
+            for block in self.blocks
+            if not (block.role == role and (not turn_id or block.turn_id == turn_id))
+        ]
 
     def _find_status_block(self, turn_id: str) -> TranscriptBlock | None:
         for block in reversed(self.blocks):

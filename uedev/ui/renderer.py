@@ -102,6 +102,16 @@ class TurnViewState:
             parts.append(f"{errors} error{'s' if errors != 1 else ''}")
         if incomplete:
             parts.append("incomplete")
+        usage = _summarize_usage_events(self.events)
+        if usage["requests"]:
+            token_text = (
+                f"{_format_token_count(usage['total_tokens'])} tokens "
+                f"({_format_token_count(usage['input_tokens'])} in / "
+                f"{_format_token_count(usage['output_tokens'])} out)"
+            )
+            if usage["estimated_requests"]:
+                token_text += " estimated"
+            parts.append(token_text)
         return " | ".join(parts)
 
 
@@ -125,6 +135,9 @@ class ConsoleRenderer:
 
         if event.type == "compact":
             return event.message
+
+        if event.type == "usage":
+            return _format_usage_event(event.usage)
 
         if event.type == "plan":
             path = f"\nPath: {event.output}" if event.output else ""
@@ -239,6 +252,11 @@ class TuiRenderer:
             if self.verbose:
                 self._record("budget", event.message)
                 self._print(Text(event.message, style="dim"))
+        elif event.type == "usage":
+            if self.verbose:
+                rendered = _format_usage_event(event.usage)
+                self._record("usage", rendered)
+                self._print(Text(rendered, style="dim"))
         elif event.type == "compact":
             self._record("compact", event.message)
             self._print(_block("system", Text(event.message), style="bold blue"))
@@ -449,6 +467,41 @@ def _format_duration(duration_ms: int) -> str:
     return f"{minutes}m"
 
 
+def _format_token_count(value: int) -> str:
+    return f"{max(0, value):,}"
+
+
+def _summarize_usage_events(events: list[AgentEvent]) -> dict[str, int]:
+    summary = {
+        "requests": 0,
+        "estimated_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    for event in events:
+        if not event.usage:
+            continue
+        summary["requests"] += 1
+        if event.usage.get("source") == "estimated":
+            summary["estimated_requests"] += 1
+        for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
+            summary[key] += _int_value(event.usage.get(key))
+    return summary
+
+
+def _format_usage_event(usage: dict[str, object]) -> str:
+    purpose = str(usage.get("purpose") or "model")
+    source = str(usage.get("source") or "provider")
+    return (
+        f"Tokens [{purpose}]: {_format_token_count(_int_value(usage.get('total_tokens')))} total · "
+        f"{_format_token_count(_int_value(usage.get('input_tokens')))} in · "
+        f"{_format_token_count(_int_value(usage.get('output_tokens')))} out · {source}"
+    )
+
+
 def _compact_text(value: str, max_chars: int) -> str:
     normalized = " ".join(value.split())
     if len(normalized) <= max_chars:
@@ -494,6 +547,7 @@ def _event_from_dict(raw: dict[str, object]) -> AgentEvent:
         summary=str(raw.get("summary") or ""),
         duration_ms=_int_value(raw.get("duration_ms")),
         is_error=is_error,
+        usage=raw.get("usage") if isinstance(raw.get("usage"), dict) else {},
     )
 
 

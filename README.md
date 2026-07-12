@@ -9,8 +9,8 @@ Tool use goes through native tool/function calling. GPT model profiles can use
 the OpenAI Responses API, while OpenAI-compatible model profiles continue to use
 Chat Completions. Tool schemas live in `uedev.tools.specs`, while implementations
 live in `AgentRuntime._build_tool_handlers()`. The loop executes returned tool
-calls, adds tool results, and asks the model to continue until it gives a normal
-final answer.
+calls, adds tool results, and asks the model to continue until it gives a final
+answer or reaches a configured runtime budget.
 
 ## Install
 
@@ -36,7 +36,8 @@ Edit the system JSON config at `~/.uedev/config.json`:
   "default_model": "openai-gpt",
   "models": {
     "openai-gpt": {
-      "gpt_model": true,
+      "response": true,
+      "effort": "medium",
       "model": "gpt-5",
       "base_url": "https://api.openai.com/v1",
       "api_key": "your_api_key",
@@ -45,7 +46,6 @@ Edit the system JSON config at `~/.uedev/config.json`:
       "responses": {
         "store": false,
         "reasoning": {
-          "effort": null,
           "summary": null
         },
         "text": {
@@ -71,9 +71,10 @@ Edit the system JSON config at `~/.uedev/config.json`:
         }
       }
     },
-    "compatible-chat": {
-      "gpt_model": false,
-      "model": "your_model",
+    "deepseek": {
+      "response": false,
+      "effort": "high",
+      "model": "deepseek-v4-pro",
       "base_url": "https://your.api.com/v1",
       "api_key": "your_api_key",
       "context_window": 262144,
@@ -85,10 +86,40 @@ Edit the system JSON config at `~/.uedev/config.json`:
     "diff_output_max_chars": 20000
   },
   "runtime": {
-    "default_max_steps": 8
+    "default_max_steps": 8,
+    "budgets": {
+      "model_request_hard_limit": 8,
+      "tool_call_soft_limit": 24,
+      "tool_call_limits": {
+        "compact": 2,
+        "subagent": 4,
+        "background_run": 4,
+        "write_file": 16,
+        "edit_file": 16,
+        "shell": 12,
+        "worktree_run": 12,
+        "ue_run_python": 12,
+        "ue_build": 12
+      },
+      "wall_clock_seconds": 900,
+      "consecutive_tool_failures": 3,
+      "permission_denials": 2,
+      "no_progress_rounds": 3,
+      "output_token_soft_ratio": 0.8,
+      "context_compact_ratio": 0.9
+    }
   },
   "workspace": {
     "excluded_dirs": [".agent", ".git", ".vs", "Binaries", "Intermediate", "Saved", "DerivedDataCache"]
+  },
+  "worktrees": {
+    "default_root": ""
+  },
+  "subagents": {
+    "model_profile": null
+  },
+  "mcp": {
+    "servers": {}
   },
   "ue": {
     "engines": {
@@ -104,10 +135,20 @@ Edit the system JSON config at `~/.uedev/config.json`:
 }
 ```
 
-The CLI uses the official `openai` Python package. Set `gpt_model` to `true` for
+The CLI uses the official `openai` Python package. Set `response` to `true` for
 OpenAI GPT profiles that should use the Responses API; leave it unset or `false`
 for OpenAI-compatible Chat Completions endpoints such as DeepSeek-compatible
 profiles.
+`effort` is the profile's default reasoning effort. Supported values are
+`low`, `medium`, `high`, and `xhigh`. Responses profiles send it as
+`reasoning.effort`; DeepSeek-compatible Chat Completions profiles send it as
+the top-level `reasoning_effort` parameter. Interactive chat can override the
+profile default for the current session with `/effort`.
+Every successful model request records token usage. Responses profiles read
+`usage` from the completed response. All Chat Completions profiles, regardless
+of model name or provider URL, request the DeepSeek/OpenAI-compatible final
+streaming usage chunk with `stream_options.include_usage`. If an API does not
+return usage, the CLI records a clearly labelled local estimate.
 `context_window` is optional for each model profile and defaults to 262144
 estimated tokens. Auto compaction defaults to 90% of that window unless
 `--context-threshold` is supplied.
@@ -115,17 +156,23 @@ estimated tokens. Auto compaction defaults to 90% of that window unless
 `requires_reasoning_content` is optional and defaults to `false`. Enable it for
 models such as DeepSeek thinking mode that require assistant
 `reasoning_content` to be replayed with later requests. It only applies when
-`gpt_model` is `false`. Responses profiles send the configured Responses API
+`response` is `false`. Responses profiles send the configured Responses API
 options, including reasoning, tool choice, parallel tool calls, max output
 tokens, truncation, include, text formatting, storage, built-in tools, and
 function tool schemas adapted from the same canonical project tool definitions
 used by Chat Completions profiles.
 `display.diff_output_max_chars` controls per-section `/diff` output truncation
 and defaults to 20000 characters.
-`runtime.default_max_steps` controls the default agent work-loop budget when
-`--max-steps` is not supplied, and defaults to 8.
+`runtime.default_max_steps` is retained as the default model-request limit.
+`runtime.budgets` configures model requests, tool-call soft and per-tool limits,
+wall-clock time, repeated failures or denials, output size, and the automatic
+compaction ratio. `--max-steps` overrides `model_request_hard_limit` for one run.
 `workspace.excluded_dirs` controls directory names skipped by workspace file
 tools and defaults to the listed agent, VCS, IDE, and UE generated folders.
+`worktrees.default_root` overrides the managed worktree root when non-empty.
+`subagents.model_profile` optionally selects a configured model for child agents.
+`mcp.servers` configures optional stdio MCP servers; `/mcp` reports their status
+and exposed tools.
 
 ## Usage
 
@@ -194,8 +241,9 @@ uedev run "debug this folder" --verbose
 Permission mode is controlled in chat with `/permissions`. The available modes
 are `read-only`, `default`, `auto-review`, and `full-access`; the selected mode
 applies to the current chat session only. `--yes` starts that run or chat session
-in `full-access`. Standalone `uedev ue ...` commands still require `--execute`;
-omitting it produces a dry-run command preview.
+in `full-access`. Standalone `ue run-python`, `ue list-assets`, and
+`ue validate-assets` require `--execute`; omitting it produces a dry-run command
+preview. `ue doctor` is read-only, while `ue build` runs the build immediately.
 
 ## Behavior
 
@@ -214,11 +262,14 @@ omitting it produces a dry-run command preview.
 - `chat` shows loading, assistant streaming text, and tool events while running,
   then renders a collapsed process summary before the final answer.
 - `chat` supports slash commands such as `/help`, `/context`, `/diff`, `/todos`,
-  `/tasks`, `/history`, `/subagents`, `/worktree`, `/model`, `/mcp`,
+  `/tasks`, `/history`, `/subagents`, `/worktree`, `/model`, `/effort`, `/usage`, `/mcp`,
   `/plan`, `/permissions`, `/compact`, `/clear`, `/exit`, and `/ue doctor`; type `/` to
   autocomplete commands with descriptions.
 - `/context` shows the current estimated model-context usage, configured context
   window, auto compact threshold, and remaining capacity.
+- `/usage` shows the current session total, the latest user-turn total, and the
+  individual model requests in that turn. Turn summaries also show input,
+  output, and total token counts.
 - `/diff` shows a human-readable Git status/diff summary and Perforce workspace
   status plus opened files for the current workspace.
 - `/model` opens an interactive profile selector in TUI chat. In plain mode,
@@ -238,6 +289,9 @@ omitting it produces a dry-run command preview.
 - `/history` lists previous conversations for the current project and lets an
   interactive TUI user choose one with the arrow keys; plain chat falls back to
   a numbered list. History is loaded from `.agent/sessions/YYYY/MM/DD/<session>/`.
+  Loading a session also restores the last API model and reasoning effort used
+  by that conversation. The API model identifier is used for matching, so this
+  still works after the outer CLI display name is changed.
 - `/subagents` lists child-agent conversations created by the current main
   session. Subagents are scoped to that session and are not shared across other
   restored conversations.
@@ -263,7 +317,11 @@ omitting it produces a dry-run command preview.
 - Conversations are stored in `.agent/sessions/YYYY/MM/DD/<session_id>/`.
   `messages.jsonl` is the model context, `display.jsonl` is the full replayable
   UI transcript, `metadata.json` stores session metadata, and `transcript.jsonl`
-  stores the latest compact source transcript.
+  stores the latest compact source transcript. The session's last model display
+  name, API model identifier, and reasoning effort are stored in
+  `metadata.json` and as a `session_state` record in `transcript.jsonl`. Each
+  model request is stored as a `token_usage` record; session totals are mirrored
+  in `metadata.json`, and compaction preserves these records.
 - Session subagents are stored below
   `.agent/sessions/YYYY/MM/DD/<session_id>/subagents/`, with one `index.jsonl`
   plus one directory per subagent containing `messages.jsonl`, `display.jsonl`,
@@ -276,15 +334,16 @@ omitting it produces a dry-run command preview.
 
 ## Unreal Engine Direction
 
-The project now includes first-class UE helper tools instead of relying on ad
-hoc shell commands:
+The agent now uses first-class UE tools instead of ad hoc shell commands:
 
-- `ue.doctor`: find `.uproject`, read its `EngineAssociation`, and match a configured UE engine
-- `ue.build`: compile `<ProjectName>Editor Win64 Development` through the configured engine `Build.bat`, capture UBT/UHT/MSVC diagnostics, and store logs under `.agent/ue_builds/`
-- `ue.run_python_commandlet`: call `UnrealEditor-Cmd.exe -run=pythonscript`
-- `ue.run_python_full_editor`: call `UnrealEditor-Cmd.exe -ExecutePythonScript`
-- `ue.list_assets`: wrap a UE Python script and return JSON
-- `ue.validate_assets`: run UE Data Validation and summarize results
+- `ue_doctor`: find `.uproject`, resolve `EngineAssociation`, configured editor paths, and Perforce status
+- `ue_build`: compile `<ProjectName>Editor Win64 Development`, capture UBT/UHT/MSVC diagnostics, and store logs under `.agent/ue_builds/`
+- `ue_run_python`: run inline code or an existing script in `commandlet` or `full_editor` mode and return structured results and logs
+- `ue_stop_executor`: stop the persistent full-editor executor polling loop
+- `p4_status`, `p4_file_state`, `p4_opened`, `p4_checkout`, `p4_add`, `p4_delete`, `p4_reconcile`, and `p4_diff`: inspect and modify Perforce state through permission-aware interfaces
+
+The standalone CLI additionally provides `ue run-python`, `ue list-assets`, and
+`ue validate-assets` commands, with dry-run behavior unless `--execute` is set.
 
 UE engine selection is driven by the project's `.uproject` `EngineAssociation`.
 The system config can store multiple UE versions under `ue.engines`; the doctor

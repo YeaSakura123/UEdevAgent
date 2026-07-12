@@ -35,6 +35,7 @@ from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_
 from uedev.llm.client import ChatMessage, ModelResponse, ToolCall, _serialize_message
 from uedev.runtime.history import (
     HistoryRecorder,
+    SessionModelState,
     load_display_history,
     load_history_file,
     load_session_metadata,
@@ -119,6 +120,8 @@ class SlashCommandTests(unittest.TestCase):
         self.assertIn("Show Git and Perforce workspace changes.", help_text)
         self.assertIn("/worktree", help_text)
         self.assertIn("/model", help_text)
+        self.assertIn("/effort", help_text)
+        self.assertIn("/usage", help_text)
         self.assertIn("/plan", help_text)
         self.assertIn("/permissions", help_text)
         self.assertIn("/history", help_text)
@@ -236,16 +239,146 @@ class SlashCommandTests(unittest.TestCase):
                 self.assertTrue(runtime.handle_slash_command("/model", emit=output.append))
                 self.assertIn("fast", output[-1])
                 self.assertIn("default", output[-1])
+                self.assertNotIn("gpt-alt-model", output[-1])
 
                 self.assertTrue(runtime.handle_slash_command("/model gpt-alt", emit=output.append))
                 self.assertIn("Active model set to gpt-alt", output[-1])
                 project_config = json.loads((agent_dir(root) / "config.json").read_text(encoding="utf-8"))
-                self.assertEqual(project_config["active_model"], "gpt-alt")
+                self.assertEqual(project_config["active_model"], "gpt-alt-model")
                 self.assertEqual(runtime.current_model_profile().name, "gpt-alt")
 
                 self.assertTrue(runtime.handle_slash_command("/model reset", emit=output.append))
                 self.assertIn("Active model reset to default profile fast", output[-1])
                 self.assertEqual(runtime.current_model_profile().name, "fast")
+
+    def test_effort_slash_command_uses_profile_default_and_session_override(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "Deepseek-V4Pro": {
+                        "model": "deepseek-v4-pro",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "api_key": "key",
+                        "effort": "high",
+                    }
+                },
+            )
+            runtime = AgentRuntime(AgentOptions("", 1, True, root, 120, False))
+            output: list[str] = []
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                self.assertTrue(runtime.handle_slash_command("/effort", emit=output.append))
+                self.assertIn("Deepseek-V4Pro: high", output[-1])
+                self.assertTrue(runtime.handle_slash_command("/effort xhigh", emit=output.append))
+                self.assertEqual(runtime.current_effort(), "xhigh")
+                self.assertTrue(runtime.handle_slash_command("/effort reset", emit=output.append))
+                self.assertEqual(runtime.current_effort(), "high")
+                self.assertTrue(runtime.handle_slash_command("/effort max", emit=output.append))
+                self.assertIn("Unknown effort", output[-1])
+
+    def test_history_model_state_restores_renamed_profile_and_effort(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "New GPT Label": {
+                        "response": True,
+                        "model": "provider/gpt-5.5",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "effort": "medium",
+                    },
+                },
+            )
+            runtime = AgentRuntime(AgentOptions("", 1, True, root, 120, False))
+            saved = SessionModelState("Old GPT Label", "provider/gpt-5.5", "xhigh")
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                result = runtime.restore_history_model_state(saved)
+
+                self.assertEqual(result, "Restored model New GPT Label with effort xhigh.")
+                self.assertEqual(runtime.current_model_profile().name, "New GPT Label")
+                self.assertEqual(runtime.current_effort(), "xhigh")
+                project_config = json.loads((agent_dir(root) / "config.json").read_text(encoding="utf-8"))
+                self.assertEqual(project_config["active_model"], "provider/gpt-5.5")
+
+    def test_model_and_effort_commands_update_session_state(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "reasoning": {
+                        "response": True,
+                        "model": "reasoning-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "effort": "medium",
+                    },
+                },
+            )
+            runtime = AgentRuntime(AgentOptions("", 1, True, root, 120, False))
+            history = HistoryRecorder(agent_dir(root), [ChatMessage(role="system", content=runtime.system_prompt)])
+            output: list[str] = []
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                runtime.handle_slash_command("/model reasoning", emit=output.append, history=history)
+                runtime.handle_slash_command("/effort high", emit=output.append, history=history)
+
+            state = load_session_metadata(history.session_dir or Path())["model_state"]
+            self.assertEqual(state["profile_name"], "reasoning")
+            self.assertEqual(state["model"], "reasoning-model")
+            self.assertEqual(state["effort"], "high")
+
+    def test_usage_command_reports_session_and_latest_turn(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(config_path)
+            runtime = AgentRuntime(AgentOptions("", 1, True, root, 120, False))
+            history = HistoryRecorder(agent_dir(root), [ChatMessage(role="system", content=runtime.system_prompt)])
+            for request_id, turn_id, total, source in (
+                ("req_1", "turn-1", 100, "provider"),
+                ("req_2", "turn-2", 75, "estimated"),
+            ):
+                history.record_token_usage(
+                    {
+                        "request_id": request_id,
+                        "turn_id": turn_id,
+                        "purpose": "main",
+                        "input_tokens": total - 25,
+                        "output_tokens": 25,
+                        "total_tokens": total,
+                        "cached_input_tokens": 0,
+                        "reasoning_tokens": 10,
+                        "source": source,
+                    }
+                )
+            output: list[str] = []
+
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                self.assertTrue(runtime.handle_slash_command("/usage", emit=output.append, history=history))
+
+            self.assertIn("2 requests · 175 total", output[-1])
+            self.assertIn("Latest turn: turn-2", output[-1])
+            self.assertIn("75 total", output[-1])
+            self.assertIn("estimated", output[-1])
 
     def test_plan_slash_command_switches_collaboration_mode(self) -> None:
         with workspace_temp_dir() as temp:
@@ -545,6 +678,8 @@ class SlashCommandTests(unittest.TestCase):
                         "model": "fast-model",
                         "base_url": "https://api.openai.com/v1",
                         "api_key": "key",
+                        "response": True,
+                        "effort": "medium",
                     }
                 },
             )
@@ -560,16 +695,20 @@ class SlashCommandTests(unittest.TestCase):
             app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
 
             with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                banner = render_chat_banner(options)
+                self.assertIn("fast", banner)
+                self.assertNotIn("medium", banner)
                 toolbar = "".join(fragment[1] for fragment in app.status_bottom_toolbar())
 
-                self.assertIn("fast-model", toolbar)
+                self.assertIn("fast medium", toolbar)
                 self.assertIn(str(root), toolbar)
                 self.assertNotIn("Plan mode", toolbar)
 
                 runtime.collaboration_mode = "plan"
+                runtime.handle_effort_command("/effort high")
                 toolbar = "".join(fragment[1] for fragment in app.status_bottom_toolbar())
 
-                self.assertIn("fast-model", toolbar)
+                self.assertIn("fast high", toolbar)
                 self.assertIn(str(root), toolbar)
                 self.assertIn("Plan mode", toolbar)
                 self.assertTrue(app.exit_plan_mode())

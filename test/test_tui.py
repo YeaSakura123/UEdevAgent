@@ -55,6 +55,7 @@ from uedev.ui.renderer import ConsoleRenderer, TuiRenderer
 from uedev.runtime.history import (
     HistoryEntry,
     HistoryRecorder,
+    SessionModelState,
     load_display_history,
     update_session_active_plan,
 )
@@ -63,7 +64,7 @@ from uedev.runtime.skills import SkillLoader
 from uedev.state.tasks import TaskManager
 from uedev.tools.specs import get_tool_names, get_tool_specs
 from uedev.runtime.subagents import SubagentRecord
-from uedev.ui.tui import ChatTuiApplication
+from uedev.ui.tui import ChatScreenState, ChatTuiApplication, SelectionModal
 from uedev.tools.workspace import edit_file, read_file, write_file
 from uedev.tools.worktrees import WorktreeManager
 
@@ -423,17 +424,79 @@ class TuiModelSelectionTests(unittest.TestCase):
                 app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
                 app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
 
-                selected = app.prompt_model_selection(_FakePromptSession("gpt-alt - gpt-alt-model (reasoning)"))
+                selected = app.prompt_model_selection(_FakePromptSession("gpt-alt (reasoning)"))
                 self.assertEqual(selected, "gpt-alt")
                 if selected is not None:
                     runtime.switch_model(selected)
-                self.assertEqual(load_project_config(root).active_model, "gpt-alt")
+                self.assertEqual(load_project_config(root).active_model, "gpt-alt-model")
 
                 selected = app.prompt_model_selection(_FakePromptSession("Reset to default (fast)"))
                 self.assertEqual(selected, "reset")
                 if selected is not None:
                     runtime.switch_model(selected)
                 self.assertIsNone(load_project_config(root).active_model)
+
+    def test_prompt_effort_selection_overrides_and_resets_profile_default(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "GPT-5.5": {
+                        "response": True,
+                        "effort": "medium",
+                        "model": "gpt-5.5",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    }
+                },
+            )
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions("", 1, True, root, 120, False)
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                selected = app.prompt_effort_selection(_FakePromptSession("high"))
+                self.assertEqual(selected, "high")
+                runtime.handle_effort_command(f"/effort {selected}")
+                self.assertEqual(runtime.current_effort(), "high")
+
+                selected = app.prompt_effort_selection(_FakePromptSession("Reset to default (medium)"))
+                self.assertEqual(selected, "reset")
+                runtime.handle_effort_command(f"/effort {selected}")
+                self.assertEqual(runtime.current_effort(), "medium")
+
+    def test_fullscreen_effort_modal_lists_levels_and_applies_selection(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "Deepseek-V4Pro": {
+                        "model": "deepseek-v4-pro",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "api_key": "key",
+                        "effort": "high",
+                    }
+                },
+            )
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions("", 1, True, root, 120, False)
+                runtime = AgentRuntime(options)
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.screen = ChatScreenState("banner")
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                app._open_effort_modal()
+
+                self.assertIsInstance(app.screen.modal, SelectionModal)
+                modal = app.screen.modal
+                self.assertIn("high (active)", modal.labels)
+                modal.on_select("xhigh")
+                self.assertEqual(runtime.current_effort(), "xhigh")
 
     def test_model_slash_with_argument_in_tui_does_not_switch_directly(self) -> None:
         with workspace_temp_dir() as temp:
@@ -567,6 +630,51 @@ class TuiHistoryRecordingTests(unittest.TestCase):
             transcript = app.renderer.render_text()
             self.assertIn("plan:\ntitle: Restored Plan", transcript)
             self.assertIn("Replay from metadata", transcript)
+
+    def test_load_history_restores_model_and_effort(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "fast": {
+                        "model": "fast-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                    },
+                    "Historical": {
+                        "response": True,
+                        "model": "historical-model",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "key",
+                        "effort": "medium",
+                    },
+                },
+            )
+            with patch("uedev.state.config.default_system_config_path", return_value=config_path):
+                options = AgentOptions("", 1, True, root, 120, False)
+                runtime = AgentRuntime(options)
+                history = HistoryRecorder(agent_dir(root), [ChatMessage(role="system", content=runtime.system_prompt)])
+                history.append(ChatMessage(role="user", content="saved conversation"))
+                entry = HistoryEntry(
+                    path=history.path or Path(),
+                    kind="session",
+                    modified_at=1.0,
+                    message_count=2,
+                    preview="saved conversation",
+                    session_dir=history.session_dir,
+                    transcript_path=history.transcript_path,
+                    model_state=SessionModelState("Historical", "historical-model", "high"),
+                )
+                app = ChatTuiApplication(options, runtime, "banner", SlashCommandCompleter())
+                app.renderer = TuiRenderer("banner", verbose=False, stream=StringIO())
+
+                app.load_history(entry)
+
+                self.assertEqual(runtime.current_model_profile().name, "Historical")
+                self.assertEqual(runtime.current_effort(), "high")
+                self.assertIn("Restored model Historical with effort high.", app.renderer.render_text())
 
 
 class TaskAndWorktreeTests(unittest.TestCase):

@@ -36,6 +36,17 @@ class ModelResponse:
     content: str
     tool_calls: list[ToolCall] = field(default_factory=list)
     reasoning_content: str | None = None
+    usage: TokenUsage | None = None
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    source: Literal["provider", "estimated"] = "provider"
 
 
 @dataclass(frozen=True)
@@ -121,9 +132,13 @@ def call_model(
     profile: ModelProfile,
     tools: list[dict[str, Any]] | None = None,
 ) -> ModelResponse:
-    if profile.gpt_model:
-        return _call_responses(messages, profile, tools)
-    return _call_chat_completions(messages, profile, tools)
+    response: ModelResponse | None = None
+    for event in call_model_stream(messages, profile, tools):
+        if event.type == "final":
+            response = event.response
+    if response is None:
+        raise RuntimeError("Model stream ended without a final response.")
+    return response
 
 
 def call_model_stream(
@@ -131,58 +146,10 @@ def call_model_stream(
     profile: ModelProfile,
     tools: list[dict[str, Any]] | None = None,
 ) -> Iterator[ModelStreamEvent]:
-    if profile.gpt_model:
+    if profile.response:
         yield from _call_responses_stream(messages, profile, tools)
         return
     yield from _call_chat_completions_stream(messages, profile, tools)
-
-
-def _call_chat_completions(
-    messages: list[ChatMessage],
-    profile: ModelProfile,
-    tools: list[dict[str, Any]] | None = None,
-) -> ModelResponse:
-    if OpenAI is None:
-        raise RuntimeError("The openai package is required to call a model.")
-    if not profile.api_key:
-        raise RuntimeError(f"Model profile {profile.name!r} is missing api_key in the system JSON config.")
-    if not profile.model:
-        raise RuntimeError(f"Model profile {profile.name!r} is missing model in the system JSON config.")
-
-    client = OpenAI(api_key=profile.api_key, base_url=profile.base_url.rstrip("/"), timeout=profile.timeout_seconds)
-
-    try:
-        kwargs: dict[str, Any] = {
-            "model": profile.model,
-            "messages": [_serialize_message(message, profile) for message in messages],
-            "temperature": 0.1,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
-        response = client.chat.completions.create(**kwargs)
-    except OpenAIError as error:
-        raise RuntimeError(f"Model request failed: {error}") from error
-
-    message = response.choices[0].message
-    try:
-        tool_calls = [
-            ToolCall(
-                id=tool_call.id,
-                name=tool_call.function.name,
-                arguments=_parse_tool_arguments(tool_call.function.arguments or ""),
-            )
-            for tool_call in (message.tool_calls or [])
-        ]
-    except RuntimeError as error:
-        raise RuntimeError(f"Failed to parse model tool call arguments: {error}") from error
-    content = message.content or ""
-    reasoning_content = _extract_reasoning_content(message)
-    if not content and not tool_calls:
-        raise RuntimeError("Model returned an empty response.")
-
-    return ModelResponse(content=content, tool_calls=tool_calls, reasoning_content=reasoning_content)
 
 
 def _call_chat_completions_stream(
@@ -205,7 +172,10 @@ def _call_chat_completions_stream(
             "messages": [_serialize_message(message, profile) for message in messages],
             "temperature": 0.1,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
+        if profile.effort:
+            kwargs["reasoning_effort"] = profile.effort
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
@@ -216,8 +186,12 @@ def _call_chat_completions_stream(
     content_parts: list[str] = []
     tool_chunks: dict[int, dict[str, str]] = {}
     reasoning_parts: list[str] = []
+    usage: TokenUsage | None = None
     try:
         for chunk in stream:
+            chunk_usage = _parse_token_usage(getattr(chunk, "usage", None), response_api=False)
+            if chunk_usage is not None:
+                usage = chunk_usage
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -264,53 +238,17 @@ def _call_chat_completions_stream(
     content = "".join(content_parts)
     if not content and not tool_calls:
         raise RuntimeError("Model returned an empty response.")
+    if usage is None:
+        usage = estimate_token_usage(kwargs, content, "".join(reasoning_parts), tool_calls)
     yield ModelStreamEvent(
         type="final",
         response=ModelResponse(
             content=content,
             tool_calls=tool_calls,
             reasoning_content="".join(reasoning_parts) or None,
+            usage=usage,
         ),
     )
-
-
-def _call_responses(
-    messages: list[ChatMessage],
-    profile: ModelProfile,
-    tools: list[dict[str, Any]] | None = None,
-) -> ModelResponse:
-    if OpenAI is None:
-        raise RuntimeError("The openai package is required to call a model.")
-    if not profile.api_key:
-        raise RuntimeError(f"Model profile {profile.name!r} is missing api_key in the system JSON config.")
-    if not profile.model:
-        raise RuntimeError(f"Model profile {profile.name!r} is missing model in the system JSON config.")
-
-    client = OpenAI(api_key=profile.api_key, base_url=profile.base_url.rstrip("/"), timeout=profile.timeout_seconds)
-
-    try:
-        kwargs = _build_responses_kwargs(messages, profile, tools, stream=False)
-        response = client.responses.create(**kwargs)
-    except OpenAIError as error:
-        raise RuntimeError(f"Model request failed: {error}") from error
-
-    try:
-        tool_calls = [
-            ToolCall(
-                id=str(_item_value(item, "call_id") or _item_value(item, "id") or ""),
-                name=str(_item_value(item, "name") or ""),
-                arguments=_parse_tool_arguments(_item_value(item, "arguments") or ""),
-            )
-            for item in (_item_value(response, "output") or [])
-            if _item_value(item, "type") == "function_call"
-        ]
-    except RuntimeError as error:
-        raise RuntimeError(f"Failed to parse model tool call arguments: {error}") from error
-
-    content = _extract_responses_text(response)
-    if not content and not tool_calls:
-        raise RuntimeError("Model returned an empty response.")
-    return ModelResponse(content=content, tool_calls=tool_calls)
 
 
 def _call_responses_stream(
@@ -328,7 +266,7 @@ def _call_responses_stream(
     client = OpenAI(api_key=profile.api_key, base_url=profile.base_url.rstrip("/"), timeout=profile.timeout_seconds)
 
     try:
-        kwargs = _build_responses_kwargs(messages, profile, tools, stream=True)
+        kwargs = _build_responses_kwargs(messages, profile, tools)
         stream = client.responses.create(**kwargs)
     except OpenAIError as error:
         raise RuntimeError(f"Model request failed: {error}") from error
@@ -363,31 +301,102 @@ def _call_responses_stream(
             ]
         except RuntimeError as error:
             raise RuntimeError(f"Failed to parse model tool call arguments: {error}") from error
-        content = _extract_responses_text(completed_response)
+        content = _extract_responses_text(completed_response) or "".join(content_parts)
+        usage = _parse_token_usage(_item_value(completed_response, "usage"), response_api=True)
     else:
         tool_calls = []
         content = "".join(content_parts)
+        usage = None
 
     if not content and not tool_calls:
         raise RuntimeError("Model returned an empty response.")
-    yield ModelStreamEvent(type="final", response=ModelResponse(content=content, tool_calls=tool_calls))
+    if usage is None:
+        usage = estimate_token_usage(kwargs, content, "", tool_calls)
+    yield ModelStreamEvent(type="final", response=ModelResponse(content=content, tool_calls=tool_calls, usage=usage))
+
+
+def estimate_token_usage(
+    request_payload: object,
+    content: str,
+    reasoning_content: str,
+    tool_calls: list[ToolCall],
+) -> TokenUsage:
+    try:
+        serialized_input = json.dumps(request_payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        serialized_input = str(request_payload)
+    serialized_output = content + reasoning_content
+    if tool_calls:
+        serialized_output += json.dumps(
+            [{"name": item.name, "arguments": item.arguments} for item in tool_calls],
+            ensure_ascii=False,
+            default=str,
+        )
+    input_tokens = max(1, len(serialized_input) // 4)
+    output_tokens = max(1, len(serialized_output) // 4) if serialized_output else 0
+    reasoning_tokens = max(1, len(reasoning_content) // 4) if reasoning_content else 0
+    return TokenUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=input_tokens + output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        source="estimated",
+    )
+
+
+def _parse_token_usage(raw: object, *, response_api: bool) -> TokenUsage | None:
+    if raw is None:
+        return None
+    input_key = "input_tokens" if response_api else "prompt_tokens"
+    output_key = "output_tokens" if response_api else "completion_tokens"
+    input_tokens = _usage_int(raw, input_key)
+    output_tokens = _usage_int(raw, output_key)
+    if input_tokens is None and not response_api:
+        input_tokens = _usage_int(raw, "input_tokens")
+    if output_tokens is None and not response_api:
+        output_tokens = _usage_int(raw, "output_tokens")
+    if input_tokens is None or output_tokens is None:
+        return None
+    total_tokens = _usage_int(raw, "total_tokens")
+    input_details = _item_value(raw, "input_tokens_details") or _item_value(raw, "prompt_tokens_details")
+    output_details = _item_value(raw, "output_tokens_details") or _item_value(raw, "completion_tokens_details")
+    cached_tokens = _usage_int(input_details, "cached_tokens") or _usage_int(raw, "prompt_cache_hit_tokens") or 0
+    reasoning_tokens = _usage_int(output_details, "reasoning_tokens") or 0
+    return TokenUsage(
+        input_tokens=max(0, input_tokens),
+        output_tokens=max(0, output_tokens),
+        total_tokens=max(0, total_tokens if total_tokens is not None else input_tokens + output_tokens),
+        cached_input_tokens=max(0, cached_tokens),
+        reasoning_tokens=max(0, reasoning_tokens),
+    )
+
+
+def _usage_int(raw: object, key: str) -> int | None:
+    value = _item_value(raw, key)
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _build_responses_kwargs(
     messages: list[ChatMessage],
     profile: ModelProfile,
     tools: list[dict[str, Any]] | None,
-    *,
-    stream: bool,
 ) -> dict[str, Any]:
     instructions, input_items = _serialize_responses_input(messages)
     options = _compact_optional_dict(profile.responses)
+    if profile.effort:
+        reasoning = dict(options.get("reasoning") or {})
+        reasoning["effort"] = profile.effort
+        options["reasoning"] = reasoning
     kwargs: dict[str, Any] = {
         "model": profile.model,
         "input": input_items,
+        "stream": True,
     }
-    if stream:
-        kwargs["stream"] = True
     if instructions:
         kwargs["instructions"] = instructions
     kwargs.update(_responses_api_options(options))

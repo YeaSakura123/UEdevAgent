@@ -161,6 +161,61 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(profile.name, "gpt-alt")
             self.assertEqual(profile.model, "alt-model")
 
+    def test_api_model_identifier_keeps_selection_after_display_name_changes(self) -> None:
+        with workspace_temp_dir() as temp:
+            root = Path(temp)
+            config_path = root / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "My renamed CLI label": {
+                        "model": "provider/model-v4",
+                        "base_url": "https://api.example.com/v1",
+                        "api_key": "key",
+                    },
+                    "Other": {
+                        "model": "provider/other",
+                        "base_url": "https://api.example.com/v1",
+                        "api_key": "key",
+                    },
+                },
+            )
+            (agent_dir(root) / "config.json").parent.mkdir(parents=True)
+            (agent_dir(root) / "config.json").write_text(
+                json.dumps({"version": 2, "active_model": "provider/model-v4"}),
+                encoding="utf-8",
+            )
+
+            config = load_system_config(config_path)
+
+            self.assertEqual(resolve_model_profile(root, config).name, "My renamed CLI label")
+
+    def test_stale_default_display_name_falls_back_after_profile_is_renamed(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "New CLI label": {
+                        "model": "provider/model-v4",
+                        "base_url": "https://api.example.com/v1",
+                        "api_key": "key",
+                    },
+                    "Other": {
+                        "model": "provider/other",
+                        "base_url": "https://api.example.com/v1",
+                        "api_key": "key",
+                    },
+                },
+            )
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            payload["default_model"] = "Old CLI label"
+            config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            config = load_system_config(config_path)
+
+            self.assertEqual(config.default_model, "New CLI label")
+
     def test_first_model_is_default_when_default_model_is_omitted(self) -> None:
         with workspace_temp_dir() as temp:
             root = Path(temp)
@@ -241,7 +296,7 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.models["deepseek"].requires_reasoning_content)
             self.assertIn("requires_reasoning_content=True", format_model_profiles(root, config))
 
-    def test_gpt_model_responses_options_default_and_can_be_configured(self) -> None:
+    def test_response_options_default_and_can_be_configured(self) -> None:
         with workspace_temp_dir() as temp:
             root = Path(temp)
             config_path = root / "system-config.json"
@@ -254,7 +309,8 @@ class ConfigTests(unittest.TestCase):
                         "api_key": "key",
                     },
                     "openai": {
-                        "gpt_model": True,
+                        "response": True,
+                        "effort": "high",
                         "model": "gpt-5",
                         "base_url": "https://api.openai.com/v1",
                         "api_key": "key",
@@ -275,8 +331,9 @@ class ConfigTests(unittest.TestCase):
 
             config = load_system_config(config_path)
 
-            self.assertFalse(config.models["plain"].gpt_model)
-            self.assertTrue(config.models["openai"].gpt_model)
+            self.assertFalse(config.models["plain"].response)
+            self.assertTrue(config.models["openai"].response)
+            self.assertEqual(config.models["openai"].effort, "high")
             self.assertFalse(config.models["openai"].requires_reasoning_content)
             self.assertEqual(config.models["openai"].timeout_seconds, 60)
             self.assertFalse(config.models["openai"].responses["parallel_tool_calls"])
@@ -285,6 +342,24 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.models["openai"].responses["built_in_tools"]["web_search"]["enabled"])
             self.assertEqual(config.models["openai"].responses["built_in_tools"]["file_search"]["vector_store_ids"], ["vs_1"])
             self.assertIn("mode=responses", format_model_profiles(root, config))
+
+    def test_invalid_profile_effort_raises(self) -> None:
+        with workspace_temp_dir() as temp:
+            config_path = Path(temp) / "system-config.json"
+            write_system_config(
+                config_path,
+                models={
+                    "bad": {
+                        "model": "deepseek-v4-pro",
+                        "base_url": "https://api.deepseek.com/v1",
+                        "api_key": "key",
+                        "effort": "max",
+                    }
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "effort must be one of"):
+                load_system_config(config_path)
 
     def test_invalid_model_reasoning_content_replay_raises(self) -> None:
         with workspace_temp_dir() as temp:
@@ -349,9 +424,9 @@ class ConfigTests(unittest.TestCase):
         template = system_config_template()
 
         self.assertEqual(template["display"]["diff_output_max_chars"], DEFAULT_DIFF_OUTPUT_MAX_CHARS)
-        self.assertTrue(template["models"]["openai-gpt"]["gpt_model"])
+        self.assertTrue(template["models"]["openai-gpt"]["response"])
         self.assertEqual(template["models"]["openai-gpt"]["responses"], default_responses_options())
-        self.assertFalse(template["models"]["compatible-chat"]["gpt_model"])
+        self.assertFalse(template["models"]["compatible-chat"]["response"])
         self.assertFalse(template["models"]["compatible-chat"]["requires_reasoning_content"])
 
     def test_runtime_default_max_steps_defaults_and_can_be_configured(self) -> None:

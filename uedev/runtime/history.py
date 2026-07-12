@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -18,10 +19,20 @@ DISPLAY_FILE = "display.jsonl"
 METADATA_FILE = "metadata.json"
 TRANSCRIPT_FILE = "transcript.jsonl"
 SCHEMA_VERSION = 1
+SESSION_STATE_RECORD = "session_state"
+TOKEN_USAGE_RECORD = "token_usage"
+_TRANSCRIPT_LOCK = threading.RLock()
 
 
 class HistoryError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class SessionModelState:
+    profile_name: str
+    model: str
+    effort: str | None
 
 
 @dataclass(frozen=True)
@@ -34,6 +45,7 @@ class HistoryEntry:
     display_path: Path | None = None
     session_dir: Path | None = None
     transcript_path: Path | None = None
+    model_state: SessionModelState | None = None
 
     @property
     def label(self) -> str:
@@ -50,6 +62,7 @@ class HistorySnapshot:
     display_seeded: bool
     initial_messages: list[ChatMessage]
     initial_display_records: list[dict[str, Any]]
+    model_state: SessionModelState | None
     file_sizes: dict[Path, int | None]
 
 
@@ -67,6 +80,7 @@ class HistoryRecorder:
         self.path: Path | None = None
         self.display_path: Path | None = None
         self.transcript_path: Path | None = None
+        self.model_state: SessionModelState | None = None
         self._display_seeded = False
 
     def reset(
@@ -80,6 +94,7 @@ class HistoryRecorder:
         self.path = None
         self.display_path = None
         self.transcript_path = None
+        self.model_state = None
         self._display_seeded = False
 
     def resume(self, entry: HistoryEntry, initial_messages: list[ChatMessage]) -> None:
@@ -89,7 +104,22 @@ class HistoryRecorder:
         self.path = entry.path
         self.display_path = entry.display_path or (entry.session_dir / DISPLAY_FILE if entry.session_dir is not None else None)
         self.transcript_path = entry.transcript_path or (entry.session_dir / TRANSCRIPT_FILE if entry.session_dir is not None else None)
+        self.model_state = entry.model_state
         self._display_seeded = True
+
+    def update_model_state(self, profile_name: str, model: str, effort: str | None) -> None:
+        state = SessionModelState(profile_name=profile_name, model=model, effort=effort)
+        if self.model_state == state and self.transcript_path is not None and self.transcript_path.exists():
+            return
+        self.ensure_session()
+        self.model_state = state
+        self._write_metadata()
+        if self.transcript_path is not None:
+            write_transcript_model_state(self.transcript_path, state)
+
+    def record_token_usage(self, usage: dict[str, Any]) -> None:
+        path = self.ensure_transcript_path()
+        append_transcript_token_usage(path, usage)
 
     def append(self, message: ChatMessage) -> None:
         path = self._ensure_path()
@@ -126,6 +156,7 @@ class HistoryRecorder:
             display_seeded=self._display_seeded,
             initial_messages=list(self.initial_messages),
             initial_display_records=list(self.initial_display_records),
+            model_state=self.model_state,
             file_sizes=file_sizes,
         )
 
@@ -159,6 +190,9 @@ class HistoryRecorder:
         self._display_seeded = snapshot.display_seeded
         self.initial_messages = list(snapshot.initial_messages)
         self.initial_display_records = list(snapshot.initial_display_records)
+        self.model_state = snapshot.model_state
+        if self.session_dir is not None and self.transcript_path is not None and self.transcript_path.exists():
+            _update_session_token_usage_metadata(self.session_dir, self.transcript_path)
 
     def _ensure_path(self) -> Path:
         if self.path is None:
@@ -197,7 +231,13 @@ class HistoryRecorder:
     def _write_metadata(self) -> None:
         if self.session_dir is None or self.path is None or self.display_path is None or self.transcript_path is None:
             return
-        write_session_metadata(self.session_dir, self.path, self.display_path, self.transcript_path)
+        write_session_metadata(
+            self.session_dir,
+            self.path,
+            self.display_path,
+            self.transcript_path,
+            model_state=self.model_state,
+        )
 
 
 def create_session_dir(agent_dir: Path) -> Path:
@@ -220,16 +260,26 @@ def create_session_dir(agent_dir: Path) -> Path:
         return session_dir
 
 
-def write_session_metadata(session_dir: Path, messages_path: Path, display_path: Path, transcript_path: Path) -> None:
+def write_session_metadata(
+    session_dir: Path,
+    messages_path: Path,
+    display_path: Path,
+    transcript_path: Path,
+    model_state: SessionModelState | None = None,
+) -> None:
     metadata_path = session_dir / METADATA_FILE
     created_at = time.time()
     active_plan: Any = None
+    existing_model_state: Any = None
+    existing_token_usage: Any = None
     if metadata_path.exists():
         try:
             raw = json.loads(metadata_path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
                 created_at = float(raw.get("created_at") or created_at)
                 active_plan = raw.get("active_plan")
+                existing_model_state = raw.get("model_state")
+                existing_token_usage = raw.get("token_usage")
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             pass
     metadata = {
@@ -243,6 +293,12 @@ def write_session_metadata(session_dir: Path, messages_path: Path, display_path:
     }
     if isinstance(active_plan, dict):
         metadata["active_plan"] = active_plan
+    if model_state is not None:
+        metadata["model_state"] = _model_state_to_dict(model_state)
+    elif isinstance(existing_model_state, dict):
+        metadata["model_state"] = existing_model_state
+    if isinstance(existing_token_usage, dict):
+        metadata["token_usage"] = existing_token_usage
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
@@ -291,6 +347,119 @@ def write_history_messages(path: Path, messages: list[ChatMessage]) -> None:
             handle.write(_message_to_json(message) + "\n")
 
 
+def write_transcript_model_state(path: Path, state: SessionModelState) -> None:
+    with _TRANSCRIPT_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        remaining_lines: list[str] = []
+        if path.exists():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError as error:
+                raise HistoryError(f"Failed to read transcript file: {path}: {error}") from error
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    remaining_lines.append(line)
+                    continue
+                if not (isinstance(raw, dict) and raw.get("type") == SESSION_STATE_RECORD):
+                    remaining_lines.append(line)
+        record = json.dumps(_model_state_to_record(state), ensure_ascii=False)
+        path.write_text("\n".join([record, *remaining_lines]) + "\n", encoding="utf-8")
+
+
+def append_transcript_token_usage(path: Path, usage: dict[str, Any]) -> None:
+    record = {"type": TOKEN_USAGE_RECORD, **usage}
+    with _TRANSCRIPT_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        _update_session_token_usage_metadata(path.parent, path)
+
+
+def load_transcript_token_usage(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(raw, dict) and raw.get("type") == TOKEN_USAGE_RECORD:
+            records.append(raw)
+    return records
+
+
+def write_transcript_messages_preserving_records(path: Path, messages: list[ChatMessage]) -> None:
+    with _TRANSCRIPT_LOCK:
+        model_state = load_transcript_model_state(path)
+        token_usage = load_transcript_token_usage(path)
+        lines: list[str] = []
+        if model_state is not None:
+            lines.append(json.dumps(_model_state_to_record(model_state), ensure_ascii=False))
+        lines.extend(_message_to_json(message) for message in messages)
+        lines.extend(json.dumps(record, ensure_ascii=False) for record in token_usage)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _update_session_token_usage_metadata(path.parent, path)
+
+
+def summarize_token_usage(records: list[dict[str, Any]]) -> dict[str, int]:
+    summary = {
+        "requests": len(records),
+        "estimated_requests": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_input_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    for record in records:
+        if record.get("source") == "estimated":
+            summary["estimated_requests"] += 1
+        for key in ("input_tokens", "output_tokens", "total_tokens", "cached_input_tokens", "reasoning_tokens"):
+            try:
+                summary[key] += max(0, int(record.get(key) or 0))
+            except (TypeError, ValueError):
+                continue
+    return summary
+
+
+def _update_session_token_usage_metadata(session_dir: Path, transcript_path: Path) -> None:
+    metadata_path = session_dir / METADATA_FILE
+    try:
+        metadata = _load_session_metadata(metadata_path)
+    except HistoryError:
+        return
+    metadata["updated_at"] = time.time()
+    metadata["token_usage"] = summarize_token_usage(load_transcript_token_usage(transcript_path))
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_transcript_model_state(path: Path) -> SessionModelState | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(raw, dict) and raw.get("type") == SESSION_STATE_RECORD:
+            return _model_state_from_dict(raw)
+    return None
+
+
 def append_display_turn_start(path: Path, turn_id: str, message: str) -> None:
     append_display_record(path, {"type": "turn_start", "turn_id": turn_id, "message": message})
 
@@ -328,6 +497,8 @@ def load_history_file(path: Path) -> list[ChatMessage]:
             raw = json.loads(line)
         except json.JSONDecodeError as error:
             raise HistoryError(f"Invalid JSON in {path} at line {line_number}: {error}") from error
+        if isinstance(raw, dict) and raw.get("type") in {SESSION_STATE_RECORD, TOKEN_USAGE_RECORD}:
+            continue
         messages.append(_message_from_dict(raw, path, line_number))
 
     if not messages:
@@ -375,6 +546,9 @@ def list_history_entries(agent_dir: Path) -> list[HistoryEntry]:
             path = session_dir / str(metadata.get("messages_path") or MESSAGES_FILE)
             display_path = session_dir / str(metadata.get("display_path") or DISPLAY_FILE)
             transcript_path = session_dir / str(metadata.get("transcript_path") or TRANSCRIPT_FILE)
+            model_state = _model_state_from_dict(metadata.get("model_state"))
+            if model_state is None:
+                model_state = load_transcript_model_state(transcript_path)
             messages = load_history_file(path)
             stat = path.stat()
         except (HistoryError, OSError):
@@ -389,6 +563,7 @@ def list_history_entries(agent_dir: Path) -> list[HistoryEntry]:
                 display_path=display_path if display_path.exists() else None,
                 session_dir=session_dir,
                 transcript_path=transcript_path,
+                model_state=model_state,
             )
         )
     return sorted(entries, key=lambda entry: entry.modified_at, reverse=True)
@@ -459,6 +634,34 @@ def _optional_str(value: Any) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def _model_state_to_dict(state: SessionModelState) -> dict[str, Any]:
+    return {
+        "profile_name": state.profile_name,
+        "model": state.model,
+        "effort": state.effort,
+    }
+
+
+def _model_state_to_record(state: SessionModelState) -> dict[str, Any]:
+    return {
+        "type": SESSION_STATE_RECORD,
+        **_model_state_to_dict(state),
+        "updated_at": time.time(),
+    }
+
+
+def _model_state_from_dict(raw: Any) -> SessionModelState | None:
+    if not isinstance(raw, dict):
+        return None
+    profile_name = str(raw.get("profile_name") or "").strip()
+    model = str(raw.get("model") or "").strip()
+    effort_value = raw.get("effort")
+    effort = str(effort_value).strip().lower() if effort_value is not None else None
+    if not profile_name and not model:
+        return None
+    return SessionModelState(profile_name=profile_name, model=model, effort=effort or None)
 
 
 def _load_session_metadata(path: Path) -> dict[str, Any]:

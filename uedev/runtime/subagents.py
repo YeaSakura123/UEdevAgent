@@ -19,12 +19,14 @@ from ..ui.events import (
     tool_error_event,
     tool_result_event,
     tool_start_event,
+    usage_event,
 )
 from .context import estimate_tokens, is_runtime_state_message, repair_tool_call_messages
 from .history import (
     append_display_event,
     append_display_turn_start,
     append_history_message,
+    append_transcript_token_usage,
     load_history_file,
     write_history_messages,
 )
@@ -124,16 +126,23 @@ class SubagentManager:
         specs: list[SubagentSpec],
         main_messages: list[ChatMessage],
         subagents_dir: Path,
+        parent_turn_id: str = "",
     ) -> list[SubagentResult]:
         if not specs:
             return []
         for spec in specs:
             self.validate_spec(spec)
         with ThreadPoolExecutor(max_workers=len(specs), thread_name_prefix="uedev-subagent") as executor:
-            futures = [executor.submit(self.run_one, spec, main_messages, subagents_dir) for spec in specs]
+            futures = [executor.submit(self.run_one, spec, main_messages, subagents_dir, parent_turn_id) for spec in specs]
             return [future.result() for future in futures]
 
-    def run_one(self, spec: SubagentSpec, main_messages: list[ChatMessage], subagents_dir: Path) -> SubagentResult:
+    def run_one(
+        self,
+        spec: SubagentSpec,
+        main_messages: list[ChatMessage],
+        subagents_dir: Path,
+        parent_turn_id: str = "",
+    ) -> SubagentResult:
         self.validate_spec(spec)
         profile = self.model_profile_provider()
         record = self._new_record(spec, profile, subagents_dir)
@@ -154,6 +163,27 @@ class SubagentManager:
                 append_display_event(display_path, thinking_event(step, total_steps, turn_id))
                 repair_tool_call_messages(child_messages, require_reasoning_content=profile.requires_reasoning_content)
                 response = call_model(child_messages, profile, tools=subagent_tools)
+                if response.usage is not None:
+                    usage_payload: dict[str, object] = {
+                        "request_id": f"req_{uuid4().hex}",
+                        "created_at": time.time(),
+                        "turn_id": parent_turn_id or turn_id,
+                        "subagent_turn_id": turn_id,
+                        "purpose": "subagent",
+                        "subagent_id": record.id,
+                        "profile_name": profile.name,
+                        "model": profile.model,
+                        "api_mode": "responses" if profile.response else "chat_completions",
+                        "effort": profile.effort,
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                        "cached_input_tokens": response.usage.cached_input_tokens,
+                        "reasoning_tokens": response.usage.reasoning_tokens,
+                        "source": response.usage.source,
+                    }
+                    append_transcript_token_usage(subagents_dir.parent / "transcript.jsonl", usage_payload)
+                    append_display_event(display_path, usage_event(usage_payload, turn_id))
                 if response.tool_calls:
                     assistant = ChatMessage(
                         role="assistant",

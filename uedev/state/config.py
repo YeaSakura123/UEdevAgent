@@ -26,6 +26,7 @@ DEFAULT_PERMISSION_DENIALS = 2
 DEFAULT_NO_PROGRESS_ROUNDS = 3
 DEFAULT_OUTPUT_TOKEN_SOFT_RATIO = 0.8
 DEFAULT_CONTEXT_COMPACT_RATIO = 0.9
+VALID_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_WORKSPACE_EXCLUDED_DIRS = (
     ".agent",
     ".git",
@@ -76,7 +77,8 @@ class ModelProfile:
     api_key: str
     context_window: int = DEFAULT_CONTEXT_WINDOW
     timeout_seconds: int = DEFAULT_MODEL_TIMEOUT_SECONDS
-    gpt_model: bool = False
+    response: bool = False
+    effort: str | None = None
     requires_reasoning_content: bool = False
     responses: dict[str, Any] = field(default_factory=dict)
 
@@ -136,8 +138,9 @@ def system_config_template() -> dict[str, Any]:
         "default_model": "openai-gpt",
         "models": {
             "openai-gpt": {
-                "gpt_model": True,
+                "response": True,
                 "model": "gpt-5",
+                "effort": "medium",
                 "base_url": "https://api.openai.com/v1",
                 "api_key": "",
                 "context_window": DEFAULT_CONTEXT_WINDOW,
@@ -145,7 +148,7 @@ def system_config_template() -> dict[str, Any]:
                 "responses": default_responses_options(),
             },
             "compatible-chat": {
-                "gpt_model": False,
+                "response": False,
                 "model": "",
                 "base_url": "https://your.api.com/v1",
                 "api_key": "",
@@ -188,7 +191,6 @@ def default_responses_options() -> dict[str, Any]:
         {
             "store": False,
             "reasoning": {
-                "effort": None,
                 "summary": None,
             },
             "text": {
@@ -263,13 +265,20 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
             raise ConfigError(f"Model profile names must be non-empty strings: {config_path}")
         if not isinstance(raw, dict):
             raise ConfigError(f"Model profile {name!r} must be an object: {config_path}")
-        gpt_model = _optional_bool(raw.get("gpt_model"), False, config_path, f"models.{name}.gpt_model")
+        response = _optional_bool(raw.get("response"), False, config_path, f"models.{name}.response")
         requires_reasoning_content = _optional_bool(
             raw.get("requires_reasoning_content"),
             False,
             config_path,
             f"models.{name}.requires_reasoning_content",
         )
+        responses = _parse_responses_options(raw.get("responses"), config_path, f"models.{name}.responses") if response else {}
+        configured_effort = _optional_str_or_none(raw.get("effort"), config_path, f"models.{name}.effort")
+        if configured_effort is not None:
+            configured_effort = configured_effort.lower()
+            if configured_effort not in VALID_REASONING_EFFORTS:
+                allowed = ", ".join(VALID_REASONING_EFFORTS)
+                raise ConfigError(f"models.{name}.effort must be one of {allowed}: {config_path}")
         profile = ModelProfile(
             name=name,
             model=str(raw.get("model") or "").strip(),
@@ -282,17 +291,20 @@ def load_system_config(path: Path | None = None) -> SystemConfig:
                 config_path,
                 f"models.{name}.timeout_seconds",
             ),
-            gpt_model=gpt_model,
-            requires_reasoning_content=requires_reasoning_content and not gpt_model,
-            responses=_parse_responses_options(raw.get("responses"), config_path, f"models.{name}.responses") if gpt_model else {},
+            response=response,
+            effort=configured_effort,
+            requires_reasoning_content=requires_reasoning_content and not response,
+            responses=responses,
         )
         models[name] = profile
 
-    default_model = str(data.get("default_model") or "").strip()
-    if not default_model:
+    default_selector = str(data.get("default_model") or "").strip()
+    default_model = _resolve_model_profile_name(default_selector, models) if default_selector else None
+    if default_model is None:
+        # Profile keys are CLI display names. Renaming one must not make the
+        # whole configuration unusable because default_model still contains
+        # the former display name; preserve the existing first-profile default.
         default_model = next(iter(models))
-    if default_model not in models:
-        raise ConfigError(f"default_model {default_model!r} is not defined in models: {config_path}")
 
     raw_ue = data.get("ue", {})
     if raw_ue is None:
@@ -384,14 +396,11 @@ def _read_project_config_data(cwd: Path) -> dict[str, Any]:
 def resolve_model_profile(cwd: Path, system_config: SystemConfig | None = None) -> ModelProfile:
     config = system_config or load_system_config()
     project = load_project_config(cwd)
-    model_name = project.active_model or config.default_model
-    profile = config.models.get(model_name)
-    if profile is None:
-        raise ConfigError(
-            f"Active model {model_name!r} is not defined in {config.path}. "
-            "Use /model to choose a configured profile."
-        )
-    return profile
+    if project.active_model:
+        profile_name = _resolve_model_profile_name(project.active_model, config.models)
+        if profile_name is not None:
+            return config.models[profile_name]
+    return config.models[config.default_model]
 
 
 def resolve_subagent_model_profile(
@@ -401,19 +410,32 @@ def resolve_subagent_model_profile(
 ) -> ModelProfile:
     config = system_config or load_system_config()
     if config.subagent_model_profile:
-        profile = config.models.get(config.subagent_model_profile)
-        if profile is None:
+        profile_name = _resolve_model_profile_name(config.subagent_model_profile, config.models)
+        if profile_name is None:
             raise ConfigError(
                 f"subagents.model_profile {config.subagent_model_profile!r} is not defined in models: {config.path}"
             )
-        return profile
+        return config.models[profile_name]
     return main_profile or resolve_model_profile(cwd, config)
 
 
 def active_model_name(cwd: Path, system_config: SystemConfig | None = None) -> str:
     config = system_config or load_system_config()
-    project = load_project_config(cwd)
-    return project.active_model or config.default_model
+    return resolve_model_profile(cwd, config).name
+
+
+def _resolve_model_profile_name(selector: str, models: dict[str, ModelProfile]) -> str | None:
+    """Resolve a display name or an actual API model identifier to a profile name."""
+    if selector in models:
+        return selector
+    folded = selector.casefold()
+    display_matches = [name for name in models if name.casefold() == folded]
+    if len(display_matches) == 1:
+        return display_matches[0]
+    model_matches = [name for name, profile in models.items() if profile.model == selector]
+    if len(model_matches) == 1:
+        return model_matches[0]
+    return None
 
 
 def format_model_profiles(cwd: Path, system_config: SystemConfig | None = None) -> str:
@@ -429,8 +451,9 @@ def format_model_profiles(cwd: Path, system_config: SystemConfig | None = None) 
         suffix = f" ({', '.join(markers)})" if markers else ""
         key_state = "set" if profile.api_key else "missing"
         lines.append(
-            f"- {name}{suffix}: {profile.model or '(missing model)'} "
-            f"mode={'responses' if profile.gpt_model else 'chat_completions'} "
+            f"- {name}{suffix}: "
+            f"mode={'responses' if profile.response else 'chat_completions'} "
+            f"effort={profile.effort or 'auto'} "
             f"context_window={profile.context_window} "
             f"timeout_seconds={profile.timeout_seconds} "
             f"requires_reasoning_content={profile.requires_reasoning_content} "
@@ -539,7 +562,7 @@ def _parse_responses_options(raw: object, config_path: Path, label: str) -> dict
     if "reasoning" in raw:
         reasoning = raw.get("reasoning")
         if reasoning is None:
-            options["reasoning"] = {"effort": None, "summary": None}
+            options["reasoning"] = {"summary": None}
         elif not isinstance(reasoning, dict):
             raise ConfigError(f"{label}.reasoning must be an object or null: {config_path}")
         else:

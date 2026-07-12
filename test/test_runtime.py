@@ -28,9 +28,9 @@ from uedev.tools.background import BackgroundManager
 from uedev.state.config import ConfigError, ModelProfile, RuntimeBudgetConfig, agent_dir, default_responses_options, load_project_config, load_system_config, resolve_model_profile
 from uedev.runtime.context import SUMMARY_PREFIX, estimate_tokens, micro_compact, repair_tool_call_messages
 from uedev.ui.events import final_event, thinking_event, tool_error_event, tool_result_event, tool_start_event
-from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file, load_session_metadata
+from uedev.runtime.history import HistoryRecorder, load_display_history, load_history_file, load_session_metadata, load_transcript_token_usage
 from uedev.runtime.subagents import SubagentSpec
-from uedev.llm.client import ChatMessage, ModelResponse, ModelStreamEvent, ToolCall, _serialize_message, call_model, call_model_stream
+from uedev.llm.client import ChatMessage, ModelResponse, ModelStreamEvent, TokenUsage, ToolCall, _serialize_message, call_model, call_model_stream
 from uedev.runtime.agent import (
     SLASH_COMMANDS,
     AgentOptions,
@@ -153,8 +153,8 @@ class LlmMessageTests(unittest.TestCase):
         class FakeCompletions:
             def create(self, **kwargs):
                 captured.update(kwargs)
-                message = SimpleNamespace(content="done", tool_calls=[], reasoning_content="thinking")
-                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+                delta = SimpleNamespace(content="done", tool_calls=[], reasoning_content="thinking")
+                return iter([SimpleNamespace(choices=[SimpleNamespace(delta=delta)])])
 
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
         profile = ModelProfile(
@@ -169,13 +169,14 @@ class LlmMessageTests(unittest.TestCase):
             response = call_model([ChatMessage(role="user", content="hello")], profile)
 
         self.assertEqual(response.reasoning_content, "thinking")
+        self.assertTrue(captured["stream"])
         self.assertNotIn("reasoning_content", captured["messages"][0])
 
     def test_call_model_reads_reasoning_content_from_model_extra(self) -> None:
         class FakeCompletions:
             def create(self, **kwargs):
-                message = SimpleNamespace(content="done", tool_calls=[], model_extra={"reasoning_content": "extra thinking"})
-                return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+                delta = SimpleNamespace(content="done", tool_calls=[], model_extra={"reasoning_content": "extra thinking"})
+                return iter([SimpleNamespace(choices=[SimpleNamespace(delta=delta)])])
 
         fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
         profile = ModelProfile(
@@ -190,13 +191,93 @@ class LlmMessageTests(unittest.TestCase):
 
         self.assertEqual(response.reasoning_content, "extra thinking")
 
-    def test_call_model_uses_responses_options_and_adapted_tools_for_gpt_model_profile(self) -> None:
+    def test_chat_completions_sends_profile_effort_as_reasoning_effort(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                delta = SimpleNamespace(content="done", tool_calls=[])
+                usage = SimpleNamespace(
+                    prompt_tokens=120,
+                    completion_tokens=30,
+                    total_tokens=150,
+                    prompt_cache_hit_tokens=80,
+                    completion_tokens_details=SimpleNamespace(reasoning_tokens=20),
+                )
+                return iter(
+                    [
+                        SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None),
+                        SimpleNamespace(choices=[], usage=usage),
+                    ]
+                )
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        profile = ModelProfile(
+            name="Deepseek-V4Pro",
+            model="deepseek-v4-pro",
+            base_url="https://api.deepseek.com/v1",
+            api_key="key",
+            effort="xhigh",
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile)
+
+        self.assertEqual(response.content, "done")
+        self.assertEqual(captured["reasoning_effort"], "xhigh")
+        self.assertTrue(captured["stream"])
+        self.assertEqual(captured["stream_options"], {"include_usage": True})
+        self.assertEqual(response.usage, TokenUsage(120, 30, 150, cached_input_tokens=80, reasoning_tokens=20))
+
+    def test_all_chat_completions_profiles_request_stream_usage(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                delta = SimpleNamespace(content="done", tool_calls=[])
+                usage = SimpleNamespace(prompt_tokens=40, completion_tokens=10, total_tokens=50)
+                return iter(
+                    [
+                        SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None),
+                        SimpleNamespace(choices=[], usage=usage),
+                    ]
+                )
+
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+        profile = ModelProfile(
+            name="Any completion provider",
+            model="vendor/model-name",
+            base_url="https://relay.example.com/v1",
+            api_key="key",
+            response=False,
+        )
+
+        with patch("uedev.llm.client.OpenAI", return_value=fake_client):
+            response = call_model([ChatMessage(role="user", content="hello")], profile)
+
+        self.assertEqual(captured["stream_options"], {"include_usage": True})
+        self.assertEqual(response.usage, TokenUsage(40, 10, 50))
+
+    def test_call_model_uses_responses_options_and_adapted_tools_for_response_profile(self) -> None:
         captured: dict[str, object] = {}
 
         class FakeResponses:
             def create(self, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(output_text="done", output=[])
+                response = SimpleNamespace(
+                    output_text="done",
+                    output=[],
+                    usage=SimpleNamespace(
+                        input_tokens=200,
+                        output_tokens=50,
+                        total_tokens=250,
+                        input_tokens_details=SimpleNamespace(cached_tokens=125),
+                        output_tokens_details=SimpleNamespace(reasoning_tokens=40),
+                    ),
+                )
+                return iter([SimpleNamespace(type="response.completed", response=response)])
 
         fake_client = SimpleNamespace(responses=FakeResponses())
         options = default_responses_options()
@@ -210,7 +291,8 @@ class LlmMessageTests(unittest.TestCase):
             model="gpt-5",
             base_url="https://api.openai.com/v1",
             api_key="key",
-            gpt_model=True,
+            response=True,
+            effort="low",
             responses=options,
         )
         messages = [
@@ -232,10 +314,11 @@ class LlmMessageTests(unittest.TestCase):
             response = call_model(messages, profile, tools=tools)
 
         self.assertEqual(captured["model"], "gpt-5")
+        self.assertTrue(captured["stream"])
         self.assertEqual(captured["instructions"], "system prompt")
         self.assertEqual(captured["input"], [{"role": "user", "content": "hello"}])
         self.assertEqual(captured["store"], True)
-        self.assertEqual(captured["reasoning"], {"effort": "high"})
+        self.assertEqual(captured["reasoning"], {"effort": "low"})
         self.assertEqual(captured["max_output_tokens"], 512)
         self.assertEqual(captured["parallel_tool_calls"], True)
         self.assertEqual(captured["tool_choice"], "auto")
@@ -255,11 +338,13 @@ class LlmMessageTests(unittest.TestCase):
         self.assertNotIn("built_in_tools", captured)
         self.assertNotIn("strict_function_tools", captured)
         self.assertEqual(response.content, "done")
+        self.assertEqual(response.usage, TokenUsage(200, 50, 250, cached_input_tokens=125, reasoning_tokens=40))
 
     def test_call_model_reads_responses_output_text(self) -> None:
         class FakeResponses:
             def create(self, **kwargs):
-                return SimpleNamespace(output_text="done", output=[])
+                response = SimpleNamespace(output_text="done", output=[])
+                return iter([SimpleNamespace(type="response.completed", response=response)])
 
         fake_client = SimpleNamespace(responses=FakeResponses())
         profile = ModelProfile(
@@ -267,7 +352,7 @@ class LlmMessageTests(unittest.TestCase):
             model="gpt-5",
             base_url="https://api.openai.com/v1",
             api_key="key",
-            gpt_model=True,
+            response=True,
             responses=default_responses_options(),
         )
 
@@ -282,7 +367,8 @@ class LlmMessageTests(unittest.TestCase):
         class FakeResponses:
             def create(self, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(output_text="done", output=[])
+                response = SimpleNamespace(output_text="done", output=[])
+                return iter([SimpleNamespace(type="response.completed", response=response)])
 
         options = default_responses_options()
         options["built_in_tools"]["web_search"]["enabled"] = True
@@ -292,7 +378,7 @@ class LlmMessageTests(unittest.TestCase):
             model="gpt-5",
             base_url="https://api.openai.com/v1",
             api_key="key",
-            gpt_model=True,
+            response=True,
             responses=options,
         )
 
@@ -309,7 +395,8 @@ class LlmMessageTests(unittest.TestCase):
         class FakeResponses:
             def create(self, **kwargs):
                 captured.update(kwargs)
-                return SimpleNamespace(output_text="done", output=[])
+                response = SimpleNamespace(output_text="done", output=[])
+                return iter([SimpleNamespace(type="response.completed", response=response)])
 
         options = default_responses_options()
         options["built_in_tools"]["web_search"]["enabled"] = True
@@ -321,7 +408,7 @@ class LlmMessageTests(unittest.TestCase):
             model="gpt-5",
             base_url="https://api.openai.com/v1",
             api_key="key",
-            gpt_model=True,
+            response=True,
             responses=options,
         )
 
@@ -364,7 +451,7 @@ class LlmMessageTests(unittest.TestCase):
             model="gpt-5",
             base_url="https://api.openai.com/v1",
             api_key="key",
-            gpt_model=True,
+            response=True,
             responses=default_responses_options(),
         )
         tools = [
@@ -423,7 +510,7 @@ class AgentEventLoopTests(unittest.TestCase):
             event_types = [event.type for event in events]
             self.assertEqual(event_types[:3], ["thinking", "tool_start", "tool_result"])
             self.assertEqual(event_types[-1], "final")
-            self.assertEqual(events[1].name, "read_file")
+            self.assertEqual(events[2].name, "read_file")
             self.assertEqual(events[-1].message, "done")
 
     def test_responses_function_call_runs_existing_tool_and_round_trips_output(self) -> None:
@@ -434,7 +521,7 @@ class AgentEventLoopTests(unittest.TestCase):
                 config_path,
                 models={
                     "openai": {
-                        "gpt_model": True,
+                        "response": True,
                         "model": "gpt-5",
                         "base_url": "https://api.openai.com/v1",
                         "api_key": "key",
@@ -494,8 +581,12 @@ class AgentEventLoopTests(unittest.TestCase):
                 messages = [ChatMessage(role="system", content=runtime.system_prompt)]
                 events = list(runtime.run_turn_events(messages, "read a.txt", turn_id="turn-responses-tool"))
 
-            self.assertEqual([event.type for event in events], ["thinking", "tool_start", "tool_result", "thinking", "final"])
-            self.assertEqual(events[1].name, "read_file")
+            self.assertEqual(
+                [event.type for event in events],
+                ["thinking", "usage", "tool_start", "tool_result", "thinking", "usage", "final"],
+            )
+            self.assertEqual(events[2].name, "read_file")
+            self.assertEqual(events[1].usage["source"], "estimated")
             self.assertEqual(events[-1].message, "done")
             first_tools = captured_calls[0]["tools"]
             self.assertTrue(any(tool.get("name") == "read_file" and tool.get("strict") is False for tool in first_tools))
@@ -1412,7 +1503,10 @@ class AgentEventLoopTests(unittest.TestCase):
                 patch("uedev.state.config.default_system_config_path", return_value=config_path),
                 patch("uedev.runtime.subagents.time.time_ns", return_value=123),
                 patch("uedev.runtime.subagents.uuid4", return_value=FixedUuid()),
-                patch("uedev.runtime.subagents.call_model", return_value=ModelResponse("child result")),
+                patch(
+                    "uedev.runtime.subagents.call_model",
+                    return_value=ModelResponse("child result", usage=TokenUsage(90, 10, 100)),
+                ),
             ):
                 results = runtime.subagents.run_batch(
                     [SubagentSpec(agent_type="explorer", task="inspect collision")],
@@ -1423,6 +1517,9 @@ class AgentEventLoopTests(unittest.TestCase):
             self.assertEqual(results[0].record.id, "sa_123_2_deadbeef")
             self.assertTrue((subagents_dir / "sa_123_2_deadbeef").exists())
             self.assertEqual(runtime.subagents.list_records(subagents_dir)[0].id, "sa_123_2_deadbeef")
+            usage_records = load_transcript_token_usage(history.transcript_path or Path())
+            self.assertEqual(usage_records[0]["purpose"], "subagent")
+            self.assertEqual(usage_records[0]["total_tokens"], 100)
 
     def test_worker_subagent_requires_responsibility_and_paths(self) -> None:
         with workspace_temp_dir() as temp:

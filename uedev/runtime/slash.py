@@ -17,6 +17,8 @@ SLASH_COMMANDS = [
     ("/subagents", "Choose a subagent conversation to view."),
     ("/worktree", "Create a UE Git linked worktree from the current project."),
     ("/model", "Choose or list model profiles for this project."),
+    ("/effort", "Choose the reasoning effort for the current model."),
+    ("/usage", "Show token usage for the current session and latest turn."),
     ("/mcp", "Show configured MCP server status and tools."),
     ("/plan", "Enter, leave, or inspect Plan Mode."),
     ("/permissions", "Show or switch the current permission mode."),

@@ -6,7 +6,7 @@ import sys
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +16,8 @@ from ..state.config import (
     ConfigError,
     DEFAULT_WORKSPACE_EXCLUDED_DIRS,
     RuntimeBudgetConfig,
+    SystemConfig,
+    VALID_REASONING_EFFORTS,
     active_model_name,
     agent_dir,
     format_model_profiles,
@@ -56,15 +58,19 @@ from ..ui.events import (
     tool_error_event,
     tool_result_event,
     tool_start_event,
+    usage_event,
 )
 from .history import (
     HistoryError,
     HistoryRecorder,
+    SessionModelState,
     create_standalone_session_transcript_path,
     ensure_system_prompt,
     list_history_entries,
     load_session_metadata,
     load_history_file,
+    load_transcript_token_usage,
+    summarize_token_usage,
     update_session_active_plan,
 )
 from .options import AgentOptions
@@ -72,6 +78,7 @@ from ..llm.client import (
     ChatMessage,
     ModelResponse,
     ModelStreamEvent,
+    TokenUsage,
     call_model as _client_call_model,
     call_model_stream as _client_call_model_stream,
 )
@@ -142,10 +149,7 @@ def call_model_stream(
     if call_model is not _client_call_model:
         yield ModelStreamEvent(type="final", response=call_model(messages, profile, tools=tools))
         return
-    try:
-        yield from _client_call_model_stream(messages, profile, tools=tools)
-    except Exception:
-        yield ModelStreamEvent(type="final", response=call_model(messages, profile, tools=tools))
+    yield from _client_call_model_stream(messages, profile, tools=tools)
 
 
 FORCED_FINALIZATION_PROMPT = """You have reached the tool and step budget for this turn.
@@ -597,7 +601,10 @@ def _handle_plain_history(runtime: "AgentRuntime", session: PromptSession) -> li
         print(f"Failed to load history: {error}")
         return None
 
+    restored = runtime.restore_history_model_state(selected.model_state)
     print(f"Loaded history: {selected.path}")
+    if restored:
+        print(restored)
     return messages
 
 
@@ -612,6 +619,7 @@ class AgentRuntime:
         project_config = load_project_config(options.cwd)
         self.collaboration_mode: CollaborationMode = "default"
         self.permission_mode: PermissionMode = "full_access" if options.auto_approve else project_config.permission_mode
+        self.effort_overrides: dict[str, str] = {}
         self.todo_manager = TodoManager(self.agent_dir)
         self.task_manager = TaskManager(self.agent_dir / "tasks")
         self.plan_manager = PlanManager()
@@ -667,13 +675,17 @@ class AgentRuntime:
         goal_already_appended = bool(messages and messages[-1].role == "user" and messages[-1].content == goal)
         if goal_already_appended:
             messages.pop()
+        if history is not None:
+            self.record_history_model_state(history)
         context_threshold = self._context_threshold()
         if estimate_tokens([*messages, goal_message]) > context_threshold:
             try:
-                transcript = self._compact_messages(
+                transcript, compact_usage = self._compact_messages(
                     messages,
                     "automatic threshold before user turn",
                     transcript_path=history.ensure_transcript_path() if history is not None else None,
+                    history=history,
+                    turn_id=current_turn_id,
                 )
             except Exception as error:
                 yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
@@ -683,6 +695,8 @@ class AgentRuntime:
                 current_turn_id,
                 str(transcript),
             )
+            if compact_usage is not None:
+                yield compact_usage
         messages.append(goal_message)
         if history is not None:
             history.append(goal_message)
@@ -702,11 +716,13 @@ class AgentRuntime:
             self._inject_runtime_observations(messages)
             if estimate_tokens(messages) > context_threshold:
                 try:
-                    transcript = self._compact_messages(
+                    transcript, compact_usage = self._compact_messages(
                         messages,
                         "automatic threshold during turn",
                         preserve_last_user=True,
                         transcript_path=history.ensure_transcript_path() if history is not None else None,
+                        history=history,
+                        turn_id=current_turn_id,
                     )
                 except Exception as error:
                     yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
@@ -716,6 +732,8 @@ class AgentRuntime:
                     current_turn_id,
                     str(transcript),
                 )
+                if compact_usage is not None:
+                    yield compact_usage
                 self._inject_runtime_observations(messages)
             budget.next_model_request()
             yield thinking_event(step, budget.config.model_request_hard_limit, current_turn_id)
@@ -724,7 +742,8 @@ class AgentRuntime:
 
             try:
                 response: ModelResponse | None = None
-                for model_event in call_model_stream(messages, self.current_model_profile(), tools=self.tool_specs):
+                request_profile = self.current_model_profile()
+                for model_event in call_model_stream(messages, request_profile, tools=self.tool_specs):
                     if model_event.type == "delta":
                         if model_event.delta:
                             budget.total_output_tokens += _estimate_text_tokens(model_event.delta)
@@ -733,6 +752,15 @@ class AgentRuntime:
                     response = model_event.response
                 if response is None:
                     raise RuntimeError("Model stream ended without a final response.")
+                token_event = self._record_token_usage(
+                    response.usage,
+                    request_profile,
+                    current_turn_id,
+                    "main",
+                    history,
+                )
+                if token_event is not None:
+                    yield token_event
             except Exception as error:
                 yield stopped_event(str(error), current_turn_id, _duration_ms(started_at))
                 return
@@ -775,7 +803,12 @@ class AgentRuntime:
                                 standalone_history = HistoryRecorder(self.agent_dir, list(messages))
                                 standalone_subagents_dir = standalone_history.ensure_session() / "subagents"
                             subagents_dir = standalone_subagents_dir
-                        results = self.subagents.run_batch([spec for _, spec in subagent_specs], list(messages), subagents_dir)
+                        results = self.subagents.run_batch(
+                            [spec for _, spec in subagent_specs],
+                            list(messages),
+                            subagents_dir,
+                            parent_turn_id=current_turn_id,
+                        )
                         for (tool_call_id, _), result in zip(subagent_specs, results):
                             subagent_outputs[tool_call_id] = (result.output, result.record.status == "failed")
                     except Exception as error:
@@ -845,11 +878,13 @@ class AgentRuntime:
 
                     if action.name == "compact":
                         try:
-                            transcript = self._compact_messages(
+                            transcript, compact_usage = self._compact_messages(
                                 messages,
                                 "manual compact tool",
                                 preserve_last_user=True,
                                 transcript_path=history.ensure_transcript_path() if history is not None else None,
+                                history=history,
+                                turn_id=current_turn_id,
                             )
                         except Exception as error:
                             yield stopped_event(f"Conversation compact failed: {error}", current_turn_id, _duration_ms(started_at))
@@ -859,6 +894,8 @@ class AgentRuntime:
                             current_turn_id,
                             str(transcript),
                         )
+                        if compact_usage is not None:
+                            yield compact_usage
                         break
                 continue
 
@@ -937,8 +974,9 @@ class AgentRuntime:
             *messages,
             ChatMessage(role="system", content=FORCED_FINALIZATION_PROMPT),
         ]
+        profile = self.current_model_profile()
         try:
-            response = call_model(request, self.current_model_profile())
+            response = call_model(request, profile)
         except Exception as error:
             return incomplete_event(
                 self._render_incomplete_summary(
@@ -993,7 +1031,13 @@ class AgentRuntime:
         messages.append(assistant_message)
         if history is not None:
             history.append(assistant_message)
-        return final_event(final_answer, turn_id, _duration_ms(started_at))
+        token_event = self._record_token_usage(response.usage, profile, turn_id, "forced_finalization", history)
+        return final_event(
+            final_answer,
+            turn_id,
+            _duration_ms(started_at),
+            usage=token_event.usage if token_event is not None else None,
+        )
 
     def _render_incomplete_summary(
         self,
@@ -1066,6 +1110,12 @@ class AgentRuntime:
         if command == "/history":
             emit("Use /history inside chat to choose and load a previous conversation.")
             return True
+        if command == "/usage":
+            emit(self.render_token_usage(history))
+            return True
+        if raw_command.split(maxsplit=1)[0].lower() == "/usage":
+            emit("Usage: /usage")
+            return True
         if command == "/subagents":
             subagents_dir = history.session_dir / "subagents" if history is not None and history.session_dir is not None else None
             emit(self.subagents.render_list(subagents_dir))
@@ -1085,12 +1135,21 @@ class AgentRuntime:
             except ConfigError as error:
                 emit(f"Config error: {error}")
             return True
+        if command == "/effort" or command.startswith("/effort "):
+            result = self.handle_effort_command(raw_command)
+            emit(result)
+            if history is not None and result.startswith(("Reasoning effort set", "Reasoning effort reset")):
+                self.record_history_model_state(history)
+            return True
         if command == "/mcp":
             emit(self.mcp.render_status())
             return True
         if command.startswith("/model "):
             try:
-                emit(self.switch_model(raw_command.split(maxsplit=1)[1].strip()))
+                result = self.switch_model(raw_command.split(maxsplit=1)[1].strip())
+                emit(result)
+                if history is not None and result.startswith("Active model"):
+                    self.record_history_model_state(history)
             except ConfigError as error:
                 emit(f"Config error: {error}")
             return True
@@ -1114,15 +1173,19 @@ class AgentRuntime:
                 emit("Use /compact inside chat to compact the current conversation context.")
                 return True
             try:
-                transcript = self._compact_messages(
+                transcript, compact_usage = self._compact_messages(
                     messages,
                     "manual slash command",
                     transcript_path=history.ensure_transcript_path() if history is not None else None,
+                    history=history,
+                    turn_id=f"compact-{uuid.uuid4().hex[:8]}",
                 )
             except Exception as error:
                 emit(f"Conversation compact failed: {error}")
                 return True
             emit(f"Conversation compacted. Full transcript saved at: {transcript}")
+            if history is not None and compact_usage is not None:
+                history.record_event(compact_usage)
             return True
 
         emit(f"Unknown slash command: {query}")
@@ -1259,7 +1322,9 @@ class AgentRuntime:
         reason: str,
         preserve_last_user: bool = False,
         transcript_path: Path | None = None,
-    ) -> Path:
+        history: HistoryRecorder | None = None,
+        turn_id: str = "",
+    ) -> tuple[Path, AgentEvent | None]:
         original_messages = list(messages)
         transcript = save_transcript(
             original_messages,
@@ -1272,6 +1337,7 @@ class AgentRuntime:
 
         request = build_compaction_request(working_messages, reason)
         response = call_model(request, profile)
+        token_event = self._record_token_usage(response.usage, profile, turn_id, "compact", history)
         summary = response.content.strip()
         if not summary:
             raise RuntimeError("Compaction model returned an empty summary.")
@@ -1289,7 +1355,7 @@ class AgentRuntime:
 
         messages[:] = compacted
         repair_tool_call_messages(messages, require_reasoning_content=profile.requires_reasoning_content)
-        return transcript
+        return transcript, token_event
 
     # 内部函数：处理 _inject_runtime_observations 辅助逻辑，支撑 agent 主循环、chat 界面、工具分发和运行时观察。
     def _inject_runtime_observations(self, messages: list[ChatMessage]) -> None:
@@ -1368,13 +1434,143 @@ class AgentRuntime:
         return False
 
     def current_model_profile(self):
-        return resolve_model_profile(self.options.cwd)
+        profile = resolve_model_profile(self.options.cwd)
+        override = self.effort_overrides.get(profile.name)
+        return replace(profile, effort=override) if override is not None else profile
 
     def current_subagent_model_profile(self):
         return resolve_subagent_model_profile(self.options.cwd, self.current_model_profile())
 
     def render_models(self) -> str:
         return format_model_profiles(self.options.cwd)
+
+    def effort_levels(self) -> tuple[str, ...]:
+        profile = resolve_model_profile(self.options.cwd)
+        if profile.response or profile.effort or "deepseek" in profile.model.casefold():
+            return VALID_REASONING_EFFORTS
+        return ()
+
+    def current_effort(self) -> str:
+        return self.current_model_profile().effort or "auto"
+
+    def default_effort(self) -> str:
+        return resolve_model_profile(self.options.cwd).effort or "auto"
+
+    def record_history_model_state(self, history: HistoryRecorder) -> None:
+        profile = self.current_model_profile()
+        history.update_model_state(profile.name, profile.model, profile.effort)
+
+    def _record_token_usage(
+        self,
+        usage: TokenUsage | None,
+        profile: Any,
+        turn_id: str,
+        purpose: str,
+        history: HistoryRecorder | None,
+    ) -> AgentEvent | None:
+        if usage is None:
+            return None
+        payload: dict[str, object] = {
+            "request_id": f"req_{uuid.uuid4().hex}",
+            "created_at": time.time(),
+            "turn_id": turn_id,
+            "purpose": purpose,
+            "profile_name": profile.name,
+            "model": profile.model,
+            "api_mode": "responses" if profile.response else "chat_completions",
+            "effort": profile.effort,
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "total_tokens": usage.total_tokens,
+            "cached_input_tokens": usage.cached_input_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "source": usage.source,
+        }
+        if history is not None:
+            history.record_token_usage(payload)
+        return usage_event(payload, turn_id)
+
+    def render_token_usage(self, history: HistoryRecorder | None) -> str:
+        path = history.transcript_path if history is not None else None
+        if path is None or not path.exists():
+            return "No token usage recorded for the current session."
+        records = load_transcript_token_usage(path)
+        if not records:
+            return "No token usage recorded for the current session."
+        total = summarize_token_usage(records)
+        latest_turn_id = next((str(record.get("turn_id") or "") for record in reversed(records) if record.get("turn_id")), "")
+        latest = [record for record in records if str(record.get("turn_id") or "") == latest_turn_id]
+        latest_total = summarize_token_usage(latest)
+        lines = ["Session token usage", self._format_token_usage_summary(total)]
+        if latest:
+            lines.extend([f"Latest turn: {latest_turn_id}", self._format_token_usage_summary(latest_total), "Requests:"])
+            for index, record in enumerate(latest, start=1):
+                source = f" {record.get('source')}" if record.get("source") == "estimated" else ""
+                lines.append(
+                    f"{index}. {record.get('purpose') or 'model'}: "
+                    f"{int(record.get('total_tokens') or 0):,} total "
+                    f"({int(record.get('input_tokens') or 0):,} in / "
+                    f"{int(record.get('output_tokens') or 0):,} out){source}"
+                )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_token_usage_summary(summary: dict[str, int]) -> str:
+        source = f" · {summary['estimated_requests']} estimated" if summary["estimated_requests"] else ""
+        return (
+            f"{summary['requests']} requests · {summary['total_tokens']:,} total · "
+            f"{summary['input_tokens']:,} in · {summary['output_tokens']:,} out · "
+            f"{summary['cached_input_tokens']:,} cached · {summary['reasoning_tokens']:,} reasoning{source}"
+        )
+
+    def restore_history_model_state(self, state: SessionModelState | None) -> str | None:
+        if state is None:
+            return None
+        config = load_system_config()
+        matches = [name for name, profile in config.models.items() if state.model and profile.model == state.model]
+        profile_name: str | None = matches[0] if len(matches) == 1 else None
+        if profile_name is None and state.profile_name:
+            folded = state.profile_name.casefold()
+            display_matches = [name for name in config.models if name.casefold() == folded]
+            if len(display_matches) == 1:
+                profile_name = display_matches[0]
+        if profile_name is None:
+            saved = state.model or state.profile_name
+            return f"History model {saved!r} is not available; kept {self.current_model_profile().name}."
+
+        profile = config.models[profile_name]
+        self._save_active_profile(profile_name, config)
+        if state.effort is None:
+            self.effort_overrides.pop(profile_name, None)
+        elif state.effort in VALID_REASONING_EFFORTS:
+            self.effort_overrides[profile_name] = state.effort
+        else:
+            self.effort_overrides.pop(profile_name, None)
+            return (
+                f"Restored model {profile.name}, but saved effort {state.effort!r} is invalid; "
+                f"using {profile.effort or 'auto'}."
+            )
+        return f"Restored model {profile.name} with effort {self.current_effort()}."
+
+    def handle_effort_command(self, raw_command: str) -> str:
+        levels = self.effort_levels()
+        profile = resolve_model_profile(self.options.cwd)
+        if not levels:
+            return f"Model {profile.name} does not support configurable reasoning effort."
+        parts = raw_command.split(maxsplit=1)
+        if len(parts) == 1:
+            return (
+                f"Reasoning effort for {profile.name}: {self.current_effort()}\n"
+                f"Available levels: {', '.join(levels)}"
+            )
+        effort = parts[1].strip().lower()
+        if effort == "reset":
+            self.effort_overrides.pop(profile.name, None)
+            return f"Reasoning effort reset to {profile.effort or 'auto'} for {profile.name}."
+        if effort not in levels:
+            return f"Unknown effort: {effort}\nAvailable levels: {', '.join(levels)}"
+        self.effort_overrides[profile.name] = effort
+        return f"Reasoning effort set to {effort} for {profile.name}."
 
     def _append_budget_reminders(self, messages: list[ChatMessage], budget: TurnBudgetState) -> None:
         reminders: list[str] = []
@@ -1442,15 +1638,24 @@ class AgentRuntime:
         if name.lower() == "reset":
             reset_project_active_model(self.options.cwd)
             profile = resolve_model_profile(self.options.cwd)
-            return f"Active model reset to default profile {profile.name}: {profile.model or '(missing model)'}"
+            return f"Active model reset to default profile {profile.name}"
 
         config = load_system_config()
         if name not in config.models:
             available = ", ".join(sorted(config.models)) or "(none)"
             return f"Unknown model profile: {name}\nAvailable profiles: {available}"
-        save_project_active_model(self.options.cwd, name)
         profile = config.models[name]
-        return f"Active model set to {profile.name}: {profile.model or '(missing model)'}"
+        self._save_active_profile(name, config)
+        return f"Active model set to {profile.name}"
+
+    def _save_active_profile(self, name: str, config: SystemConfig) -> None:
+        profile = config.models[name]
+        # Persist the API model identifier so changing the outer profile key
+        # (the CLI display name) does not invalidate the project selection.
+        model_is_unique = bool(profile.model) and sum(
+            candidate.model == profile.model for candidate in config.models.values()
+        ) == 1
+        save_project_active_model(self.options.cwd, profile.model if model_is_unique else name)
 
     def _confirm(self, command: str, reason: str) -> bool:
         return self.approval_provider(command, reason)

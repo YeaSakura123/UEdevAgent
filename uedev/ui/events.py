@@ -8,6 +8,7 @@ AgentEventType = Literal[
     "thinking",
     "assistant_delta",
     "budget",
+    "usage",
     "compact",
     "plan",
     "tool_start",
@@ -32,6 +33,7 @@ class AgentEvent:
     summary: str = ""
     duration_ms: int = 0
     is_error: bool = False
+    usage: dict[str, object] = field(default_factory=dict)
 
 
 def thinking_event(step: int, total: int, turn_id: str = "") -> AgentEvent:
@@ -51,6 +53,10 @@ def budget_event(message: str, turn_id: str = "", duration_ms: int = 0, summary:
         duration_ms=duration_ms,
         summary=summary,
     )
+
+
+def usage_event(usage: dict[str, object], turn_id: str = "") -> AgentEvent:
+    return AgentEvent(type="usage", turn_id=turn_id, status="completed", usage=usage)
 
 
 def compact_event(message: str, turn_id: str = "", output: str = "") -> AgentEvent:
@@ -73,7 +79,13 @@ def tool_error_event(name: str, message: str, turn_id: str = "") -> AgentEvent:
     return AgentEvent(type="tool_error", name=name, message=message, turn_id=turn_id, status="failed", is_error=True)
 
 
-def final_event(answer: str, turn_id: str = "", duration_ms: int = 0, summary: str = "") -> AgentEvent:
+def final_event(
+    answer: str,
+    turn_id: str = "",
+    duration_ms: int = 0,
+    summary: str = "",
+    usage: dict[str, object] | None = None,
+) -> AgentEvent:
     return AgentEvent(
         type="final",
         message=answer,
@@ -81,6 +93,7 @@ def final_event(answer: str, turn_id: str = "", duration_ms: int = 0, summary: s
         status="final",
         duration_ms=duration_ms,
         summary=summary,
+        usage=usage or {},
     )
 
 

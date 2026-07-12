@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ..llm.client import ChatMessage
-from .history import message_to_dict
+from .history import write_transcript_messages_preserving_records
 
 
 SUMMARY_PREFIX = "[Conversation summary]"
@@ -90,9 +90,7 @@ def save_transcript(messages: list[ChatMessage], transcript_target: Path) -> Pat
     else:
         transcript_target.mkdir(parents=True, exist_ok=True)
         path = transcript_target / f"transcript_{time.time_ns()}.jsonl"
-    with path.open("w", encoding="utf-8") as handle:
-        for message in messages:
-            handle.write(json.dumps(message_to_dict(message), ensure_ascii=False) + "\n")
+    write_transcript_messages_preserving_records(path, messages)
     return path
 
 

@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import json
 import unittest
 import uuid
 from pathlib import Path
@@ -9,13 +10,18 @@ from contextlib import contextmanager
 from uedev.runtime.history import (
     HistoryError,
     HistoryRecorder,
+    SessionModelState,
     append_display_event,
     append_display_turn_start,
     load_display_history,
     list_history_entries,
     load_history_file,
+    load_session_metadata,
+    load_transcript_token_usage,
+    summarize_token_usage,
     write_history_messages,
 )
+from uedev.runtime.context import save_transcript
 from uedev.ui.events import final_event, thinking_event, tool_result_event, tool_start_event
 from uedev.ui.events import plan_event
 from uedev.llm.client import ChatMessage, ToolCall
@@ -104,6 +110,58 @@ class HistoryTests(unittest.TestCase):
             self.assertTrue(((recorder.session_dir or Path()) / "metadata.json").exists())
             self.assertEqual((recorder.session_dir or Path()).relative_to(agent_dir).parts[0], "sessions")
             self.assertEqual(len((recorder.session_dir or Path()).relative_to(agent_dir).parts), 5)
+
+    def test_model_state_is_saved_in_metadata_and_transcript(self) -> None:
+        with workspace_temp_dir() as root:
+            recorder = HistoryRecorder(root / ".agent", [ChatMessage(role="system", content="system")])
+            recorder.append(ChatMessage(role="user", content="hello"))
+            recorder.update_model_state("Renamed GPT", "provider/gpt-5.5", "xhigh")
+
+            metadata = load_session_metadata(recorder.session_dir or Path())
+            transcript_path = recorder.transcript_path or Path()
+            transcript_record = json.loads(transcript_path.read_text(encoding="utf-8").splitlines()[0])
+            entries = list_history_entries(root / ".agent")
+
+            self.assertEqual(metadata["model_state"]["profile_name"], "Renamed GPT")
+            self.assertEqual(metadata["model_state"]["model"], "provider/gpt-5.5")
+            self.assertEqual(metadata["model_state"]["effort"], "xhigh")
+            self.assertEqual(transcript_record["type"], "session_state")
+            self.assertEqual(entries[0].model_state, SessionModelState("Renamed GPT", "provider/gpt-5.5", "xhigh"))
+
+            save_transcript([ChatMessage(role="user", content="before compact")], transcript_path)
+            compacted_lines = transcript_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(json.loads(compacted_lines[0])["type"], "session_state")
+            self.assertEqual(load_history_file(transcript_path)[0].content, "before compact")
+
+    def test_token_usage_is_saved_and_survives_transcript_compaction(self) -> None:
+        with workspace_temp_dir() as root:
+            recorder = HistoryRecorder(root / ".agent", [ChatMessage(role="system", content="system")])
+            recorder.append(ChatMessage(role="user", content="hello"))
+            recorder.record_token_usage(
+                {
+                    "request_id": "req_1",
+                    "turn_id": "turn-1",
+                    "purpose": "main",
+                    "input_tokens": 100,
+                    "output_tokens": 25,
+                    "total_tokens": 125,
+                    "cached_input_tokens": 60,
+                    "reasoning_tokens": 10,
+                    "source": "provider",
+                }
+            )
+            transcript_path = recorder.transcript_path or Path()
+
+            save_transcript([ChatMessage(role="user", content="compacted source")], transcript_path)
+            recorder.append(ChatMessage(role="assistant", content="done"))
+
+            records = load_transcript_token_usage(transcript_path)
+            summary = summarize_token_usage(records)
+            metadata = load_session_metadata(recorder.session_dir or Path())
+            self.assertEqual(len(records), 1)
+            self.assertEqual(summary["total_tokens"], 125)
+            self.assertEqual(metadata["token_usage"]["cached_input_tokens"], 60)
+            self.assertEqual(load_history_file(transcript_path)[0].content, "compacted source")
 
     def test_display_history_round_trips_turn_and_events(self) -> None:
         with workspace_temp_dir() as root:

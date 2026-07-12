@@ -654,12 +654,24 @@ class ChatTuiApplication:
                 if selected is not None:
                     try:
                         self.renderer.print_system(self.runtime.switch_model(selected))
+                        self.runtime.record_history_model_state(self.history)
                     except ConfigError as error:
                         self.renderer.print_system(f"Config error: {error}")
                 continue
 
             if query.lower().startswith("/model "):
                 self.renderer.print_system("Use /model and choose a profile with the arrow keys.")
+                continue
+
+            if query.lower() == "/effort":
+                selected = self.prompt_effort_selection(session)
+                if selected is not None:
+                    self.renderer.print_system(self.runtime.handle_effort_command(f"/effort {selected}"))
+                    self.runtime.record_history_model_state(self.history)
+                continue
+
+            if query.lower().startswith("/effort "):
+                self.renderer.print_system("Use /effort and choose a level with the arrow keys.")
                 continue
 
             if query.lower() == "/permissions":
@@ -1227,6 +1239,12 @@ class ChatTuiApplication:
         if lowered.startswith("/model "):
             self.renderer.print_system("Use /model and choose a profile with the arrow keys.")
             return
+        if lowered == "/effort":
+            self._open_effort_modal()
+            return
+        if lowered.startswith("/effort "):
+            self.renderer.print_system("Use /effort and choose a level with the arrow keys.")
+            return
         if lowered == "/permissions":
             self._open_permission_modal()
             return
@@ -1286,12 +1304,12 @@ class ChatTuiApplication:
                 markers.append("active")
             if name == config.default_model:
                 markers.append("default")
-            if profile.gpt_model:
+            if profile.response:
                 markers.append("responses")
             if profile.requires_reasoning_content:
                 markers.append("reasoning")
             suffix = f" ({', '.join(markers)})" if markers else ""
-            labels.append(f"{name} - {profile.model or '(missing model)'}{suffix}")
+            labels.append(f"{name}{suffix}")
             values.append(name)
         labels.append(f"Reset to default ({config.default_model})")
         values.append("reset")
@@ -1299,10 +1317,28 @@ class ChatTuiApplication:
         def select(value: object) -> None:
             try:
                 self.renderer.print_system(self.runtime.switch_model(str(value)))
+                self.runtime.record_history_model_state(self.history)
             except ConfigError as error:
                 self.renderer.print_system(f"Config error: {error}")
 
         self._set_selection_modal("Model", labels, values, select)
+
+    def _open_effort_modal(self) -> None:
+        levels = self.runtime.effort_levels()
+        if not levels:
+            self.renderer.print_system(self.runtime.handle_effort_command("/effort"))
+            return
+        current = self.runtime.current_effort()
+        labels = [f"{level}{' (active)' if level == current else ''}" for level in levels]
+        values: list[object] = list(levels)
+        labels.append(f"Reset to default ({self.runtime.default_effort()})")
+        values.append("reset")
+
+        def select(value: object) -> None:
+            self.renderer.print_system(self.runtime.handle_effort_command(f"/effort {value}"))
+            self.runtime.record_history_model_state(self.history)
+
+        self._set_selection_modal("Effort", labels, values, select)
 
     def _open_permission_modal(self) -> None:
         labels = [f"/permissions {permission_mode_label(mode)}" for mode in VALID_PERMISSION_MODES]
@@ -1507,12 +1543,12 @@ class ChatTuiApplication:
                 markers.append("active")
             if name == config.default_model:
                 markers.append("default")
-            if profile.gpt_model:
+            if profile.response:
                 markers.append("responses")
             if profile.requires_reasoning_content:
                 markers.append("reasoning")
             suffix = f" ({', '.join(markers)})" if markers else ""
-            label = f"{name} - {profile.model or '(missing model)'}{suffix}"
+            label = f"{name}{suffix}"
             labels.append(label)
             by_label[label] = name
 
@@ -1542,6 +1578,41 @@ class ChatTuiApplication:
             self.renderer.print_system(f"Unknown model selection: {selected}")
         return choice
 
+    def prompt_effort_selection(self, session: PromptSession) -> str | None:
+        from ..runtime.agent import create_chat_prompt_options
+
+        levels = self.runtime.effort_levels()
+        if not levels:
+            self.renderer.print_system(self.runtime.handle_effort_command("/effort"))
+            return None
+        current = self.runtime.current_effort()
+        labels = [f"{level}{' (active)' if level == current else ''}" for level in levels]
+        by_label = {label: level for label, level in zip(labels, levels)}
+        reset_label = f"Reset to default ({self.runtime.default_effort()})"
+        labels.append(reset_label)
+        by_label[reset_label] = "reset"
+
+        def start_completion() -> None:
+            session.app.current_buffer.start_completion(select_first=True)
+
+        try:
+            prompt_options = create_chat_prompt_options()
+            prompt_options["bottom_toolbar"] = self.status_bottom_toolbar
+            selected = session.prompt(
+                [("class:prompt", "\nEffort> ")],
+                completer=WordCompleter(labels, ignore_case=True, sentence=True),
+                pre_run=start_completion,
+                **prompt_options,
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not selected:
+            return None
+        choice = by_label.get(selected)
+        if choice is None:
+            self.renderer.print_system(f"Unknown effort selection: {selected}")
+        return choice
+
     def create_ue_linked_worktree(self, name: str) -> None:
         try:
             default_root = load_system_config().worktree_default_root
@@ -1564,10 +1635,13 @@ class ChatTuiApplication:
         self.messages = messages
         self.history.resume(entry, self.messages)
         self.current_subagent = None
+        restored = self.runtime.restore_history_model_state(entry.model_state)
         if display_records:
             self.renderer.render_display_history(display_records, str(entry.path))
         else:
             self.renderer.render_history(self.messages, str(entry.path))
+        if restored:
+            self.renderer.print_system(restored)
 
     def load_subagent(self, record: "SubagentRecord") -> None:
         try:
@@ -1617,7 +1691,8 @@ class ChatTuiApplication:
             profile = self.runtime.current_model_profile()
         except ConfigError:
             return "(missing config)"
-        return profile.model or profile.name or "(missing model)"
+        model_name = profile.name or profile.model or "(missing model)"
+        return f"{model_name} {self.runtime.current_effort()}"
 
     def plan_mode_bottom_toolbar(self):
         return self.status_fragments()

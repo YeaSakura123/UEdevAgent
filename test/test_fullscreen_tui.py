@@ -20,7 +20,7 @@ from uedev.runtime.agent import AgentOptions, AgentRuntime, SlashCommandComplete
 from uedev.runtime.history import append_display_event, load_display_history, load_history_file
 from uedev.state.config import agent_dir
 from uedev.tools.workspace import write_file
-from uedev.ui.events import assistant_delta_event, budget_event, final_event, thinking_event
+from uedev.ui.events import assistant_delta_event, budget_event, final_event, thinking_event, usage_event
 from uedev.ui.tui import ApprovalModal, ChatScreenState, ChatTuiApplication, FullscreenRenderer, SelectionModal
 
 
@@ -70,6 +70,26 @@ class FullscreenStateTests(unittest.TestCase):
         self.assertEqual(transcript.count("hello"), 2)
         self.assertIn("summary", transcript)
         self.assertIn("assistant", transcript)
+
+    def test_turn_summary_includes_token_usage(self) -> None:
+        state = ChatScreenState("banner")
+        state.start_turn("turn-1", "hello")
+        state.render(
+            usage_event(
+                {
+                    "input_tokens": 1200,
+                    "output_tokens": 300,
+                    "total_tokens": 1500,
+                    "cached_input_tokens": 800,
+                    "reasoning_tokens": 200,
+                    "source": "provider",
+                },
+                "turn-1",
+            )
+        )
+        state.render(final_event("done", "turn-1"))
+
+        self.assertIn("1,500 tokens (1,200 in / 300 out)", state.render_text())
 
     def test_thinking_block_is_removed_after_final(self) -> None:
         state = ChatScreenState("banner")
